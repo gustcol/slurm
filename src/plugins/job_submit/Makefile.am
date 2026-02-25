@@ -8,4 +8,5 @@ SUBDIRS = \
 	partition \
 	pbs \
 	require_timelimit \
+	resilience \
 	throttle

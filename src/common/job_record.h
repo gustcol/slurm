@@ -532,6 +532,19 @@ struct job_record {
 	uint32_t wait4switch; /* Maximum time to wait for Maximum switches */
 	bool     best_switch; /* true=min number of switches met           */
 	time_t wait4switch_start; /* Time started waiting for switch       */
+
+	/* Adaptive resilience fields */
+	uint16_t resilience_min_cluster_pct; /* min cluster health % to enable
+					      * resilience, 0 = use system
+					      * default (70%) */
+	time_t   resilience_suspended_at;    /* nonzero while job is in
+					      * resilience recovery mode */
+	uint32_t resilience_orig_node_cnt;   /* node count before first node
+					      * failure, target for elastic
+					      * recovery */
+	bitstr_t *resilience_orig_bitmap;    /* original node allocation bitmap;
+					      * DO NOT PACK - rebuilt from
+					      * nodes string on restore */
 };
 
 /* Job dependency specification, used in "depend_list" within job_record */

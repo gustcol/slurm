@@ -658,6 +658,8 @@ enum job_state_reason {
 					    * (Unknown) */
 	WAIT_MAX_POWERED_NODES,            /* max_powered_nodes reached */
 	WAIT_MPI_PORTS_BUSY,		   /* MPI resv_ports busy */
+	WAIT_RESILIENCE_RECOVERY,	   /* adaptive resilience: running on
+					    * reduced nodes after failure */
 	REASON_END, /* end of table */
 };
 
@@ -1251,6 +1253,9 @@ typedef enum {
 #define SPREAD_SEGMENTS SLURM_BIT(43) /* Spread segments across blocks*/
 #define CONSOLIDATE_SEGMENTS SLURM_BIT(44) /* Consolidate segments */
 #define EXPEDITED_REQUEUE SLURM_BIT(45) /* expedited requeue requested */
+#define ADAPTIVE_RESILIENCE SLURM_BIT(46) /* adaptive resilience on node
+					   * failure: shrink allocation and
+					   * continue running */
 
 /* These bits are set in the x11 field of job_desc_msg_t */
 #define X11_FORWARD_ALL		0x0001	/* all nodes should setup forward */
