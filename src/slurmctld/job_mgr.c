@@ -3592,6 +3592,8 @@ extern job_record_t *job_array_split(job_record_t *job_ptr, bool list_add)
 	job_ptr_pend->node_bitmap_pr = NULL;
 	job_ptr_pend->node_bitmap_preempt = NULL;
 	job_ptr_pend->resilience_orig_bitmap = NULL;
+	job_ptr_pend->resilience_suspended_at = 0;
+	job_ptr_pend->resilience_orig_node_cnt = 0;
 	job_ptr_pend->nodes = NULL;
 	job_ptr_pend->nodes_completing = NULL;
 	job_ptr_pend->nodes_pr = NULL;
@@ -16486,6 +16488,9 @@ void batch_requeue_fini(job_record_t *job_ptr)
 	xfree(job_ptr->failed_node);
 	FREE_NULL_BITMAP(job_ptr->node_bitmap);
 	FREE_NULL_BITMAP(job_ptr->node_bitmap_cg);
+	FREE_NULL_BITMAP(job_ptr->resilience_orig_bitmap);
+	job_ptr->resilience_suspended_at = 0;
+	job_ptr->resilience_orig_node_cnt = 0;
 	FREE_NULL_LIST(job_ptr->gres_list_alloc);
 
 	job_resv_clear_magnetic_flag(job_ptr);

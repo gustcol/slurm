@@ -86,6 +86,16 @@ extern bool job_resilience_eligible(job_record_t *job_ptr)
 	if (!job_ptr->batch_flag)
 		return false;
 
+	/*
+	 * Het job components share node-failure dispatch via
+	 * _het_job_on_node(), which matches all components when any
+	 * component loses a node.  Resilience operates on the
+	 * individual job's own allocation, so skip het jobs to avoid
+	 * shrinking a component that does not own the failed node.
+	 */
+	if (job_ptr->het_job_id)
+		return false;
+
 	/* Don't interfere with jobs already being killed */
 	if (job_ptr->kill_on_node_fail)
 		return false;
