@@ -72,7 +72,18 @@ extern bool job_resilience_eligible(job_record_t *job_ptr)
 {
 	int min_pct, cur_pct;
 
+	xassert(verify_lock(JOB_LOCK, READ_LOCK));
+	xassert(verify_lock(NODE_LOCK, READ_LOCK));
+
 	if (!(job_ptr->bit_flags & ADAPTIVE_RESILIENCE))
+		return false;
+
+	/*
+	 * Only running jobs are eligible. IS_JOB_RUNNING includes
+	 * JOB_CONFIGURING which is not safe to shrink (nodes not yet
+	 * ready), so exclude it explicitly.
+	 */
+	if (!IS_JOB_RUNNING(job_ptr) || IS_JOB_CONFIGURING(job_ptr))
 		return false;
 
 	/*

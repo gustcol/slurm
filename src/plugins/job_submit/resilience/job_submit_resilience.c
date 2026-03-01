@@ -116,7 +116,7 @@ static void _parse_resilience_comment(job_desc_msg_t *job_desc)
 			return;
 	}
 	ptr += strlen("resilience");
-	if (*ptr != '\0' && *ptr != ' ' && *ptr != ',' && *ptr != '=')
+	if (*ptr != '\0' && *ptr != ' ' && *ptr != ',' && *ptr != ';' && *ptr != '=')
 		return;
 
 	/* Parse optional threshold: resilience=80 */

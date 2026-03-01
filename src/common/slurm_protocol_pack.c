@@ -3535,6 +3535,18 @@ _unpack_job_info_members(job_info_t * job, buf_t *buffer,
 
 		safe_unpack32(&job->wait4switch, buffer);
 		safe_unpackstr(&job->wckey, buffer);
+		/* Adaptive resilience state (discard for RPC clients) */
+		{
+			uint16_t tmp16;
+			time_t tmp_time;
+			uint32_t tmp32;
+			bitstr_t *tmp_bitmap = NULL;
+			safe_unpack16(&tmp16, buffer);
+			safe_unpack_time(&tmp_time, buffer);
+			safe_unpack32(&tmp32, buffer);
+			unpack_bit_str_hex(&tmp_bitmap, buffer);
+			FREE_NULL_BITMAP(tmp_bitmap);
+		}
 		/**************************************/
 
 
