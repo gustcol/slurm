@@ -50,6 +50,7 @@
 #include "src/slurmctld/job_resilience.h"
 #include "src/slurmctld/locks.h"
 #include "src/slurmctld/slurmctld.h"
+#include "src/stepmgr/srun_comm.h"
 
 #define RESILIENCE_DEFAULT_MIN_PCT 70
 
@@ -141,6 +142,9 @@ extern int job_resilience_suspend(job_record_t *job_ptr,
 	     __func__, job_ptr, job_ptr->node_cnt,
 	     job_ptr->node_cnt - 1, node_ptr->name);
 
+	/* Notify srun of the failed node */
+	srun_node_fail(job_ptr, node_ptr->name);
+
 	/*
 	 * Remove the failed node from the running job. This reuses the
 	 * same proven code path as the existing kill_on_node_fail==0
@@ -208,9 +212,6 @@ static int _try_resilience_restore(void *x, void *arg)
 
 	/*
 	 * The recovered node must have been part of the original allocation.
-	 * resilience_orig_bitmap may be NULL after a slurmctld restart
-	 * (it is not persisted); in that case elastic recovery is not
-	 * possible and the job continues at its reduced size.
 	 */
 	if (!job_ptr->resilience_orig_bitmap)
 		return 0;

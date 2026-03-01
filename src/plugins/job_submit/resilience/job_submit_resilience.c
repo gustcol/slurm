@@ -119,11 +119,18 @@ static void _parse_resilience_comment(job_desc_msg_t *job_desc)
 	 * Encode the custom threshold in admin_comment so that
 	 * the slurmctld can extract it when building the job record.
 	 * This avoids extending job_desc_msg_t and the wire protocol.
+	 *
+	 * Append rather than overwrite to preserve any existing
+	 * admin_comment content set by other plugins or the admin.
 	 */
 	if (pct > 0) {
-		xfree(job_desc->admin_comment);
-		xstrfmtcat(job_desc->admin_comment,
-			   "resilience_pct=%d", pct);
+		if (job_desc->admin_comment &&
+		    job_desc->admin_comment[0] != '\0')
+			xstrfmtcat(job_desc->admin_comment,
+				   " resilience_pct=%d", pct);
+		else
+			xstrfmtcat(job_desc->admin_comment,
+				   "resilience_pct=%d", pct);
 	}
 }
 
@@ -155,5 +162,23 @@ extern int job_modify(job_desc_msg_t *job_desc, job_record_t *job_ptr,
 		      uint32_t submit_uid, char **err_msg)
 {
 	_parse_resilience_comment(job_desc);
+
+	/* Admin partition-level opt-in */
+	if (!(job_desc->bitflags & ADAPTIVE_RESILIENCE) &&
+	    job_ptr->part_ptr &&
+	    _partition_has_resilience(job_ptr->part_ptr->name)) {
+		job_desc->bitflags |= ADAPTIVE_RESILIENCE;
+	}
+
+	/*
+	 * Ensure kill_on_node_fail is cleared when resilience is
+	 * enabled via job modification, matching the job_submit path.
+	 */
+	if (job_desc->bitflags & ADAPTIVE_RESILIENCE) {
+		job_desc->kill_on_node_fail = 0;
+		info("job_submit/resilience: enabled adaptive resilience for modified job %u uid=%u",
+		     job_ptr->job_id, submit_uid);
+	}
+
 	return SLURM_SUCCESS;
 }

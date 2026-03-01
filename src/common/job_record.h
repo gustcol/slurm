@@ -542,9 +542,9 @@ struct job_record {
 	uint32_t resilience_orig_node_cnt;   /* node count before first node
 					      * failure, target for elastic
 					      * recovery */
-	bitstr_t *resilience_orig_bitmap;    /* original node allocation bitmap;
-					      * DO NOT PACK - rebuilt from
-					      * nodes string on restore */
+	bitstr_t *resilience_orig_bitmap;    /* original node allocation bitmap,
+					      * packed/unpacked for state
+					      * persistence across restarts */
 };
 
 /* Job dependency specification, used in "depend_list" within job_record */

@@ -2990,9 +2990,12 @@ static int _foreach_kill_running_job_by_node(void *x, void *arg)
 		 * Adaptive resilience: shrink the job to surviving nodes
 		 * and mark it for elastic recovery when nodes return.
 		 * Takes priority over requeue and kill paths.
+		 *
+		 * Do not call srun_node_fail() here because
+		 * job_resilience_suspend() handles the notification
+		 * internally, and the fallback paths below also call it.
 		 */
 		if (job_resilience_eligible(job_ptr)) {
-			srun_node_fail(job_ptr, node_ptr->name);
 			if (job_resilience_suspend(job_ptr, node_ptr) ==
 			    SLURM_SUCCESS)
 				return 0;
