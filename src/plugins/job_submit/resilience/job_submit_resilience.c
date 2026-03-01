@@ -105,8 +105,21 @@ static void _parse_resilience_comment(job_desc_msg_t *job_desc)
 	if (!ptr)
 		return;
 
-	/* Parse optional threshold: resilience=80 */
+	/*
+	 * Ensure "resilience" is a standalone token, not a substring
+	 * of another word (e.g., "no_resilience" or "resilience_other").
+	 * Check both prefix and suffix boundaries.
+	 */
+	if (ptr != job_desc->comment) {
+		char prev = *(ptr - 1);
+		if (prev != ' ' && prev != ',' && prev != ';')
+			return;
+	}
 	ptr += strlen("resilience");
+	if (*ptr != '\0' && *ptr != ' ' && *ptr != ',' && *ptr != '=')
+		return;
+
+	/* Parse optional threshold: resilience=80 */
 	if (*ptr == '=') {
 		pct = (int) strtol(ptr + 1, NULL, 10);
 		if (pct < 1 || pct > 100)

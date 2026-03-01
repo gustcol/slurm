@@ -243,9 +243,9 @@ static int _try_resilience_restore(void *x, void *arg)
 	     job_ptr->node_cnt, job_ptr->resilience_orig_node_cnt);
 
 	/*
-	 * Clear resilience state if all originally-allocated nodes
-	 * are back in the available pool, even though we haven't
-	 * expanded the job. The job finished with reduced resources.
+	 * Update state_desc to reflect progress. Elastic expansion is
+	 * deferred to a future enhancement; for now we just log and
+	 * update the human-readable description.
 	 */
 	xfree(job_ptr->state_desc);
 	xstrfmtcat(job_ptr->state_desc,
@@ -253,6 +253,7 @@ static int _try_resilience_restore(void *x, void *arg)
 		   node_ptr->name, job_ptr->node_cnt,
 		   job_ptr->resilience_orig_node_cnt);
 
+	last_job_update = time(NULL);
 	return 0;
 }
 
