@@ -272,6 +272,7 @@ extern void job_record_delete(void *job_entry)
 	FREE_NULL_BITMAP(job_ptr->node_bitmap_cg);
 	FREE_NULL_BITMAP(job_ptr->node_bitmap_pr);
 	FREE_NULL_BITMAP(job_ptr->node_bitmap_preempt);
+	FREE_NULL_BITMAP(job_ptr->resilience_orig_bitmap);
 	xfree(job_ptr->nodes);
 	xfree(job_ptr->nodes_completing);
 	xfree(job_ptr->nodes_pr);
@@ -2369,6 +2370,13 @@ extern void job_record_pack_common(job_record_t *dump_job_ptr,
 
 		pack32(dump_job_ptr->wait4switch, buffer);
 		packstr(dump_job_ptr->wckey, buffer);
+
+		/* Adaptive resilience state */
+		pack16(dump_job_ptr->resilience_min_cluster_pct, buffer);
+		pack_time(dump_job_ptr->resilience_suspended_at, buffer);
+		pack32(dump_job_ptr->resilience_orig_node_cnt, buffer);
+		pack_bit_str_hex(dump_job_ptr->resilience_orig_bitmap,
+				 buffer);
 	} else if (protocol_version >= SLURM_25_11_PROTOCOL_VERSION) {
 		pack_step_id(&dump_job_ptr->step_id, buffer, protocol_version);
 		packstr(dump_job_ptr->account, buffer);
@@ -2744,6 +2752,13 @@ extern int job_record_unpack_common(job_record_t *job_ptr,
 
 		safe_unpack32(&job_ptr->wait4switch, buffer);
 		safe_unpackstr(&job_ptr->wckey, buffer);
+
+		/* Adaptive resilience state */
+		safe_unpack16(&job_ptr->resilience_min_cluster_pct, buffer);
+		safe_unpack_time(&job_ptr->resilience_suspended_at, buffer);
+		safe_unpack32(&job_ptr->resilience_orig_node_cnt, buffer);
+		unpack_bit_str_hex(&job_ptr->resilience_orig_bitmap,
+				   buffer);
 	} else if (protocol_version >= SLURM_25_11_PROTOCOL_VERSION) {
 		if (unpack_step_id_members(&job_ptr->step_id, buffer,
 					   protocol_version))

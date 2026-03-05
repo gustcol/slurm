@@ -81,6 +81,7 @@
 #include "src/interfaces/topology.h"
 
 #include "src/slurmctld/agent.h"
+#include "src/slurmctld/job_resilience.h"
 #include "src/slurmctld/locks.h"
 #include "src/slurmctld/ping_nodes.h"
 #include "src/slurmctld/power_save.h"
@@ -3709,6 +3710,14 @@ extern int validate_node_specs(slurm_msg_t *slurm_msg, bool *newly_up)
 
 	*newly_up = (!orig_node_avail &&
 		     bit_test(avail_node_bitmap, node_ptr->index));
+
+	/*
+	 * If the node just came back online, notify the resilience
+	 * subsystem so it can attempt elastic recovery for any jobs
+	 * that lost this node.
+	 */
+	if (*newly_up)
+		job_resilience_node_recovered(node_ptr);
 
 	if (IS_NODE_CLOUD(node_ptr) ||
 	    IS_NODE_DYNAMIC_FUTURE(node_ptr) ||

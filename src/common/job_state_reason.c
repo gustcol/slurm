@@ -882,6 +882,10 @@ const static entry_t jsra[] = {
 	[WAIT_MPI_PORTS_BUSY] = {
 		.str = "MpiPortsBusy",
 	},
+	[WAIT_RESILIENCE_RECOVERY] = {
+		.flags = JSR_MISC,
+		.str = "ResilienceRecovery",
+	},
 };
 
 extern const char *job_state_reason_string(enum job_state_reason inx)

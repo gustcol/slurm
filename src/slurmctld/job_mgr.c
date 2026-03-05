@@ -102,6 +102,7 @@
 #include "src/slurmctld/agent.h"
 #include "src/slurmctld/fed_mgr.h"
 #include "src/slurmctld/gang.h"
+#include "src/slurmctld/job_resilience.h"
 #include "src/slurmctld/job_scheduler.h"
 #include "src/slurmctld/licenses.h"
 #include "src/slurmctld/locks.h"
@@ -2984,6 +2985,26 @@ static int _foreach_kill_running_job_by_node(void *x, void *arg)
 		}
 	} else if (IS_JOB_RUNNING(job_ptr) || suspended) {
 		foreach_kill_job_by->kill_job_cnt++;
+
+		/*
+		 * Adaptive resilience: shrink the job to surviving nodes
+		 * and mark it for elastic recovery when nodes return.
+		 * Takes priority over requeue and kill paths.
+		 *
+		 * Do not call srun_node_fail() here because
+		 * job_resilience_suspend() handles the notification
+		 * internally, and the fallback paths below also call it.
+		 */
+		if (job_resilience_eligible(job_ptr)) {
+			if (job_resilience_suspend(job_ptr, node_ptr) ==
+			    SLURM_SUCCESS)
+				return 0;
+			/*
+			 * Resilience suspend failed (e.g., last node).
+			 * Fall through to existing dispatch below.
+			 */
+		}
+
 		if ((job_ptr->details) &&
 		    (job_ptr->kill_on_node_fail == 0) &&
 		    (job_ptr->node_cnt > 1) &&
@@ -3570,6 +3591,9 @@ extern job_record_t *job_array_split(job_record_t *job_ptr, bool list_add)
 	job_ptr_pend->node_bitmap_cg = NULL;
 	job_ptr_pend->node_bitmap_pr = NULL;
 	job_ptr_pend->node_bitmap_preempt = NULL;
+	job_ptr_pend->resilience_orig_bitmap = NULL;
+	job_ptr_pend->resilience_suspended_at = 0;
+	job_ptr_pend->resilience_orig_node_cnt = 0;
 	job_ptr_pend->nodes = NULL;
 	job_ptr_pend->nodes_completing = NULL;
 	job_ptr_pend->nodes_pr = NULL;
@@ -8710,6 +8734,21 @@ static int _copy_job_desc_to_job_record(job_desc_msg_t *job_desc,
 	job_ptr->bit_flags &= ~TASKS_CHANGED;
 	job_ptr->bit_flags &= ~BACKFILL_TEST;
 	job_ptr->bit_flags &= ~BF_WHOLE_NODE_TEST;
+
+	/*
+	 * Extract adaptive resilience threshold from admin_comment if
+	 * set by the job_submit/resilience plugin.
+	 */
+	if ((job_ptr->bit_flags & ADAPTIVE_RESILIENCE) &&
+	    job_desc->admin_comment) {
+		char *pct_str = xstrcasestr(job_desc->admin_comment,
+					    "resilience_pct=");
+		if (pct_str) {
+			int pct = atoi(pct_str + strlen("resilience_pct="));
+			if (pct >= 1 && pct <= 100)
+				job_ptr->resilience_min_cluster_pct = pct;
+		}
+	}
 
 	job_ptr->resv_port_cnt = job_desc->resv_port_cnt;
 	if (job_desc->resv_port_cnt != NO_VAL16) {
@@ -16449,6 +16488,9 @@ void batch_requeue_fini(job_record_t *job_ptr)
 	xfree(job_ptr->failed_node);
 	FREE_NULL_BITMAP(job_ptr->node_bitmap);
 	FREE_NULL_BITMAP(job_ptr->node_bitmap_cg);
+	FREE_NULL_BITMAP(job_ptr->resilience_orig_bitmap);
+	job_ptr->resilience_suspended_at = 0;
+	job_ptr->resilience_orig_node_cnt = 0;
 	FREE_NULL_LIST(job_ptr->gres_list_alloc);
 
 	job_resv_clear_magnetic_flag(job_ptr);
