@@ -4,9 +4,13 @@
 ############################################################################
 # Copyright (C) SchedMD LLC.
 ############################################################################
-import atf
-import pytest
 import re
+
+import pytest
+
+import atf
+
+pytestmark = pytest.mark.slow
 
 mps_cnt = 100 * 2
 job_mps = int(mps_cnt * 0.5)
@@ -27,6 +31,7 @@ def setup():
         source="gres",
     )
     atf.require_nodes(2, [("Gres", f"gpu:2,mps:{mps_cnt}"), ("CPUs", 6)])
+    atf.require_accounting()
     atf.require_slurm_running()
 
 
@@ -188,7 +193,7 @@ def test_three_parallel_consumption_sbatch(mps_nodes, file_in_1a):
         sum(map(int, match)) == step_mps * 3
     ), f"Bad CUDA percentage information about job ({sum(map(int, match))} != {step_mps * 3})"
     assert atf.check_steps_delayed(
-        job_id, file_output, 1
+        job_id, 1
     ), "Failed to delay step for sufficient MPS resources (match != 1)"
 
 

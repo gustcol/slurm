@@ -27,11 +27,8 @@
 #include <sys/time.h>
 #include <time.h>
 
-#ifdef __linux__
-#define TIMESPEC_CLOCK_TYPE CLOCK_TAI
-#else
+/* Always use CLOCK_REALTIME to match pthread_cond_timedwait() */
 #define TIMESPEC_CLOCK_TYPE CLOCK_REALTIME
-#endif
 
 extern time_t slurm_mktime(struct tm *tp);
 
@@ -128,6 +125,49 @@ extern timespec_t timespec_now(void);
 extern int timespec_ctime(timespec_t ts, bool abs_time, char *buffer,
 			  size_t buffer_len);
 
+typedef struct {
+	char str[TIMESPEC_CTIME_STR_LEN];
+} timespec_ctime_str_t;
+
+/*
+ * Populate string from timespec
+ * WARNING: Use TIMESPEC_STR() macro instead calling func directly
+ * IN ts - timestamp
+ * IN abs_time -
+ *	true if ts is time since UNIX epoch
+ *	false if ts is arbitrary length of time
+ * RET timespec_ctime_str_t::str populated
+ */
+extern timespec_ctime_str_t timespec_ctime_str(timespec_t ts, bool abs_time);
+
+/*
+ * Convert timespec to string (for logging)
+ * IN ts - timestamp
+ * IN abs_time -
+ *	true if ts is time since UNIX epoch
+ *	false if ts is arbitrary length of time
+ * RET timestamp as string or "INVALID" (which must be used immediately)
+ */
+#define TIMESPEC_STR(ts, abs_time) timespec_ctime_str((ts), (abs_time)).str
+
+/*
+ * Convert timespec duration to string (for logging)
+ * IN start_ts - timestamp of start of duration
+ * IN end_ts - timestamp of end of duration
+ * RET timestamp as string or "INVALID" (which must be used immediately)
+ */
+#define TIMESPEC_DURATION_STR(start_ts, end_ts) \
+	timespec_ctime_str(timespec_diff_ns((end_ts), (start_ts)).diff, false) \
+		.str
+
+/*
+ * Convert timespec time elapsed (for logging)
+ * IN start_ts - timestamp of start of duration
+ * RET timestamp as string or "INVALID" (which must be used immediately)
+ */
+#define TIMESPEC_ELAPSED_STR(start_ts) \
+	TIMESPEC_DURATION_STR(start_ts, timespec_now())
+
 /* Add overflow of nanoseconds into seconds */
 extern timespec_t timespec_normalize(timespec_t ts);
 
@@ -161,6 +201,13 @@ extern timespec_diff_ns_t timespec_diff_ns(const timespec_t x,
 extern double timespec_to_secs(const timespec_t x);
 
 /*
+ * Convert timestamp to milliseconds
+ * IN x - timestamp
+ * RET milliseconds, or INFINITE64 if x is TIMESPEC_INFINITE
+ */
+extern uint64_t timespec_to_msec(timespec_t x);
+
+/*
  * Time diff to deadline passing against timespec_now()
  * IN deadline - absolute time of deadline
  * RET
@@ -175,5 +222,8 @@ extern int64_t timespec_after_deadline(const timespec_t deadline);
  * Takes a struct timeval.
  */
 extern int timeval_tot_wait(struct timeval *start_time);
+
+/* True if X is equal to zero */
+extern bool timespec_is_zero(timespec_t x);
 
 #endif /* _HAVE_SLURM_TIME_H */

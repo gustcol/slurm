@@ -329,7 +329,7 @@ extern node_info_msg_t *g_node_info_ptr;
 extern partition_info_msg_t *g_part_info_ptr;
 extern reserve_info_msg_t *g_resv_info_ptr;
 extern burst_buffer_info_msg_t *g_bb_info_ptr;
-extern slurm_ctl_conf_info_msg_t *g_ctl_info_ptr;
+extern slurm_conf_t *g_ctl_info_ptr;
 extern job_step_info_response_msg_t *g_step_info_ptr;
 extern topo_info_response_msg_t *g_topo_info_msg_ptr;
 extern switch_record_bitmaps_t *g_switch_nodes_maps;
@@ -393,7 +393,7 @@ extern void setup_popup_grid_list(popup_info_t *popup_win);
 extern void post_setup_popup_grid_list(popup_info_t *popup_win);
 
 // part_info.c
-extern GtkWidget *create_part_entry(update_part_msg_t *part_msg,
+extern GtkWidget *create_part_entry(partition_info_t *part_msg,
 				    GtkTreeModel *model, GtkTreeIter *iter);
 extern bool check_part_includes_node(int node_dx);
 extern void refresh_part(GtkAction *action, gpointer user_data);
@@ -496,7 +496,7 @@ extern void set_menus_submit(void *arg, void *arg2,
 			     GtkTreePath *path, int type);
 
 // config_info.c
-extern int get_new_info_config(slurm_ctl_conf_info_msg_t **info_ptr);
+extern int get_new_info_config(slurm_conf_t **info_ptr);
 
 // common.c
 extern char * replspace (char *str);

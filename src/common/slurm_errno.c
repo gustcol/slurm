@@ -59,6 +59,7 @@
 #define ERRTAB_ENTRY(_e) _e, #_e
 
 /* Add new error values to slurm/slurm_errno.h, and their descriptions to this table */
+// clang-format off
 slurm_errtab_t slurm_errtab[] = {
 	{
 		ERRTAB_ENTRY(SLURM_SUCCESS),
@@ -150,6 +151,34 @@ slurm_errtab_t slurm_errtab[] = {
 		ERRTAB_ENTRY(SLURM_BLOCKED_ON_WRITE),
 		"Write would block",
 	},
+	{
+		ERRTAB_ENTRY(SLURM_COMMUNICATIONS_REJECTED),
+		"Connection rejected by handler",
+	},
+	{
+		ERRTAB_ENTRY(SLURM_COMMUNICATIONS_QUIESCE_TIMEOUT),
+		"Connection forced closed by quiesce timeout",
+	},
+	{
+		ERRTAB_ENTRY(SLURM_COMMUNICATIONS_CONNECT_TIMEOUT),
+		"Connection timed out establishing",
+	},
+	{
+		ERRTAB_ENTRY(SLURM_COMMUNICATIONS_WRITE_TIMEOUT),
+		"Connection timed out writing",
+	},
+	{
+		ERRTAB_ENTRY(SLURM_COMMUNICATIONS_READ_TIMEOUT),
+		"Connection timed out reading",
+	},
+	{
+		ERRTAB_ENTRY(SLURM_COMMUNICATIONS_DELAYED_ERROR),
+		"Kernel reported delayed socket error after successful write(), client side likely closed",
+	},
+	{
+		ERRTAB_ENTRY(SLURM_SHUTTING_DOWN),
+		"Process is shutting down and closing all communications",
+	},
 
 	/* communication failures to/from slurmctld */
 	{
@@ -216,8 +245,8 @@ slurm_errtab_t slurm_errtab[] = {
 		"Node count specification invalid",
 	},
 	{
-		ERRTAB_ENTRY(ESLURM_ERROR_ON_DESC_TO_RECORD_COPY),
-		"Unable to create job record, try again",
+		ERRTAB_ENTRY(ESLURM_MAX_JOB_COUNT),
+		"MaxJobCount limit reached",
 	},
 	{
 		ERRTAB_ENTRY(ESLURM_JOB_MISSING_SIZE_SPECIFICATION),
@@ -362,6 +391,10 @@ slurm_errtab_t slurm_errtab[] = {
 		"Only batch jobs are accepted or processed",
 	},
 	{
+		ERRTAB_ENTRY(ESLURM_EXTERN_ONLY),
+		"Requested operation requires extern step",
+	},
+	{
 		ERRTAB_ENTRY(ESLURM_LICENSES_UNAVAILABLE),
 		"Licenses currently unavailable",
 	},
@@ -458,6 +491,10 @@ slurm_errtab_t slurm_errtab[] = {
 	{
 		ERRTAB_ENTRY(ESLURM_MISSING_WORK_DIR),
 		"Job cannot be submitted without the current working directory specified.",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_STEPS_DRAINED),
+		"No running or pending steps in the job",
 	},
 	{
 		ERRTAB_ENTRY(ESLURM_QOS_PREEMPTION_LOOP),
@@ -902,20 +939,102 @@ slurm_errtab_t slurm_errtab[] = {
 		"Invalid job state",
 	},
 	{
-		ERRTAB_ENTRY(ESLURM_BREAK_EVAL),
-		"Break common_topo_choose_nodes",
-	},
-	{
-		ERRTAB_ENTRY(ESLURM_RETRY_EVAL),
-		"Remove nodes and retry eval_nodes",
-	},
-	{
-		ERRTAB_ENTRY(ESLURM_RETRY_EVAL_HINT),
-		"Remove one node and retry eval_nodes",
-	},
-	{
 		ERRTAB_ENTRY(ESLURM_INVALID_SLUID),
 		"SLUID is invalid",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_INVALID_POWER_ACTION),
+		"Invalid power action",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_STEP_QUEUED),
+		"Step queued as pending",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_INVALID_EXTERNAL_JOB),
+		"Invalid configuration for external job",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_FILE_UNREADABLE),
+		"Unable to load file for reading",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_STEP_TIMED_OUT),
+		"Timed out waiting for pending step",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_STEP_CANCELLED),
+		"Pending step cancelled",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_INVALID_HRES_NAME),
+		"Invalid HRES name or layer",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_INVALID_HRES_NODES),
+		"Invalid nodes specification",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_HRES_MODE3_NON_LEAF),
+		"HRES Mode 3 node updates must happen on a leaf",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_HRES_MODE3_OVERLAP),
+		"Specified nodes overlap with another layer",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_INVALID_HRES_COUNT),
+		"Invalid HRES count/base: count must be greater than or equal to base",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_HRES_BASE_OVERFLOW),
+		"Base would result in overflow",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_HRES_INVALID_DISABLE),
+		"Invalid value for disable; acceptable values are \"true\" or \"false\"",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_HRES_MISSING_LAYER_NAME),
+		"Specified updates require a layer_name",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_HRES_DISABLED),
+		"Requested hierarchical resource is disabled",
+	},
+
+	/* Topology eval_nodes rejection reasons */
+	{
+		ERRTAB_ENTRY(ESLURM_TOPO_REQ_NODES_NOT_AVAIL),
+		"Required nodes lack available resources",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_TOPO_REQ_NODES_NO_MATCH_TOPO),
+		"Required nodes do not fit topology",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_TOPO_NO_FIT),
+		"No suitable topology unit found",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_TOPO_SEGMENT_NO_FIT),
+		"No suitable topology unit found for segment",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_TOPO_INSUFFICIENT_RESOURCES),
+		"Insufficient resources in topology unit",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_TOPO_WEIGHT_NO_FIT),
+		"Weight-based selection could not satisfy request within topology unit",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_TOPO_MAX_NODE_LIMIT),
+		"Exceeded maximum node limit during topology allocation",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_TOPO_EMPTY_NODE_MAP),
+		"No available nodes in topology",
 	},
 
 	/* SPANK errors */
@@ -1173,6 +1292,10 @@ slurm_errtab_t slurm_errtab[] = {
 		ERRTAB_ENTRY(ESLURM_NO_RPC_STATS),
 		"No RPC stats are available",
 	},
+	{
+		ERRTAB_ENTRY(ESLURM_INVALID_SHARED_POOL_ALLOWED),
+		"Invalid value for Allowed field when SharedPool enabled, must be 0 or 100% (without Absolute) or Count (with Absolute).",
+	},
 
 	/* Federation Errors */
 	{
@@ -1310,16 +1433,16 @@ slurm_errtab_t slurm_errtab[] = {
 		"Missing UNIX group in the system",
 	},
 	{
-		ERRTAB_ENTRY(ESLURM_REST_UNKNOWN_URL),
-		"Unable to find requested URL endpoint. Please query the '/openapi/v3' endpoint or visit 'https://slurm.schedmd.com/rest_api.html' for the OpenAPI specification which includes a list of all possible slurmrestd endpoints.",
-	},
-	{
 		ERRTAB_ENTRY(ESLURM_REST_UNKNOWN_URL_METHOD),
 		"Requested HTTP query method is not supported at URL endpoint. Please query the '/openapi/v3' endpoint or visit 'https://slurm.schedmd.com/rest_api.html' for the OpenAPI specification which includes a list of all possible slurmrestd endpoints.",
 	},
 	{
 		ERRTAB_ENTRY(ESLURM_REST_AUTH_FAIL),
 		"Authentication failure",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_REST_BAD_REQUEST),
+		"Query requirements not met",
 	},
 
 	/* data_t errors */
@@ -1390,6 +1513,68 @@ slurm_errtab_t slurm_errtab[] = {
 	{
 		ERRTAB_ENTRY(ESLURM_DATA_PARSE_BAD_INPUT),
 		"Request to parse invalid data",
+	},
+
+	/* UTF and UTF-8 errors */
+	{
+		ERRTAB_ENTRY(ESLURM_UTF_INVALID_CODE),
+		"Invalid or reserved UTF code point",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_UTF8_INVALID_READ),
+		"Unable to read invalid UTF-8 character",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_UTF8_READ_ILLEGAL_TERMINATION),
+		"Unable to read UTF-8 multibyte character before string termination",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_UTF8_INVALID_BYTE_2),
+		"Invalid second byte of UTF-8 multibyte character",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_UTF8_INVALID_BYTE_3),
+		"Invalid third byte of UTF-8 multibyte character",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_UTF8_INVALID_BYTE_4),
+		"Invalid fourth byte of UTF-8 multibyte character",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_UTF_RESERVED_CODE),
+		"Rejecting reserved UTF code",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_UTF16_SURROGATE_CODE),
+		"Rejecting UTF-16 surrogate code",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_UTF_PRIVATE_CODE),
+		"Rejecting private use only UTF code",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_UTF_NONCHARACTER_CODE),
+		"Rejecting noncharacter UTF code",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_UTF_NULL_CODE),
+		"Rejecting U+0 code for null character",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_UTF16BE_SCHEMA),
+		"UTF-16BE encoding schema is unsupported",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_UTF16LE_SCHEMA),
+		"UTF-16LE encoding schema is unsupported",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_UTF32BE_SCHEMA),
+		"UTF-32BE encoding schema is unsupported",
+	},
+	{
+		ERRTAB_ENTRY(ESLURM_UTF32LE_SCHEMA),
+		"UTF-32LE encoding schema is unsupported",
 	},
 
 	/* container  errors */
@@ -1471,7 +1656,7 @@ slurm_errtab_t slurm_errtab[] = {
 	},
 	{
 		ERRTAB_ENTRY(ESLURM_HTTP_MISSING_LF),
-		"Expected LF character but not found",
+		"Missing an expected LF character",
 	},
 	{
 		ERRTAB_ENTRY(ESLURM_HTTP_INVALID_CHARACTER),
@@ -1529,6 +1714,10 @@ slurm_errtab_t slurm_errtab[] = {
 		ERRTAB_ENTRY(ESLURM_HTTP_UNKNOWN_ACCEPT_MIME_TYPE),
 		"HTTP Accept header content type is unknown or unsupported",
 	},
+	{
+		ERRTAB_ENTRY(ESLURM_HTTP_MISSING_CR),
+		"Missing an expected CR character",
+	},
 
 	/* TLS errors */
 	{
@@ -1536,6 +1725,7 @@ slurm_errtab_t slurm_errtab[] = {
 		"TLS missing but required for connection",
 	},
 };
+// clang-format on
 
 unsigned int slurm_errtab_size = sizeof(slurm_errtab) / sizeof(slurm_errtab_t);
 

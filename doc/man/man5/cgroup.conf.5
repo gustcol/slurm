@@ -1,4 +1,4 @@
-.TH "cgroup.conf" "5" "Slurm Configuration File" "Slurm 26.05" "Slurm Configuration File"
+.TH "cgroup.conf" "5" "Slurm Configuration File" "Slurm 26.11" "Slurm Configuration File"
 
 .SH "NAME"
 cgroup.conf \- Slurm configuration file for the cgroup support
@@ -55,6 +55,17 @@ The default is system.slice.
 .IP
 
 .TP
+\fBCgroupJobIdPaths\fR=\fI<yes|no>\fR
+If configured to "yes" then job\-level cgroup directories are named with the
+numeric job ID instead of with the SLUID (e.g.
+"\fI/sys/fs/cgroup/system.slice/slurmstepd.scope/job_123/\fR" instead of
+"\fI/sys/fs/cgroup/system.slice/slurmstepd.scope/sEKNKTV3WPV500/\fR").
+This restores the pre\-26.05 cgroup/v2 path layout and may be useful for sites
+with external tooling keyed on job IDs. Only applies to cgroup/v2.
+The default value is no.
+
+
+.TP
 \fBSystemdTimeout\fR=\fI<number>\fR
 On slow systems like virtual machines or when systemd is busy, it can take
 a lot of time to initialize and prepare the scope for slurmd during startup.
@@ -107,18 +118,27 @@ of this particular plugin:
 \fBAllowedRAMSpace\fR=<number>
 Constrain the job/step cgroup RAM to this percentage of the allocated memory.
 The percentage supplied may be expressed as floating point number, e.g. 101.5.
-Sets the cgroup soft memory limit at the allocated memory size and then sets the
-job/step hard memory limit at the (AllowedRAMSpace/100) * allocated memory. If
-the job/step exceeds the hard limit, then it might trigger Out Of Memory (OOM)
-events (including oom\-kill) which will be logged to kernel log ring buffer
-(dmesg in Linux). Setting AllowedRAMSpace above 100 may cause system Out of
-Memory (OOM) events as it allows job/step to allocate more memory than
+Sets the job/step hard memory limit at the (AllowedRAMSpace/100) * allocated
+memory, and with cgroup/v1 also sets the soft memory limit at the allocated
+memory size. If the job/step exceeds the hard limit, then it might trigger Out
+Of Memory (OOM) events (including oom\-kill) which will be logged to kernel log
+ring buffer (dmesg in Linux).
+Setting AllowedRAMSpace above 100 may cause system
+Out of Memory (OOM) events as it allows job/step to allocate more memory than
 configured to the nodes. Reducing configured node available memory to avoid
-system OOM events is suggested. Setting AllowedRAMSpace below 100 will result
-in jobs receiving less memory than allocated and soft memory limit will set to
-the same value as the hard limit.
+system OOM events is suggested.
+Setting AllowedRAMSpace below 100 will result
+in jobs receiving less memory than allocated, and with cgroup/v1 the soft memory
+limit will be set to the same value as the hard limit.
 Also see \fBConstrainRAMSpace\fR.
 The default value is 100.
+
+\fBNOTE\fR: cgroup/v2 does not set a soft limit. Its \fImemory.high\fR is not an
+equivalent. It is enforced even when the node has free memory, throttling the
+job with reclaim, so the job can stall long before it reaches the hard limit.
+\fImemory.max\fR is therefore the only limit Slurm places on RAM usage, so with
+AllowedRAMSpace above 100 the system OOM caveat above fully applies.
+See \fBConstrainSwapSpace\fR for the separate swap limit.
 .IP
 
 .TP
@@ -152,9 +172,9 @@ The default value is "no".
 
 .TP
 \fBConstrainRAMSpace\fR=<yes|no>
-If configured to "yes" then constrain the job's RAM usage by setting
-the memory soft limit to the allocated memory and the hard limit to
-the allocated memory * \fBAllowedRAMSpace\fR. The default value is "no", in
+If configured to "yes" then constrain the job's RAM usage by setting the hard
+memory limit to the allocated memory * \fBAllowedRAMSpace\fR. With cgroup/v1,
+the soft memory limit is the allocated memory. The default value is "no", in
 which case the job's RAM limit will be set to its swap space limit if
 \fBConstrainSwapSpace\fR is set to "yes". CR_*_Memory must be set in slurm.conf
 for this parameter to take any effect.
@@ -222,7 +242,7 @@ must be set to \fByes\fR in order for this parameter to be applied.
 
 .TP
 \fBMinRAMSpace\fR=<number>
-Set a lower bound (in MB) on the memory limits defined by
+Set a lower bound (in MiB) on the memory limits defined by
 \fBAllowedRAMSpace\fR and \fBAllowedSwapSpace\fR. This prevents
 accidentally creating a memory cgroup with such a low limit that slurmstepd
 is immediately killed due to lack of RAM. If this happens, cleanup will not be

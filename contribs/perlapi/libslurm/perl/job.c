@@ -65,9 +65,10 @@ static int _job_resrcs_to_hv(job_info_t *job_info, HV *hv)
 	int abs_node_inx, rel_node_inx;
 	uint64_t *last_mem_alloc_ptr = NULL;
 	uint64_t last_mem_alloc = NO_VAL64;
+	uint32_t last_cpu_cnt = 0;
 	char *last_hosts;
 	hostlist_t *hl, *hl_last;
-	uint32_t threads;
+	uint32_t threads, cpu_cnt;
 
 	if (!job_resrcs || !job_resrcs->core_bitmap
 	    || ((last = slurm_bit_fls(job_resrcs->core_bitmap)) == -1))
@@ -108,6 +109,7 @@ static int _job_resrcs_to_hv(job_info_t *job_info, HV *hv)
 			}
 			bit_inx++;
 		}
+		cpu_cnt = job_resrcs->cpus ? job_resrcs->cpus[rel_node_inx] : 0;
 		slurm_bit_fmt(tmp1, sizeof(tmp1), cpu_bitmap);
 		FREE_NULL_BITMAP(cpu_bitmap);
 /*
@@ -115,7 +117,7 @@ static int _job_resrcs_to_hv(job_info_t *job_info, HV *hv)
  *		last host, print the report of the last group of hosts that had
  *		identical allocation values.
  */
-		if (strcmp(tmp1, tmp2) ||
+		if ((cpu_cnt != last_cpu_cnt) || strcmp(tmp1, tmp2) ||
 		    (last_mem_alloc_ptr != job_resrcs->memory_allocated) ||
 		    (job_resrcs->memory_allocated &&
 		     (last_mem_alloc !=
@@ -127,6 +129,7 @@ static int _job_resrcs_to_hv(job_info_t *job_info, HV *hv)
 				nr_hv = newHV();
 				hv_store_charp(nr_hv, "nodes", last_hosts);
 				hv_store_charp(nr_hv, "cpu_ids", tmp2);
+				hv_store_uint32_t(nr_hv, "cpus", last_cpu_cnt);
 				hv_store_uint64_t(nr_hv, "mem",
 						  last_mem_alloc_ptr ?
 						  last_mem_alloc : 0);
@@ -136,6 +139,7 @@ static int _job_resrcs_to_hv(job_info_t *job_info, HV *hv)
 				hl_last = slurm_hostlist_create(NULL);
 			}
 			strcpy(tmp2, tmp1);
+			last_cpu_cnt = cpu_cnt;
 			last_mem_alloc_ptr = job_resrcs->memory_allocated;
 			if (last_mem_alloc_ptr)
 				last_mem_alloc = job_resrcs->
@@ -162,6 +166,7 @@ static int _job_resrcs_to_hv(job_info_t *job_info, HV *hv)
 		nr_hv = newHV();
 		hv_store_charp(nr_hv, "nodes", last_hosts);
 		hv_store_charp(nr_hv, "cpu_ids", tmp2);
+		hv_store_uint32_t(nr_hv, "cpus", last_cpu_cnt);
 		hv_store_uint64_t(nr_hv, "mem",
 				  last_mem_alloc_ptr ?
 				  last_mem_alloc : 0);
@@ -285,7 +290,6 @@ job_info_to_hv(job_info_t *job_info, HV *hv)
 	if(job_info->resv_name)
 		STORE_FIELD(hv, job_info, resv_name, charp);
 	STORE_PTR_FIELD(hv, job_info, job_resrcs, "Slurm::job_resources_t");
-	STORE_FIELD(hv, job_info, shared, uint16_t);
 	STORE_FIELD(hv, job_info, start_time, time_t);
 	if(job_info->state_desc)
 		STORE_FIELD(hv, job_info, state_desc, charp);
@@ -418,7 +422,6 @@ hv_to_job_info(HV *hv, job_info_t *job_info)
 	FETCH_FIELD(hv, job_info, restart_cnt, uint16_t, TRUE);
 	FETCH_FIELD(hv, job_info, resv_name, charp, FALSE);
 	FETCH_PTR_FIELD(hv, job_info, job_resrcs, "Slurm::job_resources_t", FALSE);
-	FETCH_FIELD(hv, job_info, shared, uint16_t, TRUE);
 	FETCH_FIELD(hv, job_info, start_time, time_t, TRUE);
 	FETCH_FIELD(hv, job_info, state_desc, charp, FALSE);
 	FETCH_FIELD(hv, job_info, state_reason, uint32_t, TRUE);

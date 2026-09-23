@@ -1,9 +1,13 @@
 ############################################################################
 # Copyright (C) SchedMD LLC.
 ############################################################################
-import atf
-import pytest
 import re
+
+import pytest
+
+import atf
+
+pytestmark = pytest.mark.slow
 
 sleep_time = 90
 kill_wait = 30

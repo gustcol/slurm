@@ -74,11 +74,11 @@ typedef struct {
 	bool shadow;
 } buf_t;
 
-#define get_buf_data(__buf)		(__buf->head)
-#define get_buf_offset(__buf)		(__buf->processed)
-#define set_buf_offset(__buf,__val)	(__buf->processed = __val)
-#define remaining_buf(__buf)		(__buf->size - __buf->processed)
-#define size_buf(__buf)			(__buf->size)
+#define get_buf_data(__buf) ((__buf)->head)
+#define get_buf_offset(__buf) ((__buf)->processed)
+#define set_buf_offset(__buf, __val) ((__buf)->processed = (__val))
+#define remaining_buf(__buf) ((__buf)->size - (__buf)->processed)
+#define size_buf(__buf) ((__buf)->size)
 
 /* Initialize shadow buffer to point at data with size of bytes */
 #define SHADOW_BUF_INITIALIZER(data, bytes) \
@@ -101,6 +101,14 @@ extern buf_t *create_mmap_buf(const char *file);
 extern buf_t *create_shadow_buf(char *data, uint32_t size);
 extern void free_buf(buf_t *my_buf);
 extern buf_t *init_buf(uint32_t size);
+
+/*
+ * Assign data to buffer
+ * IN data_ptr - Pointer to data to take ownership of
+ * IN bytes - Number of populated bytes in data
+ * WARNING: data must be xmalloc()ed
+ */
+extern void assign_buf(buf_t *buf, char **data_ptr, uint32_t bytes);
 /*
  * Try to create buffer by given number of bytes.
  * IN size - number of bytes in buffer
@@ -124,7 +132,42 @@ extern int try_grow_buf(buf_t *buffer, uint32_t size);
  * RET SLURM_SUCCESS or error
  */
 extern int try_grow_buf_remaining(buf_t *buffer, uint32_t size);
-extern void *xfer_buf_data(buf_t *my_buf);
+
+/*
+ * Append a binary-safe chunk of memory to a buf_t, growing it as needed.
+ * The appended data is not NUL-terminated.
+ * IN buf - buffer to append to
+ * IN ptr - pointer to the bytes to append; may be NULL only if bytes is 0
+ * IN bytes - number of bytes to append
+ * RET SLURM_SUCCESS or error (EINVAL / ESLURM_DATA_TOO_LARGE / ENOMEM)
+ */
+extern int buf_append_bytes(buf_t *buf, const void *ptr, size_t bytes);
+
+/*
+ * Append a NUL-terminated string to a buf_t but will not append NUL-terminator
+ * to the buffer.
+ *
+ * IN buf - buffer to append to
+ * IN str - NUL-terminated string to append; NULL is treated as an empty
+ *	string (a no-op success)
+ * RET SLURM_SUCCESS or error (EINVAL / ESLURM_DATA_TOO_LARGE / ENOMEM)
+ */
+extern int buf_append_str(buf_t *buf, const char *str);
+
+/*
+ * Extract Buffer head pointer
+ * NOTE: Use xfer_buf_data() macro instead
+ * IN/OUT my_buf_ptr - Pointer to buffer (will be xfree()ed and set to NULL)
+ * RET pointer to buffer's head pointer or NULL on failure
+ */
+extern void *xfer_buf_data_ptr(buf_t **my_buf_ptr);
+
+/*
+ * Extract Buffer head pointer
+ * IN/OUT my_buf - Pointer to buffer (will be xfree()ed)
+ * RET pointer to buffer's head pointer or NULL on failure
+ */
+#define xfer_buf_data(my_buf) xfer_buf_data_ptr(&my_buf)
 
 extern void pack_time(time_t val, buf_t *buffer);
 extern int unpack_time(time_t *valp, buf_t *buffer);
@@ -189,7 +232,16 @@ extern int safe_unpackstr_func(void **object,
 extern void packstr_array(char **valp, uint32_t size_val, buf_t *buffer);
 extern int unpackstr_array(char ***valp, uint32_t* size_val, buf_t *buffer);
 
-extern void packmem_array(char *valp, uint32_t size_val, buf_t *buffer);
+/*
+ * Store a chunk of memory into a buf_t, growing it as needed.
+ * The bytes are copied verbatim, with no length prefix and no byte order
+ * conversion, so unpackmem_array() has to be told the size separately.
+ * IN valp - pointer to the bytes to store
+ * IN size_val - number of bytes to store
+ * IN buffer - buffer to store into
+ * RET SLURM_SUCCESS or error (EINVAL / ESLURM_DATA_TOO_LARGE / ENOMEM)
+ */
+extern int packmem_array(char *valp, uint32_t size_val, buf_t *buffer);
 extern int unpackmem_array(char *valp, uint32_t size_valp, buf_t *buffer);
 
 #define safe_unpack_time(valp,buf) do {			\

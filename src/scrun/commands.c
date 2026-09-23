@@ -62,7 +62,7 @@ static data_for_each_cmd_t _foreach_load_annotation(const char *key,
 	return DATA_FOR_EACH_CONT;
 }
 
-static void _load_config()
+static void _load_config(void)
 {
 	int rc;
 	data_t *term, *ver, *rp, *annot, *config = NULL;
@@ -148,7 +148,7 @@ static data_for_each_cmd_t _foreach_env(data_t *data, void *arg)
 	return DATA_FOR_EACH_CONT;
 }
 
-static void _load_config_environ()
+static void _load_config_environ(void)
 {
 	int i = 0;
 
@@ -361,7 +361,7 @@ extern int command_kill(void)
 			      __func__, strsignal(signal), state.id,
 			      slurm_strerror(rc));
 
-			rc = slurm_signal_job(state.step_id.job_id, signal);
+			rc = slurm_signal_job(state.step_id, signal);
 			if ((rc == SLURM_ERROR) && errno)
 				rc = errno;
 
@@ -446,7 +446,7 @@ extern int command_delete(void)
 			debug("%s: unable to connect to anchor to delete container %s directly: %s",
 			      __func__, state.id, slurm_strerror(rc));
 
-			if (slurm_signal_job(state.step_id.job_id, signal)) {
+			if (slurm_signal_job(state.step_id, signal)) {
 				rc = errno;
 				error("%s: unable to signal %s container %s or signal %pI: %m",
 				      __func__, strsignal(signal), state.id,

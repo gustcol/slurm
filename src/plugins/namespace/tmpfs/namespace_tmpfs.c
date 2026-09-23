@@ -595,7 +595,8 @@ static int _create_ns(stepd_step_rec_t *step)
 				error("%s: could not mount private shm",
 				      __func__);
 		}
-		exit(rc);
+		/* Never execs: use _exit(), not exit(). */
+		_exit(rc);
 	} else {
 		int wstatus;
 		char *proc_path = NULL;
@@ -868,12 +869,12 @@ extern int namespace_p_stepd_create(stepd_step_rec_t *step)
 	return _create_ns(step);
 }
 
-extern int namespace_p_stepd_delete(slurm_step_id_t *step_id)
+extern int namespace_p_stepd_delete(stepd_step_rec_t *step)
 {
 	if (plugin_disabled)
 		return SLURM_SUCCESS;
 
-	return _delete_ns(step_id->job_id);
+	return _delete_ns(step->step_id.job_id);
 }
 
 extern int namespace_p_send_stepd(int fd)

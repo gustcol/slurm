@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 
+import os
 import re
 import sys
-import os
-import codecs
 
 try:
     import pypandoc
@@ -30,7 +29,7 @@ page_title_regex = re.compile(page_title_pat)
 url_pat = r'(\s+href\s*=\s*")([^"#]+)(#[^"]+)?(")'
 url_regex = re.compile(url_pat)
 
-first_header_pat = r'<[hH]1>\s*(<a name="top">)?\s*(?P<title>[a-zA-Z0-9_ ()\'/-]+)[:]*.*\s*[</a>]?\s*</[hH]1>'
+first_header_pat = r' {0,2}<[hH]1>\s*(<a (?:name|id)="top">)?\s*(?P<title>[a-zA-Z0-9_ ()\'"/-]+)[:]*.*\s*[</a>]?\s*</[hH]1>'
 first_header_regex = re.compile(first_header_pat)
 
 version_pat = r"(@SLURM_VERSION@)"
@@ -123,8 +122,8 @@ for filename in files:
     dirname, basefilename = os.path.split(filename)
     newfilename = basefilename[:-6] + ".html"
     print("Converting", filename, "->", newfilename)
-    shtml = codecs.open(filename, "r", encoding="utf-8")
-    html = codecs.open(newfilename, "w", encoding="utf-8")
+    shtml = open(filename, "r", encoding="utf-8")
+    html = open(newfilename, "w", encoding="utf-8")
 
     for line in shtml.readlines():
         result = first_header_regex.match(line)

@@ -79,8 +79,9 @@ static const char *tags[] = {
 	NULL
 };
 
-#define OP_FLAGS (OP_BIND_DATA_PARSER | OP_BIND_OPENAPI_RESP_FMT | \
-		  OP_BIND_NO_SLURMDBD)
+#define OP_FLAGS \
+	(OPENAPI_BIND_DATA_PARSER | OPENAPI_BIND_OPENAPI_RESP_FMT | \
+	 OPENAPI_BIND_NO_SLURMDBD)
 
 const openapi_path_binding_t openapi_paths[] = {
 	{
@@ -163,6 +164,27 @@ const openapi_path_binding_t openapi_paths[] = {
 				.response = {
 					.type = DATA_PARSER_OPENAPI_LICENSES_RESP,
 					.description = "results of get all licenses",
+				},
+			},
+			{0}
+		},
+		.flags = OP_FLAGS,
+	},
+	{
+		.path = "/slurm/{data_parser}/hres/",
+		.callback = op_handler_hres,
+		.methods = (openapi_path_binding_method_t[]) {
+			{
+				.method = HTTP_REQUEST_POST,
+				.tags = tags,
+				.summary = "Update HRES",
+				.response = {
+					.type = DATA_PARSER_OPENAPI_RESP,
+					.description = "Update HRES results",
+				},
+				.body = {
+					.type = DATA_PARSER_HRES_UPDATE_MSG,
+					.description = "HRES description",
 				},
 			},
 			{0}
@@ -305,6 +327,46 @@ const openapi_path_binding_t openapi_paths[] = {
 		.flags = OP_FLAGS,
 	},
 	{
+		.path = "/slurm/{data_parser}/job/{job_id}/requeue",
+		.callback = op_handler_job_requeue,
+		.methods = (openapi_path_binding_method_t[]) {
+			{
+				.method = HTTP_REQUEST_GET,
+				.tags = tags,
+				.summary = "request job requeue",
+				.response = {
+					.type = DATA_PARSER_OPENAPI_JOB_REQUEUE_RESP,
+					.description = "job requeue result",
+				},
+				.parameters = DATA_PARSER_OPENAPI_JOB_INFO_PARAM,
+				.query = DATA_PARSER_OPENAPI_JOB_REQUEUE_QUERY,
+			},
+			{0}
+		},
+		.flags = OP_FLAGS,
+	},
+	{
+		.path = "/slurm/{data_parser}/jobs/requeue",
+		.callback = op_handler_jobs_requeue,
+		.methods = (openapi_path_binding_method_t[]) {
+			{
+				.method = HTTP_REQUEST_POST,
+				.tags = tags,
+				.summary = "batch requeue job(s)",
+				.response = {
+					.type = DATA_PARSER_OPENAPI_JOBS_REQUEUE_RESP,
+					.description = "batch job requeue request result",
+				},
+				.body = {
+					.type = DATA_PARSER_OPENAPI_JOBS_REQUEUE_QUERY,
+					.description = "batch job requeue request parameters",
+				}
+			},
+			{0}
+		},
+		.flags = OP_FLAGS,
+	},
+	{
 		.path = "/slurm/{data_parser}/nodes/",
 		.callback = op_handler_nodes,
 		.methods = (openapi_path_binding_method_t[]) {
@@ -392,6 +454,19 @@ const openapi_path_binding_t openapi_paths[] = {
 				},
 				.query = DATA_PARSER_OPENAPI_PARTITIONS_QUERY,
 			},
+			{
+				.method = HTTP_REQUEST_POST,
+				.tags = tags,
+				.summary = "create or update partitions",
+				.response = {
+					.type = DATA_PARSER_OPENAPI_RESP,
+					.description = "partition update or create request results",
+				},
+				.body = {
+					.type = DATA_PARSER_OPENAPI_PARTITIONS_MOD_REQ,
+					.description = "partition description"
+				}
+			},
 			{0}
 		},
 		.flags = OP_FLAGS,
@@ -410,6 +485,17 @@ const openapi_path_binding_t openapi_paths[] = {
 				},
 				.parameters = DATA_PARSER_OPENAPI_PARTITION_PARAM,
 				.query = DATA_PARSER_OPENAPI_PARTITIONS_QUERY,
+			},
+			{
+				.method = HTTP_REQUEST_DELETE,
+				.tags = tags,
+				.summary = "delete partition",
+				.response = {
+					.type = DATA_PARSER_OPENAPI_RESP,
+					.description = "partition deletion result",
+				},
+				/* Use ALIAS so it only adds to v45+ */
+				.parameters = DATA_PARSER_OPENAPI_PARTITION_PARAM_ALIAS,
 			},
 			{0}
 		},
@@ -530,6 +616,24 @@ const openapi_path_binding_t openapi_paths[] = {
 					.description = "resource layout information",
 				},
 				.parameters = DATA_PARSER_OPENAPI_JOB_INFO_PARAM,
+			},
+			{0}
+		},
+		.flags = OP_FLAGS,
+	},
+	{
+		.path = "/slurm/{data_parser}/conf",
+		.callback = op_handler_config,
+		.methods = (openapi_path_binding_method_t[]){
+			{
+				.method = HTTP_REQUEST_GET,
+				.tags = tags,
+				.summary = "Dump slurm configuration",
+				.response = {
+					.type = DATA_PARSER_OPENAPI_CONF_RESP,
+					.description = "slurm configuration",
+				},
+				.query = DATA_PARSER_OPENAPI_CONF_QUERY,
 			},
 			{0}
 		},

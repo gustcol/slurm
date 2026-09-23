@@ -42,6 +42,7 @@
 
 #include "src/common/fd.h"
 #include "src/common/log.h"
+#include "src/common/net.h"
 #include "src/common/read_config.h"
 #include "src/common/slurm_protocol_defs.h"
 #include "src/common/strlcpy.h"
@@ -77,6 +78,7 @@ void _xsystemd_notify_barrier(int fd)
 		error("poll timed out: PID on systemd might not be updated");
 
 	close(pipe_fd[0]);
+	xfree(payload);
 	return;
 
 fail:
@@ -89,8 +91,8 @@ extern void xsystemd_change_mainpid(pid_t pid)
 {
 	char *notify_socket = getenv("NOTIFY_SOCKET");
 	char *payload = NULL;
-	size_t len = 0;
 	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+	socklen_t len;
 	int fd = -1;
 
 	if (!notify_socket) {
@@ -99,7 +101,8 @@ extern void xsystemd_change_mainpid(pid_t pid)
 	}
 
 	strlcpy(addr.sun_path, notify_socket, sizeof(addr.sun_path));
-	len = strlen(addr.sun_path) + 1 + sizeof(addr.sun_family);
+	len = sockaddr_fixlen((struct sockaddr *) &addr,
+			      (socklen_t) sizeof(addr));
 
 	if ((fd = socket(AF_UNIX, SOCK_DGRAM, 0)) < 0) {
 		error("%s: socket() failed: %m", __func__);

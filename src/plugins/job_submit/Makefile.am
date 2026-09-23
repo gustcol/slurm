@@ -4,8 +4,12 @@ SUBDIRS = \
 	all_partitions \
 	defaults \
 	logging \
-	lua \
 	partition \
 	pbs \
 	require_timelimit \
+	resilience \
 	throttle
+
+if HAVE_LUA
+SUBDIRS += lua
+endif

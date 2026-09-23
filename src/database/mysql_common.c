@@ -336,6 +336,11 @@ try_again:
 				      __func__, deadlock_attempt,
 				      MAX_DEADLOCK_ATTEMPTS, errno, err_str);
 			}
+		} else if ((errno == ER_CHECKREAD) &&
+			   xstrcasestr(mysql_get_server_info(db_conn),
+				       "mariadb")) {
+			fatal("%s: a concurrent transaction modified a row read by this transaction: %d %s\nSet innodb_snapshot_isolation=OFF in MariaDB, it is not supported by Slurm.\n%s",
+			      __func__, errno, err_str, query);
 		} else if (errno == ER_LOCK_WAIT_TIMEOUT) {
 			/* FIXME: If we get ER_LOCK_WAIT_TIMEOUT here we need
 			 * to restart the connections, but it appears restarting
@@ -888,6 +893,36 @@ next:
 	xfree(tmp_opts);
 }
 
+/* Check if the storage host is a host address or a socket path */
+static void _select_storage_host(storage_host_scheme_t scheme, char *value,
+				 char **db_host, char **db_socket)
+{
+	switch (scheme) {
+	case HOST_SCHEME_ADDR:
+		*db_host = value;
+		*db_socket = NULL;
+		break;
+	case HOST_SCHEME_UNIX:
+		*db_host = NULL;
+		*db_socket = value;
+		break;
+	default:
+		fatal("%s: invalid storage_host_scheme: %d", __func__, scheme);
+	}
+}
+
+/* Log a connection failure with appropriate fields for host vs socket */
+static void _log_connect_failure(mysql_db_info_t *db_info, char *db_host,
+				 char *db_socket)
+{
+	if (db_host)
+		info("Connection failed to host = %s port = %u user = %s",
+		     db_host, db_info->port, db_info->user);
+	else
+		info("Connection failed to socket = %s user = %s",
+		     db_socket, db_info->user);
+}
+
 /* NOTE: Ensure that mysql_conn->lock is set on function entry */
 static int _create_db(char *db_name, mysql_db_info_t *db_info)
 {
@@ -896,6 +931,7 @@ static int _create_db(char *db_name, mysql_db_info_t *db_info)
 
 	MYSQL *db_ptr = NULL;
 	char *db_host = NULL;
+	char *db_socket = NULL;
 
 	while (rc == SLURM_ERROR) {
 		char *pass = NULL;
@@ -906,19 +942,21 @@ static int _create_db(char *db_name, mysql_db_info_t *db_info)
 		_set_mysql_ssl_opts(mysql_db, db_info->params);
 		pass = _current_password(db_info);
 
-		db_host = db_info->host;
+		_select_storage_host(db_info->host_scheme, db_info->host,
+				     &db_host, &db_socket);
 		db_ptr = mysql_real_connect(mysql_db, db_host, db_info->user,
-					    pass, NULL, db_info->port, NULL, 0);
+					    pass, NULL, db_info->port,
+					    db_socket, 0);
 
 		if (!db_ptr && db_info->backup) {
-			info("Connection failed to host = %s "
-			     "user = %s port = %u",
-			     db_host, db_info->user,
-			     db_info->port);
-			db_host = db_info->backup;
-			db_ptr = mysql_real_connect(mysql_db, db_host,
-						    db_info->user, pass, NULL,
-						    db_info->port, NULL, 0);
+			_log_connect_failure(db_info, db_host, db_socket);
+			_select_storage_host(db_info->backup_scheme,
+					     db_info->backup, &db_host,
+					     &db_socket);
+			db_ptr =
+				mysql_real_connect(mysql_db, db_host,
+						   db_info->user, pass, NULL,
+						   db_info->port, db_socket, 0);
 		}
 
 		if (db_ptr) {
@@ -934,10 +972,7 @@ static int _create_db(char *db_name, mysql_db_info_t *db_info)
 				mysql_thread_end();
 			mysql_close(mysql_db);
 		} else {
-			info("Connection failed to host = %s "
-			     "user = %s port = %u",
-			     db_host, db_info->user,
-			     db_info->port);
+			_log_connect_failure(db_info, db_host, db_socket);
 			error("mysql_real_connect failed: %d %s",
 			      mysql_errno(mysql_db),
 			      mysql_error(mysql_db));
@@ -996,18 +1031,36 @@ static void _parse_token_params(mysql_db_info_t *db_info)
 	xfree(duration);
 }
 
+/* Parse path from storage host if it begins with 'unix:' or leave as addr */
+static void _parse_storage_host(const char *src, char **dest,
+				storage_host_scheme_t *scheme)
+{
+	if (!src)
+		return;
+	if (!xstrncasecmp(UNIX_PREFIX, src, UNIX_PREFIX_BYTES)) {
+		if (src[UNIX_PREFIX_BYTES] == '\0')
+			fatal("empty UNIX socket path, expected 'unix:/path'");
+		*scheme = HOST_SCHEME_UNIX;
+		*dest = xstrdup(src + UNIX_PREFIX_BYTES);
+	} else {
+		*scheme = HOST_SCHEME_ADDR;
+		*dest = xstrdup(src);
+	}
+}
+
 extern mysql_db_info_t *create_mysql_db_info(slurm_mysql_plugin_type_t type)
 {
 	mysql_db_info_t *db_info = xmalloc(sizeof(mysql_db_info_t));
+	char *db_backup = NULL;
+	char *db_host = NULL;
 
 	slurm_mutex_init(&db_info->token_lock);
 
 	switch (type) {
 	case SLURM_MYSQL_PLUGIN_AS:
 		db_info->port = slurm_conf.accounting_storage_port;
-		db_info->host = xstrdup(slurm_conf.accounting_storage_host);
-		db_info->backup =
-			xstrdup(slurm_conf.accounting_storage_backup_host);
+		db_host = slurm_conf.accounting_storage_host;
+		db_backup = slurm_conf.accounting_storage_backup_host;
 		db_info->user = xstrdup(slurmdbd_conf->storage_user);
 		db_info->pass = xstrdup(slurm_conf.accounting_storage_pass);
 		db_info->pass_script =
@@ -1018,7 +1071,7 @@ extern mysql_db_info_t *create_mysql_db_info(slurm_mysql_plugin_type_t type)
 		if (!slurm_conf.job_comp_port)
 			slurm_conf.job_comp_port = DEFAULT_MYSQL_PORT;
 		db_info->port = slurm_conf.job_comp_port;
-		db_info->host = xstrdup(slurm_conf.job_comp_host);
+		db_host = slurm_conf.job_comp_host;
 		db_info->user = xstrdup(slurm_conf.job_comp_user);
 		db_info->pass = xstrdup(slurm_conf.job_comp_pass);
 		db_info->pass_script =
@@ -1037,6 +1090,10 @@ extern mysql_db_info_t *create_mysql_db_info(slurm_mysql_plugin_type_t type)
 		debug2("mysql_common: Script-based authentication enabled for %s",
 		       db_info->pass_script);
 	}
+
+	_parse_storage_host(db_host, &db_info->host, &db_info->host_scheme);
+	_parse_storage_host(db_backup, &db_info->backup,
+			    &db_info->backup_scheme);
 
 	return db_info;
 }
@@ -1059,9 +1116,13 @@ extern int mysql_db_get_db_connection(mysql_conn_t *mysql_conn, char *db_name,
 {
 	int rc = SLURM_SUCCESS;
 	bool storage_init = false;
-	char *db_host = db_info->host;
+	char *db_host = NULL;
+	char *db_socket = NULL;
 	char *pass = NULL;
 	unsigned int my_timeout = 30;
+
+	_select_storage_host(db_info->host_scheme, db_info->host, &db_host,
+			     &db_socket);
 
 	xassert(mysql_conn);
 
@@ -1085,15 +1146,18 @@ extern int mysql_db_get_db_connection(mysql_conn_t *mysql_conn, char *db_name,
 	_set_mysql_ssl_opts(mysql_conn->db_conn, db_info->params);
 
 	while (!storage_init) {
-		debug2("Attempting to connect to %s:%d", db_host,
-		       db_info->port);
+		if (db_host)
+			debug2("Attempting to connect to %s:%u",
+			       db_host, db_info->port);
+		else
+			debug2("Attempting to connect to socket %s", db_socket);
 
 		xfree(pass);
 		pass = _current_password(db_info);
 
 		if (!mysql_real_connect(mysql_conn->db_conn, db_host,
 					db_info->user, pass, db_name,
-					db_info->port, NULL,
+					db_info->port, db_socket,
 					CLIENT_MULTI_STATEMENTS)) {
 			const char *err_str = NULL;
 			int err = mysql_errno(mysql_conn->db_conn);
@@ -1115,10 +1179,14 @@ extern int mysql_db_get_db_connection(mysql_conn_t *mysql_conn, char *db_name,
 
 			err_str = mysql_error(mysql_conn->db_conn);
 
-			if ((db_host == db_info->host) && db_info->backup) {
+			if (((db_host == db_info->host) ||
+			     (db_socket == db_info->host)) &&
+			    db_info->backup) {
 				debug2("mysql_real_connect failed: %d %s",
 				       err, err_str);
-				db_host = db_info->backup;
+				_select_storage_host(db_info->backup_scheme,
+						     db_info->backup, &db_host,
+						     &db_socket);
 				continue;
 			}
 
@@ -1174,11 +1242,16 @@ extern int mysql_db_query(mysql_conn_t *mysql_conn, char *query)
 {
 	int rc = SLURM_SUCCESS;
 
-	if (!mysql_conn || !mysql_conn->db_conn) {
+	if (!mysql_conn) {
 		fatal("You haven't inited this storage yet.");
 		return 0;	/* For CLANG false positive */
 	}
 	slurm_mutex_lock(&mysql_conn->lock);
+	if (!mysql_conn->db_conn) {
+		slurm_mutex_unlock(&mysql_conn->lock);
+		fatal("You haven't inited this storage yet.");
+		return 0; /* For CLANG false positive */
+	}
 	rc = _mysql_query_internal(mysql_conn->db_conn, query);
 	slurm_mutex_unlock(&mysql_conn->lock);
 	return rc;
@@ -1192,11 +1265,16 @@ extern int mysql_db_delete_affected_rows(mysql_conn_t *mysql_conn, char *query)
 {
 	int rc = SLURM_SUCCESS;
 
-	if (!mysql_conn || !mysql_conn->db_conn) {
+	if (!mysql_conn) {
 		fatal("You haven't inited this storage yet.");
 		return 0;	/* For CLANG false positive */
 	}
 	slurm_mutex_lock(&mysql_conn->lock);
+	if (!mysql_conn->db_conn) {
+		slurm_mutex_unlock(&mysql_conn->lock);
+		fatal("You haven't inited this storage yet.");
+		return 0; /* For CLANG false positive */
+	}
 	if (!(rc = _mysql_query_internal(mysql_conn->db_conn, query)))
 		rc = mysql_affected_rows(mysql_conn->db_conn);
 	slurm_mutex_unlock(&mysql_conn->lock);
@@ -1207,11 +1285,12 @@ extern int mysql_db_ping(mysql_conn_t *mysql_conn)
 {
 	int rc;
 
-	if (!mysql_conn->db_conn)
-		return -1;
-
 	/* clear out the old results so we don't get a 2014 error */
 	slurm_mutex_lock(&mysql_conn->lock);
+	if (!mysql_conn->db_conn) {
+		slurm_mutex_unlock(&mysql_conn->lock);
+		return -1;
+	}
 	_clear_results(mysql_conn->db_conn);
 	rc = mysql_ping(mysql_conn->db_conn);
 	/*
@@ -1228,10 +1307,11 @@ extern int mysql_db_commit(mysql_conn_t *mysql_conn)
 {
 	int rc = SLURM_SUCCESS;
 
-	if (!mysql_conn->db_conn)
-		return SLURM_ERROR;
-
 	slurm_mutex_lock(&mysql_conn->lock);
+	if (!mysql_conn->db_conn) {
+		slurm_mutex_unlock(&mysql_conn->lock);
+		return SLURM_ERROR;
+	}
 	/* clear out the old results so we don't get a 2014 error */
 	_clear_results(mysql_conn->db_conn);
 	if (mysql_commit(mysql_conn->db_conn)) {
@@ -1249,10 +1329,11 @@ extern int mysql_db_rollback(mysql_conn_t *mysql_conn)
 {
 	int rc = SLURM_SUCCESS;
 
-	if (!mysql_conn->db_conn)
-		return SLURM_ERROR;
-
 	slurm_mutex_lock(&mysql_conn->lock);
+	if (!mysql_conn->db_conn) {
+		slurm_mutex_unlock(&mysql_conn->lock);
+		return SLURM_ERROR;
+	}
 	/* clear out the old results so we don't get a 2014 error */
 	_clear_results(mysql_conn->db_conn);
 	if (mysql_rollback(mysql_conn->db_conn)) {

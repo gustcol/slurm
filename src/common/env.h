@@ -27,9 +27,10 @@
 #ifndef _ENV_H
 #define _ENV_H
 
+#include <stdarg.h>
 #include <sys/types.h>
-#include <unistd.h>
 #include <sys/utsname.h>
+#include <unistd.h>
 
 #include "slurm/slurm.h"
 #include "src/common/macros.h"
@@ -38,6 +39,7 @@
 #include "src/common/xregex.h"
 
 typedef struct env_options {
+	slurm_step_id_t step_id;
 	int ntasks;		/* --ntasks=n,      -n n	*/
 	char *task_count;
 	bool ntasks_set;	/* true if ntasks explicitly set */
@@ -63,8 +65,6 @@ typedef struct env_options {
 	uint16_t comm_port;	/* srun's communication port */
 	slurm_addr_t *cli; /* launch node address - DON'T FREE, ref only */
 	char *job_name;		/* assigned job name */
-	int jobid;		/* assigned job id */
-	int stepid;	        /* assigned step id */
 	int procid;		/* global task id (across nodes) */
 	int localid;		/* local task id (within node) */
 	int nodeid;
@@ -104,7 +104,16 @@ int	envcount (char **env);
 char *	getenvp(char **env, const char *name);
 int	setenvf(char ***envp, const char *name, const char *fmt, ...)
 		__attribute__ ((format (printf, 3, 4)));
-int	setenvfs(const char *fmt, ...);
+extern int vsetenvf(char ***envp, const char *name, const char *fmt,
+		    va_list ap);
+
+/*
+ * Set a variable in the callers environment.
+ * IN fmt - printf() formatting string
+ * NOTE: setenv() copies the name and value, so nothing is left allocated.
+ * Example: setenvfs("RMS_RANK=%d", rank);
+ */
+extern int setenvfs(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void	unsetenvp(char **env, const char *name);
 
 int	setup_env(env_t *env, bool preserve_env);

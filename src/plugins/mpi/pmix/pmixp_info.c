@@ -159,8 +159,14 @@ extern int pmixp_info_set(const stepd_step_rec_t *step, char ***env)
 	memcpy(&_pmixp_job_info.step_id, &step->step_id,
 	       sizeof(_pmixp_job_info.step_id));
 
-	if (step->het_job_id && (step->het_job_id != NO_VAL))
+	if (step->het_job_id && (step->het_job_id != NO_VAL)) {
 		_pmixp_job_info.step_id.job_id = step->het_job_id;
+		/*
+		 * Clear the component sluid since the newly copied job_id
+		 * refers to the leader
+		 */
+		_pmixp_job_info.step_id.sluid = 0;
+	}
 
 	if ((step->het_job_offset != NO_VAL) &&
 	    (step->het_job_step_task_cnts)) {
@@ -223,20 +229,6 @@ extern int pmixp_info_set(const stepd_step_rec_t *step, char ***env)
 
 	_pmixp_job_info.task_dist =
 		slurm_step_layout_type_name(step->task_dist);
-
-#if 0
-	if ((step->het_job_id != 0) && (step->het_job_id != NO_VAL))
-		info("HET_JOB_ID:%u", _pmixp_job_info.step_id.job_id);
-	info("%ps", &_pmixp_job_info.step_id);
-	info("NODEID:%u", _pmixp_job_info.node_id);
-	info("NODE_TASKS:%u", _pmixp_job_info.node_tasks);
-	info("NTASKS:%u", _pmixp_job_info.ntasks);
-	info("NNODES:%u", _pmixp_job_info.nnodes);
-	for (i = 0; i < _pmixp_job_info.nnodes; i++)
-		info("TASK_CNT[%d]:%u", i,_pmixp_job_info.task_cnts[i]);
-	for (i = 0; i < step->node_tasks; i++)
-		info("GTIDS[%d]:%u", i, _pmixp_job_info.gtids[i]);
-#endif
 
 	_pmixp_job_info.hostname = xstrdup(step->node_name);
 
@@ -346,7 +338,6 @@ static int _resources_set(char ***env)
 						    _pmixp_job_info.hostname);
 
 	_pmixp_job_info.ntasks_job = _pmixp_job_info.ntasks;
-	_pmixp_job_info.ncpus_job = _pmixp_job_info.ntasks;
 
 	/* Save task-to-node mapping */
 	p = getenvp(*env, PMIXP_SLURM_MAPPING_ENV);
@@ -632,37 +623,37 @@ static int _env_set(const stepd_step_rec_t *step, char ***env)
 	return SLURM_SUCCESS;
 }
 
-extern int pmixp_info_timeout()
+extern int pmixp_info_timeout(void)
 {
 	xassert(_pmixp_job_info.magic == PMIXP_INFO_MAGIC);
 	return _pmixp_job_info.timeout;
 }
 
 /* My hostname */
-extern char *pmixp_info_hostname()
+extern char *pmixp_info_hostname(void)
 {
 	return _pmixp_job_info.hostname;
 }
 
 /* Cli tempdir */
-extern char *pmixp_info_tmpdir_cli()
+extern char *pmixp_info_tmpdir_cli(void)
 {
 	return _pmixp_job_info.cli_tmpdir;
 }
 
-extern char *pmixp_info_tmpdir_cli_base()
+extern char *pmixp_info_tmpdir_cli_base(void)
 {
 	return _pmixp_job_info.cli_tmpdir_base;
 }
 
 /* Lib tempdir */
-extern char *pmixp_info_tmpdir_lib()
+extern char *pmixp_info_tmpdir_lib(void)
 {
 	return _pmixp_job_info.lib_tmpdir;
 }
 
 /* client Lib tempdir */
-extern char *_pmixp_info_client_tmpdir_lib()
+extern char *_pmixp_info_client_tmpdir_lib(void)
 {
 	if (_pmixp_job_info.client_lib_tmpdir)
 		return _pmixp_job_info.client_lib_tmpdir;
@@ -670,25 +661,25 @@ extern char *_pmixp_info_client_tmpdir_lib()
 		return pmixp_info_tmpdir_lib();
 }
 
-extern char *pmixp_info_cmd()
+extern char *pmixp_info_cmd(void)
 {
 	xassert(_pmixp_job_info.magic == PMIXP_INFO_MAGIC);
 	return _pmixp_job_info.cmd;
 }
 
-extern uint32_t pmixp_info_jobuid()
+extern uint32_t pmixp_info_jobuid(void)
 {
 	xassert(_pmixp_job_info.magic == PMIXP_INFO_MAGIC);
 	return _pmixp_job_info.uid;
 }
 
-extern uint32_t pmixp_info_jobgid()
+extern uint32_t pmixp_info_jobgid(void)
 {
 	xassert(_pmixp_job_info.magic == PMIXP_INFO_MAGIC);
 	return _pmixp_job_info.gid;
 }
 
-extern uint32_t pmixp_info_jobid()
+extern uint32_t pmixp_info_jobid(void)
 {
 	xassert(_pmixp_job_info.magic == PMIXP_INFO_MAGIC);
 	return _pmixp_job_info.step_id.job_id;
@@ -702,13 +693,13 @@ extern uint32_t pmixp_info_job_offset(int rank)
 	return _pmixp_job_info.het_job_offset[rank];
 }
 
-extern char *pmixp_info_srun_ip()
+extern char *pmixp_info_srun_ip(void)
 {
 	xassert(_pmixp_job_info.magic == PMIXP_INFO_MAGIC);
 	return _pmixp_job_info.srun_ip;
 }
 
-extern int pmixp_info_abort_agent_port()
+extern int pmixp_info_abort_agent_port(void)
 {
 	xassert(_pmixp_job_info.magic == PMIXP_INFO_MAGIC);
 	return _pmixp_job_info.abort_agent_port;
@@ -720,19 +711,19 @@ extern slurm_step_id_t *pmixp_info_step_id(void)
 	return &_pmixp_job_info.step_id;
 }
 
-extern uint32_t pmixp_info_stepid()
+extern uint32_t pmixp_info_stepid(void)
 {
 	xassert(_pmixp_job_info.magic == PMIXP_INFO_MAGIC);
 	return _pmixp_job_info.step_id.step_id;
 }
 
-extern char *pmixp_info_namespace()
+extern char *pmixp_info_namespace(void)
 {
 	xassert(_pmixp_job_info.magic == PMIXP_INFO_MAGIC);
 	return _pmixp_job_info.nspace;
 }
 
-extern uint32_t pmixp_info_nodeid()
+extern uint32_t pmixp_info_nodeid(void)
 {
 	/* This routine is called from PMIX_DEBUG/ERROR and
 	 * this CAN happen before initialization. Relax demand to have
@@ -742,7 +733,7 @@ extern uint32_t pmixp_info_nodeid()
 	return _pmixp_job_info.node_id;
 }
 
-extern uint32_t pmixp_info_nodeid_job()
+extern uint32_t pmixp_info_nodeid_job(void)
 {
 	/* This routine is called from PMIX_DEBUG/ERROR and
 	 * this CAN happen before initialization. Relax demand to have
@@ -752,53 +743,40 @@ extern uint32_t pmixp_info_nodeid_job()
 	return _pmixp_job_info.node_id_job;
 }
 
-extern uint32_t pmixp_info_nodes()
+extern uint32_t pmixp_info_nodes(void)
 {
 	xassert(_pmixp_job_info.magic == PMIXP_INFO_MAGIC);
 	return _pmixp_job_info.nnodes;
 }
 
-extern uint32_t pmixp_info_nodes_uni()
+extern uint32_t pmixp_info_nodes_uni(void)
 {
 	xassert(_pmixp_job_info.magic == PMIXP_INFO_MAGIC);
 	return _pmixp_job_info.nnodes_job;
 }
 
-extern uint32_t pmixp_info_tasks()
+extern uint32_t pmixp_info_tasks(void)
 {
 	xassert(_pmixp_job_info.magic == PMIXP_INFO_MAGIC);
 	return _pmixp_job_info.ntasks;
 }
 
-extern uint32_t pmixp_info_tasks_node(uint32_t nodeid)
-{
-	xassert(_pmixp_job_info.magic == PMIXP_INFO_MAGIC);
-	xassert(nodeid < _pmixp_job_info.nnodes);
-	return _pmixp_job_info.task_cnts[nodeid];
-}
-
-extern uint32_t *pmixp_info_tasks_cnts()
+extern uint32_t *pmixp_info_tasks_cnts(void)
 {
 	xassert(_pmixp_job_info.magic == PMIXP_INFO_MAGIC);
 	return _pmixp_job_info.task_cnts;
 }
 
-extern uint32_t pmixp_info_tasks_loc()
+extern uint32_t pmixp_info_tasks_loc(void)
 {
 	xassert(_pmixp_job_info.magic == PMIXP_INFO_MAGIC);
 	return _pmixp_job_info.node_tasks;
 }
 
-extern uint32_t pmixp_info_tasks_uni()
+extern uint32_t pmixp_info_tasks_uni(void)
 {
 	xassert(_pmixp_job_info.magic == PMIXP_INFO_MAGIC);
 	return _pmixp_job_info.ntasks_job;
-}
-
-extern uint32_t pmixp_info_cpus()
-{
-	xassert(_pmixp_job_info.magic == PMIXP_INFO_MAGIC);
-	return _pmixp_job_info.ncpus_job;
 }
 
 extern uint32_t pmixp_info_taskid(uint32_t localid)
@@ -826,33 +804,19 @@ extern int pmixp_info_taskid2localid(uint32_t taskid)
 	return -1;
 }
 
-extern char *pmixp_info_task_dist()
+extern char *pmixp_info_task_dist(void)
 {
 	return _pmixp_job_info.task_dist;
 }
 
-extern char *pmixp_info_task_map()
+extern char *pmixp_info_task_map(void)
 {
 	return _pmixp_job_info.task_map_packed;
 }
 
-extern hostlist_t *pmixp_info_step_hostlist()
+extern hostlist_t *pmixp_info_step_hostlist(void)
 {
 	return _pmixp_job_info.step_hl;
-}
-
-extern char *pmixp_info_step_host(int nodeid)
-{
-	xassert(nodeid < _pmixp_job_info.nnodes);
-	char *p = hostlist_nth(_pmixp_job_info.step_hl, nodeid);
-	char *ret = xstrdup(p);
-	free(p);
-	return ret;
-}
-
-extern int pmixp_info_step_hostid(char *hostname)
-{
-	return hostlist_find(_pmixp_job_info.step_hl, hostname);
 }
 
 extern char *pmixp_info_job_host(int nodeid)
@@ -882,13 +846,13 @@ extern char *pmixp_info_nspace_usock(const char *nspace)
 	return spool;
 }
 
-extern uint32_t pmixp_info_appldr()
+extern uint32_t pmixp_info_appldr(void)
 {
 	xassert(_pmixp_job_info.magic == PMIXP_INFO_MAGIC);
 	return _pmixp_job_info.app_ldr;
 }
 
-extern uint32_t pmixp_info_flags()
+extern uint32_t pmixp_info_flags(void)
 {
 	xassert(_pmixp_job_info.magic == PMIXP_INFO_MAGIC);
 	return _pmixp_job_info.flags;

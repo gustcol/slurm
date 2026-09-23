@@ -163,18 +163,18 @@ static int _setup_cluster_cond_limits(slurmdb_cluster_cond_t *cluster_cond,
 		return 0;
 
 	if (cluster_cond->with_deleted)
-		xstrcat(*extra, " where (deleted=0 || deleted=1)");
+		xstrcat(*extra, " where (deleted=0 or deleted=1)");
 	else
 		xstrcat(*extra, " where deleted=0");
 
 	if (cluster_cond->cluster_list
 	    && list_count(cluster_cond->cluster_list)) {
 		set = 0;
-		xstrcat(*extra, " && (");
+		xstrcat(*extra, " and (");
 		itr = list_iterator_create(cluster_cond->cluster_list);
 		while ((object = list_next(itr))) {
 			if (set)
-				xstrcat(*extra, " || ");
+				xstrcat(*extra, " or ");
 			xstrfmtcat(*extra, "name='%s'", object);
 			set = 1;
 		}
@@ -185,11 +185,11 @@ static int _setup_cluster_cond_limits(slurmdb_cluster_cond_t *cluster_cond,
 	if (cluster_cond->federation_list
 	    && list_count(cluster_cond->federation_list)) {
 		set = 0;
-		xstrcat(*extra, " && (");
+		xstrcat(*extra, " and (");
 		itr = list_iterator_create(cluster_cond->federation_list);
 		while ((object = list_next(itr))) {
 			if (set)
-				xstrcat(*extra, " || ");
+				xstrcat(*extra, " or ");
 			xstrfmtcat(*extra, "federation='%s'", object);
 			set = 1;
 		}
@@ -200,11 +200,11 @@ static int _setup_cluster_cond_limits(slurmdb_cluster_cond_t *cluster_cond,
 	if (cluster_cond->rpc_version_list
 	    && list_count(cluster_cond->rpc_version_list)) {
 		set = 0;
-		xstrcat(*extra, " && (");
+		xstrcat(*extra, " and (");
 		itr = list_iterator_create(cluster_cond->rpc_version_list);
 		while ((object = list_next(itr))) {
 			if (set)
-				xstrcat(*extra, " || ");
+				xstrcat(*extra, " or ");
 			xstrfmtcat(*extra, "rpc_version='%s'", object);
 			set = 1;
 		}
@@ -213,12 +213,12 @@ static int _setup_cluster_cond_limits(slurmdb_cluster_cond_t *cluster_cond,
 	}
 
 	if (cluster_cond->classification) {
-		xstrfmtcat(*extra, " && (classification & %u)",
+		xstrfmtcat(*extra, " and (classification & %u)",
 			   cluster_cond->classification);
 	}
 
 	if (cluster_cond->flags != NO_VAL) {
-		xstrfmtcat(*extra, " && (flags & %u)",
+		xstrfmtcat(*extra, " and (flags & %u)",
 			   cluster_cond->flags);
 	}
 
@@ -318,6 +318,12 @@ extern int as_mysql_add_clusters(mysql_conn_t *mysql_conn, uint32_t uid,
 			error("We need a cluster name to add.");
 			rc = SLURM_ERROR;
 			list_remove(itr);
+			continue;
+		}
+		if (as_mysql_validate_cluster_name(object->name) !=
+		    SLURM_SUCCESS) {
+			rc = ESLURM_INVALID_CLUSTER_NAME;
+			list_delete_item(itr);
 			continue;
 		}
 		if ((object->flags != NO_VAL) &&
@@ -627,6 +633,10 @@ extern list_t *as_mysql_modify_clusters(mysql_conn_t *mysql_conn, uint32_t uid,
 		return NULL;
 	}
 
+	if (as_mysql_validate_cluster_list(cluster_cond->cluster_list) !=
+	    SLURM_SUCCESS)
+		return NULL;
+
 	/* force to only do non-deleted clusters */
 	cluster_cond->with_deleted = 0;
 	_setup_cluster_cond_limits(cluster_cond, &extra);
@@ -863,6 +873,10 @@ extern list_t *as_mysql_remove_clusters(mysql_conn_t *mysql_conn, uint32_t uid,
 		return NULL;
 	}
 
+	if (as_mysql_validate_cluster_list(cluster_cond->cluster_list) !=
+	    SLURM_SUCCESS)
+		return NULL;
+
 	/* force to only do non-deleted clusters */
 	cluster_cond->with_deleted = 0;
 	_setup_cluster_cond_limits(cluster_cond, &extra);
@@ -1026,6 +1040,10 @@ extern list_t *as_mysql_get_clusters(mysql_conn_t *mysql_conn, uid_t uid,
 		xstrcat(extra, " where deleted=0");
 		goto empty;
 	}
+
+	if (as_mysql_validate_cluster_list(cluster_cond->cluster_list) !=
+	    SLURM_SUCCESS)
+		return NULL;
 
 	_setup_cluster_cond_limits(cluster_cond, &extra);
 
@@ -1209,9 +1227,13 @@ extern list_t *as_mysql_get_cluster_events(mysql_conn_t *mysql_conn, uint32_t ui
 	if (!event_cond)
 		goto empty;
 
+	if (as_mysql_validate_cluster_list(event_cond->cluster_list) !=
+	    SLURM_SUCCESS)
+		return NULL;
+
 	if (event_cond->cpus_min) {
 		if (extra)
-			xstrcat(extra, " && (");
+			xstrcat(extra, " and (");
 		else
 			xstrcat(extra, " where (");
 
@@ -1236,7 +1258,7 @@ extern list_t *as_mysql_get_cluster_events(mysql_conn_t *mysql_conn, uint32_t ui
 		break;
 	case SLURMDB_EVENT_CLUSTER:
 		if (extra)
-			xstrcat(extra, " && (");
+			xstrcat(extra, " and (");
 		else
 			xstrcat(extra, " where (");
 		xstrcat(extra, "node_name = '')");
@@ -1244,7 +1266,7 @@ extern list_t *as_mysql_get_cluster_events(mysql_conn_t *mysql_conn, uint32_t ui
 		break;
 	case SLURMDB_EVENT_NODE:
 		if (extra)
-			xstrcat(extra, " && (");
+			xstrcat(extra, " and (");
 		else
 			xstrcat(extra, " where (");
 		xstrcat(extra, "node_name != '')");
@@ -1272,13 +1294,13 @@ extern list_t *as_mysql_get_cluster_events(mysql_conn_t *mysql_conn, uint32_t ui
 
 		set = 0;
 		if (extra)
-			xstrcat(extra, " && (");
+			xstrcat(extra, " and (");
 		else
 			xstrcat(extra, " where (");
 
 		while ((object = hostlist_shift(temp_hl))) {
 			if (set)
-				xstrcat(extra, " || ");
+				xstrcat(extra, " or ");
 			xstrfmtcat(extra, "node_name='%s'", object);
 			set = 1;
 			free(object);
@@ -1292,24 +1314,24 @@ extern list_t *as_mysql_get_cluster_events(mysql_conn_t *mysql_conn, uint32_t ui
 			event_cond->period_end = now;
 
 		if (extra)
-			xstrcat(extra, " && (");
+			xstrcat(extra, " and (");
 		else
 			xstrcat(extra, " where (");
 
 		if (event_cond->cond_flags & SLURMDB_EVENT_COND_OPEN)
 			xstrfmtcat(extra,
-				   "(time_start >= %ld) && (time_end = 0))",
+				   "(time_start >= %ld) and (time_end = 0))",
 				   event_cond->period_start);
 		else
 			xstrfmtcat(extra,
 				   "(time_start < %ld) "
-				   "&& (time_end >= %ld || time_end = 0))",
+				   "and (time_end >= %ld or time_end = 0))",
 				   event_cond->period_end,
 				   event_cond->period_start);
 
 	} else if (event_cond->cond_flags & SLURMDB_EVENT_COND_OPEN) {
 		if (extra)
-			xstrcat(extra, " && (");
+			xstrcat(extra, " and (");
 		else
 			xstrcat(extra, " where (");
 
@@ -1320,13 +1342,13 @@ extern list_t *as_mysql_get_cluster_events(mysql_conn_t *mysql_conn, uint32_t ui
 	    && list_count(event_cond->reason_list)) {
 		set = 0;
 		if (extra)
-			xstrcat(extra, " && (");
+			xstrcat(extra, " and (");
 		else
 			xstrcat(extra, " where (");
 		itr = list_iterator_create(event_cond->reason_list);
 		while ((object = list_next(itr))) {
 			if (set)
-				xstrcat(extra, " || ");
+				xstrcat(extra, " or ");
 			xstrfmtcat(extra, "reason like '%%%s%%'", object);
 			set = 1;
 		}
@@ -1338,13 +1360,13 @@ extern list_t *as_mysql_get_cluster_events(mysql_conn_t *mysql_conn, uint32_t ui
 	    && list_count(event_cond->reason_uid_list)) {
 		set = 0;
 		if (extra)
-			xstrcat(extra, " && (");
+			xstrcat(extra, " and (");
 		else
 			xstrcat(extra, " where (");
 		itr = list_iterator_create(event_cond->reason_uid_list);
 		while ((object = list_next(itr))) {
 			if (set)
-				xstrcat(extra, " || ");
+				xstrcat(extra, " or ");
 			xstrfmtcat(extra, "reason_uid='%s'", object);
 			set = 1;
 		}
@@ -1356,14 +1378,14 @@ extern list_t *as_mysql_get_cluster_events(mysql_conn_t *mysql_conn, uint32_t ui
 	    && list_count(event_cond->state_list)) {
 		set = 0;
 		if (extra)
-			xstrcat(extra, " && (");
+			xstrcat(extra, " and (");
 		else
 			xstrcat(extra, " where (");
 		itr = list_iterator_create(event_cond->state_list);
 		while ((object = list_next(itr))) {
 			uint32_t tmp_state = strtol(object, NULL, 10);
 			if (set)
-				xstrcat(extra, " || ");
+				xstrcat(extra, " or ");
 			if (tmp_state & NODE_STATE_BASE)
 				xstrfmtcat(extra, "(state&%u)=%u",
 					   NODE_STATE_BASE,
@@ -1608,6 +1630,10 @@ extern list_t *as_mysql_get_instances(mysql_conn_t *mysql_conn, uint32_t uid,
 		}
 	}
 
+	if (instance_cond &&
+	    (as_mysql_validate_cluster_list(instance_cond->cluster_list) !=
+	     SLURM_SUCCESS))
+		return NULL;
 
 	/* determine cluster list */
 	if (instance_cond && instance_cond->cluster_list &&
@@ -1669,15 +1695,14 @@ extern list_t *as_mysql_get_instances(mysql_conn_t *mysql_conn, uint32_t uid,
 			    mysql_conn,
 			    (char *) list_peek(use_cluster_list),
 			    &dims)) {
-			xfree(where_clause);
-			return NULL;
+			goto end_it;
 		}
 
 		temp_hl = hostlist_create_dims(instance_cond->node_list, dims);
 		if (hostlist_count(temp_hl) <= 0) {
-			xfree(where_clause);
 			error("we didn't get any real hosts to look for.");
-			return NULL;
+			FREE_NULL_HOSTLIST(temp_hl);
+			goto end_it;
 		}
 
 		set = 0;
@@ -1741,6 +1766,8 @@ empty:
 		mysql_free_result(result);
 	}
 	list_iterator_destroy(itr);
+
+end_it:
 	xfree(tmp);
 	xfree(where_clause);
 
@@ -1984,8 +2011,8 @@ extern int as_mysql_fini_ctld(mysql_conn_t *mysql_conn,
 	*/
 	query = xstrdup_printf(
 		"update %s set mod_time=%ld, control_host='', "
-		"control_port=0 where name='%s' && "
-		"control_host='%s' && control_port=%u;",
+		"control_port=0 where name='%s' and "
+		"control_host='%s' and control_port=%u;",
 		cluster_table, now, cluster_rec->name,
 		cluster_rec->control_host, cluster_rec->control_port);
 	DB_DEBUG(DB_EVENT, mysql_conn->conn, "query\n%s", query);

@@ -35,6 +35,8 @@ libcommon_interfaces_la_SOURCES =    \
 	certgen.h				\
 	certmgr.c				\
 	certmgr.h				\
+	compress.c				\
+	compress.h				\
 	cgroup.c				\
 	cgroup.h				\
 	cli_filter.c				\
@@ -73,6 +75,8 @@ libcommon_interfaces_la_SOURCES =    \
 	prep.h					\
 	priority.c				\
 	priority.h				\
+	runtime.c				\
+	runtime.h				\
 	select.c				\
 	select.h				\
 	serializer.c				\

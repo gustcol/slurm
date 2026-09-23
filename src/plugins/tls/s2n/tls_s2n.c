@@ -34,6 +34,7 @@
 \*****************************************************************************/
 
 #include <s2n.h>
+#include <signal.h>
 #include <sys/poll.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -45,6 +46,7 @@
 #include "src/common/fd.h"
 #include "src/common/log.h"
 #include "src/common/macros.h"
+#include "src/common/openssl_helper.h"
 #include "src/common/read_config.h"
 #include "src/common/run_in_daemon.h"
 #include "src/common/slurm_time.h"
@@ -90,8 +92,12 @@ static bool is_own_cert_trusted_by_ca = false;
 static pthread_rwlock_t s2n_conf_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 static uint32_t s2n_conf_conn_cnt = 0;
+static uint32_t s2n_all_conn_cnt = 0;
 static pthread_mutex_t s2n_conf_cnt_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t s2n_conf_cnt_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t s2n_all_cnt_cond = PTHREAD_COND_INITIALIZER;
+
+static bool fini_run = false;
 
 /*
  * These are defined here so when we link with something other than
@@ -726,6 +732,12 @@ extern int init(void)
 		return SLURM_SUCCESS;
 	init_run = true;
 
+	/*
+	 * s2n_init() initializes libcrypto, so disable OpenSSL's atexit()
+	 * cleanup first to avoid a teardown race at shutdown.
+	 */
+	openssl_helper_disable_atexit(plugin_type);
+
 	if (s2n_init() != S2N_SUCCESS) {
 		on_s2n_error(NULL, s2n_init);
 		return errno;
@@ -766,11 +778,33 @@ extern int init(void)
 
 extern void fini(void)
 {
-	static bool fini_run = false;
+	struct timespec ts = { 0, 0 };
+	int drain_timeout = (2 * slurm_conf.msg_timeout);
 
-	if (fini_run)
+	slurm_mutex_lock(&s2n_conf_cnt_lock);
+	if (fini_run) {
+		slurm_mutex_unlock(&s2n_conf_cnt_lock);
 		return;
+	}
 	fini_run = true;
+
+	/*
+	 * Wait for remaining connections to close before freeing the global
+	 * configs they may still be using. If connections don't close within
+	 * the timeout, leave the global configs allocated and return to avoid a
+	 * use-after-free failure.
+	 */
+	ts.tv_sec = (time(NULL) + drain_timeout);
+	while (s2n_all_conn_cnt) {
+		if (time(NULL) >= ts.tv_sec) {
+			error("%s: timed out after %d seconds waiting for %u connection(s) to drain, skipping cleanup",
+			      __func__, drain_timeout, s2n_all_conn_cnt);
+			slurm_mutex_unlock(&s2n_conf_cnt_lock);
+			return;
+		}
+		slurm_cond_timedwait(&s2n_all_cnt_cond, &s2n_conf_cnt_lock,
+				     &ts);
+	}
 
 	if (s2n_config_free(client_config))
 		on_s2n_error(NULL, s2n_config_free);
@@ -792,6 +826,8 @@ extern void fini(void)
 
 	xfree(own_cert);
 	xfree(own_key);
+
+	slurm_mutex_unlock(&s2n_conf_cnt_lock);
 }
 
 static int _negotiate(tls_conn_t *conn)
@@ -903,6 +939,7 @@ extern bool tls_p_own_cert_loaded(void)
 static void _s2n_config_inc(tls_conn_t *conn)
 {
 	xassert(conn->magic == TLS_CONN_MAGIC);
+	xassert(conn->using_global_s2n_conf);
 
 	slurm_mutex_lock(&s2n_conf_cnt_lock);
 	s2n_conf_conn_cnt++;
@@ -915,15 +952,29 @@ static void _s2n_config_dec(tls_conn_t *conn)
 
 	slurm_mutex_lock(&s2n_conf_cnt_lock);
 
-	if (s2n_conf_conn_cnt > 0) {
-		s2n_conf_conn_cnt--;
-	} else {
-		error("%s: unexpected underflow", __func__);
+	/* Only connections using the global config hold a conf refcount */
+	if (conn->using_global_s2n_conf) {
+		if (s2n_conf_conn_cnt)
+			s2n_conf_conn_cnt--;
+		else
+			error("%s: unexpected s2n_conf_conn_cnt underflow",
+			      __func__);
+
+		if (!s2n_conf_conn_cnt)
+			slurm_cond_signal(&s2n_conf_cnt_cond);
 	}
 
-	if (s2n_conf_conn_cnt == 0) {
-		slurm_cond_signal(&s2n_conf_cnt_cond);
-	}
+	/*
+	 * All connections are tracked by s2n_all_conn_cnt, so decrement it
+	 * unconditionally here.
+	 */
+	if (s2n_all_conn_cnt)
+		s2n_all_conn_cnt--;
+	else
+		error("%s: unexpected s2n_all_conn_cnt underflow", __func__);
+
+	if (!s2n_all_conn_cnt)
+		slurm_cond_signal(&s2n_all_cnt_cond);
 
 	slurm_mutex_unlock(&s2n_conf_cnt_lock);
 }
@@ -936,6 +987,8 @@ static void _cleanup_tls_conn(tls_conn_t **conn_ptr)
 
 	xassert(conn->magic == TLS_CONN_MAGIC);
 
+	_s2n_config_dec(conn);
+
 	if (conn->s2n_config && (conn->s2n_config != server_config) &&
 	    (conn->s2n_config != client_config))
 		if (s2n_config_free(conn->s2n_config))
@@ -947,9 +1000,6 @@ static void _cleanup_tls_conn(tls_conn_t **conn_ptr)
 
 	if (conn->s2n_conn && s2n_connection_free(conn->s2n_conn) < 0)
 		on_s2n_error(conn, s2n_connection_free);
-
-	if (conn->using_global_s2n_conf)
-		_s2n_config_dec(conn);
 
 	if (s2n_stack_traces_enabled())
 		s2n_free_stacktrace();
@@ -975,7 +1025,6 @@ static int _set_conn_s2n_conf(tls_conn_t *conn,
 			slurm_rwlock_unlock(&s2n_conf_lock);
 			return SLURM_ERROR;
 		}
-		_s2n_config_inc(conn);
 
 		if (is_server)
 			conn->s2n_config = server_config;
@@ -983,6 +1032,8 @@ static int _set_conn_s2n_conf(tls_conn_t *conn,
 			conn->s2n_config = client_config;
 
 		conn->using_global_s2n_conf = true;
+		_s2n_config_inc(conn);
+
 		slurm_rwlock_unlock(&s2n_conf_lock);
 		return SLURM_SUCCESS;
 	}
@@ -1039,6 +1090,24 @@ extern void *tls_p_create_conn(const conn_args_t *tls_conn_args)
 	log_flag(TLS, "%s: create connection. fd:%d->%d. tls mode:%s",
 		 plugin_type, tls_conn_args->input_fd, tls_conn_args->output_fd,
 		 conn_mode_to_str(tls_conn_args->mode));
+
+	slurm_mutex_lock(&s2n_conf_cnt_lock);
+	if (fini_run) {
+		/* Block new connections once fini() has been called */
+		slurm_mutex_unlock(&s2n_conf_cnt_lock);
+		log_flag(TLS, "%s: shutting down, refusing new connection for fd:%d->%d",
+			 plugin_type, tls_conn_args->input_fd,
+			 tls_conn_args->output_fd);
+		return NULL;
+	}
+
+	/*
+	 * Track total connection count here and in _s2n_config_dec(). Every
+	 * connection counted here reaches _cleanup_tls_conn(), including the
+	 * goto fail paths below.
+	 */
+	s2n_all_conn_cnt++;
+	slurm_mutex_unlock(&s2n_conf_cnt_lock);
 
 	conn = xmalloc(sizeof(*conn));
 	conn->magic = TLS_CONN_MAGIC;
@@ -1185,6 +1254,10 @@ extern int tls_p_shutdown_conn(tls_conn_t *conn)
 {
 	s2n_blocked_status blocked = S2N_NOT_BLOCKED;
 	int rc = SLURM_SUCCESS;
+	int shutdown_rc = S2N_SUCCESS;
+	int saved_errno = 0;
+	sigset_t sigpipe_set, oldset, pending;
+	bool sigpipe_was_pending = false;
 
 	xassert(conn);
 	xassert(conn->magic == TLS_CONN_MAGIC);
@@ -1195,25 +1268,80 @@ extern int tls_p_shutdown_conn(tls_conn_t *conn)
 		return SLURM_SUCCESS;
 	}
 
-	log_flag(TLS, "%s: Attempting s2n_shutdown for fd:%d->%d",
+	log_flag(TLS, "%s: Attempting s2n_shutdown_send for fd:%d->%d",
 		 plugin_type, conn->input_fd, conn->output_fd);
 
-	/* Attempt graceful shutdown at TLS layer */
-	if (s2n_shutdown(conn->s2n_conn, &blocked) != S2N_SUCCESS) {
+	/*
+	 * Half-close the TLS connection: send our close_notify but do not wait
+	 * to receive the peer's. This lets both peers shut down gracefully in
+	 * any order without blocking on (or failing against) a dead or slow
+	 * peer. s2n_shutdown_send() only writes, so it can only block on write.
+	 *
+	 * In "persistent" connections, this shutdown on the TLS layer allows
+	 * peers to get s2n_recv() == 0, which indicates a
+	 * successful/intentional shutdown. Without this shutdown, peers would
+	 * get s2n_recv() == -1 and assume the connection failed.
+	 */
+
+	/*
+	 * s2n issues its socket write() without MSG_NOSIGNAL, so sending our
+	 * close_notify to a peer that has already closed raises SIGPIPE (s2n
+	 * requires the application to prevent it). Block SIGPIPE around only
+	 * this shutdown write and drain the instance our write may raise, so
+	 * callers that treat SIGPIPE as fatal (e.g. srun) are not killed by a
+	 * routine connection teardown. Record whether SIGPIPE was already
+	 * pending so an unrelated instance is left intact.
+	 */
+	sigemptyset(&sigpipe_set);
+	sigaddset(&sigpipe_set, SIGPIPE);
+	sigemptyset(&pending);
+	pthread_sigmask(SIG_BLOCK, &sigpipe_set, &oldset);
+	sigpending(&pending);
+	sigpipe_was_pending = sigismember(&pending, SIGPIPE);
+
+	shutdown_rc = s2n_shutdown_send(conn->s2n_conn, &blocked);
+	saved_errno = errno;
+
+	if (!sigpipe_was_pending) {
+		struct timespec zero = { 0, 0 };
+
+		/*
+		 * Consume the SIGPIPE our write may have raised, if any.
+		 * sigtimedwait() returns -1 with EAGAIN when none is pending.
+		 */
+		while ((sigtimedwait(&sigpipe_set, NULL, &zero) == -1) &&
+		       (errno == EINTR))
+			;
+	}
+	pthread_sigmask(SIG_SETMASK, &oldset, NULL);
+	errno = saved_errno;
+
+	if (shutdown_rc != S2N_SUCCESS) {
 		if (s2n_error_get_type(s2n_errno) == S2N_ERR_T_BLOCKED) {
-			if (s2n_errno == S2N_BLOCKED_ON_READ)
-				errno = SLURM_BLOCKED_ON_READ;
-			else if (s2n_errno == S2N_BLOCKED_ON_WRITE)
-				errno = SLURM_BLOCKED_ON_WRITE;
+			rc = SLURM_BLOCKED_ON_WRITE;
+
 			/* Avoid calling on_s2n_error for blocking */
-			on_s2n_block(conn, s2n_shutdown);
-			return EWOULDBLOCK;
+			on_s2n_block(conn, s2n_shutdown_send);
+			return rc;
+		} else if (s2n_error_get_type(s2n_errno) == S2N_ERR_T_IO) {
+			/*
+			 * The underlying socket write failed, which means the
+			 * peer already tore down its end of the connection
+			 * before we could send our close_notify. There is
+			 * nothing left to shut down, so this is not an error:
+			 * the connection is already gone, which is the goal of
+			 * shutdown. Real protocol errors still fall through to
+			 * on_s2n_error() below.
+			 */
+			log_flag(TLS, "%s: s2n_shutdown_send peer already gone for fd:%d->%d: %s",
+				 plugin_type, conn->input_fd, conn->output_fd,
+				 s2n_strerror(s2n_errno, NULL));
 		} else {
-			on_s2n_error(conn, s2n_shutdown);
+			on_s2n_error(conn, s2n_shutdown_send);
 			rc = errno;
 		}
 	} else {
-		log_flag(TLS, "%s: Successfully did s2n_shutdown for  fd:%d->%d.",
+		log_flag(TLS, "%s: Successfully did s2n_shutdown_send for fd:%d->%d.",
 			 plugin_type, conn->input_fd, conn->output_fd);
 	}
 

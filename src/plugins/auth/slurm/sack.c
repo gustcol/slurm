@@ -60,6 +60,7 @@
 #include "src/interfaces/auth.h"
 #include "src/interfaces/serializer.h"
 
+#include "src/plugins/auth/common/auth_common.h"
 #include "src/plugins/auth/slurm/auth_slurm.h"
 
 #define SLURMCTLD_SACK_SOCKET "/run/slurmctld/sack.socket"
@@ -154,7 +155,7 @@ static int _sack_create(conmgr_fd_t *con, buf_t *in)
 	 * root/SlurmUser, who must already exist on all nodes.
 	 */
 	if (use_client_ids)
-		extra = get_identity_string(NULL, uid, gid);
+		extra = auth_common_get_identity_string(NULL, uid, gid);
 
 	if (!(token = create_internal("sack", uid, gid, r_uid,
 				      data, dlen, extra))) {
@@ -287,7 +288,7 @@ extern void init_sack_conmgr(void)
 	const char *path = NULL;
 	const char *env_fd = NULL;
 
-	conmgr_init(0, 0, 0);
+	conmgr_init(0);
 
 	if (sack_fd >= 0) {
 		/* already have the FD -> do nothing */
@@ -300,6 +301,7 @@ extern void init_sack_conmgr(void)
 		char *runtime_dir = NULL, *runtime_socket = NULL;
 		slurm_addr_t addr = {0};
 		mode_t mask;
+		socklen_t bind_len = 0;
 
 		if (running_in_slurmctld()) {
 			_prepare_run_dir("slurmctld", true);
@@ -338,9 +340,11 @@ extern void init_sack_conmgr(void)
 		/* set value of socket path */
 		mask = umask(0);
 
-		/* bind() will EINVAL if socklen=sizeof(addr) */
+		bind_len =
+			sockaddr_fixlen((struct sockaddr *) &addr,
+					(socklen_t) sizeof(struct sockaddr_un));
 		if ((rc = bind(sack_fd, (const struct sockaddr *) &addr,
-			       sizeof(struct sockaddr_un))))
+			       bind_len)))
 			fatal("%s: [%pA] Unable to bind UNIX socket: %m",
 			      __func__, &addr);
 		umask(mask);
@@ -352,7 +356,7 @@ extern void init_sack_conmgr(void)
 			      __func__, &addr);
 	}
 
-	if ((rc = conmgr_process_fd_listen(sack_fd, CON_TYPE_RAW, &events,
+	if ((rc = conmgr_process_fd_listen(sack_fd, CON_TYPE_RAW, NULL, &events,
 					   CON_FLAG_NONE, NULL)))
 		fatal("%s: [fd:%d] conmgr rejected socket: %s",
 		      __func__, sack_fd, slurm_strerror(rc));
@@ -363,11 +367,11 @@ extern void init_sack_conmgr(void)
 	 */
 }
 
-extern int auth_p_get_reconfig_fd(void)
+extern int auth_p_prepare_reconfig_fd(char ***env)
 {
 	if (sack_fd >= 0) {
 		/* Prepare for reconfigure */
-		setenvf(NULL, SACK_RECONFIG_ENV, "%d", sack_fd);
+		setenvf(env, SACK_RECONFIG_ENV, "%d", sack_fd);
 		fd_set_noclose_on_exec(sack_fd);
 	}
 

@@ -58,6 +58,7 @@ extern pid_t getsid(pid_t pid);		/* missing from <unistd.h> */
 #include "src/common/forward.h"
 #include "src/common/hostlist.h"
 #include "src/common/parse_time.h"
+#include "src/common/proc_args.h"
 #include "src/common/read_config.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/slurm_protocol_defs.h"
@@ -94,7 +95,7 @@ static void _destroy_allocation_response_socket(listen_t *listen);
 static void _wait_for_allocation_response(slurm_step_id_t *step_id,
 					  const listen_t *listen,
 					  uint16_t msg_type, int timeout,
-					  void **resp);
+					  void **resp, int interrupt_fd);
 static int _job_will_run_cluster(job_desc_msg_t *req,
 				 will_run_response_msg_t **will_run_resp,
 				 slurmdb_cluster_rec_t *cluster);
@@ -159,6 +160,8 @@ slurm_allocate_resources (job_desc_msg_t *req,
  *      the controller will put the job in the PENDING state.  If
  *      pending callback is not NULL, it will be called with the job_id
  *      of the pending job as the sole parameter.
+ * IN interrupt_fd - If data can be read from this fd (POLLIN), then this
+ *	function will immediately stop blocking and return.
  *
  * RET allocation structure on success, NULL on error set errno to
  *	indicate the error (errno will be ETIMEDOUT if the timeout is reached
@@ -167,7 +170,7 @@ slurm_allocate_resources (job_desc_msg_t *req,
  */
 resource_allocation_response_msg_t *slurm_allocate_resources_blocking(
 	const job_desc_msg_t *user_req, time_t timeout,
-	void (*pending_callback)(slurm_step_id_t *step_id))
+	void (*pending_callback)(slurm_step_id_t *step_id), int interrupt_fd)
 {
 	int rc;
 	slurm_msg_t req_msg;
@@ -261,7 +264,7 @@ resource_allocation_response_msg_t *slurm_allocate_resources_blocking(
 				pending_callback(&step_id);
 			_wait_for_allocation_response(
 				&step_id, listen, RESPONSE_RESOURCE_ALLOCATION,
-				timeout, (void **) &resp);
+				timeout, (void **) &resp, interrupt_fd);
 			/* If NULL, we didn't get the allocation in
 			   the time desired, so just free the job id */
 			if ((resp == NULL) && (errno != ESLURM_ALREADY_DONE)) {
@@ -475,6 +478,8 @@ static void _het_job_alloc_test(list_t *resp, uint32_t *node_cnt,
  *      the controller will put the job in the PENDING state.  If
  *      pending callback is not NULL, it will be called with the job_id
  *      of the pending job as the sole parameter.
+ * IN interrupt_fd - If data can be read from this fd (POLLIN), then this
+ *	function will immediately stop blocking and return.
  *
  * RET List of allocation structures on success, NULL on error set errno to
  *	indicate the error (errno will be ETIMEDOUT if the timeout is reached
@@ -483,7 +488,7 @@ static void _het_job_alloc_test(list_t *resp, uint32_t *node_cnt,
  */
 list_t *slurm_allocate_het_job_blocking(
 	list_t *job_req_list, time_t timeout,
-	void (*pending_callback)(slurm_step_id_t *step_id))
+	void (*pending_callback)(slurm_step_id_t *step_id), int interrupt_fd)
 {
 	int rc;
 	slurm_msg_t req_msg;
@@ -577,7 +582,7 @@ list_t *slurm_allocate_het_job_blocking(
 				pending_callback(&step_id);
 			_wait_for_allocation_response(
 				&step_id, listen, RESPONSE_HET_JOB_ALLOCATION,
-				timeout, (void **) &resp);
+				timeout, (void **) &resp, interrupt_fd);
 			/* If NULL, we didn't get the allocation in
 			 * the time desired, so just free the job id */
 			if ((resp == NULL) && (errno != ESLURM_ALREADY_DONE)) {
@@ -809,6 +814,44 @@ static int _job_will_run_cluster(job_desc_msg_t *req,
 }
 
 /*
+ * Look up SLURM_STEPMGR_HET_GROUP_<N> by matching job_id against
+ * SLURM_JOB_ID_HET_GROUP_<N>. Returns NULL when called outside a hetjob
+ * allocation or when no component matches.
+ */
+static char *_get_het_stepmgr_env_for_jobid(uint32_t job_id)
+{
+	char *het_size_env, *mgr_env = NULL;
+	uint32_t het_size = 0;
+
+	het_size_env = getenv("SLURM_HET_SIZE");
+	if (!het_size_env)
+		return NULL;
+
+	if (parse_uint32(het_size_env, &het_size) || (het_size < 2))
+		return NULL;
+
+	for (uint32_t i = 0; i < het_size; i++) {
+		char *name = NULL, *id_str;
+		uint32_t comp_id;
+
+		xstrfmtcat(name, "SLURM_JOB_ID_HET_GROUP_%u", i);
+		id_str = getenv(name);
+		xfree(name);
+		if (!id_str || parse_uint32(id_str, &comp_id))
+			continue;
+		if (comp_id != job_id)
+			continue;
+
+		xstrfmtcat(name, "SLURM_STEPMGR_HET_GROUP_%u", i);
+		mgr_env = xstrdup(getenv(name));
+		xfree(name);
+		break;
+	}
+
+	return mgr_env;
+}
+
+/*
  * slurm_job_step_create - create a job step for a given job id
  * IN slurm_step_alloc_req_msg - description of job step request
  * OUT slurm_step_alloc_resp_msg - response to request
@@ -832,7 +875,10 @@ slurm_job_step_create (job_step_create_request_msg_t *req,
 
 re_send:
 	/* xstrdup() to be consistent with reroute and be able to free. */
-	if ((stepmgr_nodename = xstrdup(getenv("SLURM_STEPMGR")))) {
+	stepmgr_nodename = _get_het_stepmgr_env_for_jobid(req->step_id.job_id);
+	if (!stepmgr_nodename)
+		stepmgr_nodename = xstrdup(getenv("SLURM_STEPMGR"));
+	if (stepmgr_nodename) {
 trystepmgr:
 		slurm_msg_set_r_uid(&req_msg, slurm_conf.slurmd_user_id);
 
@@ -842,7 +888,7 @@ trystepmgr:
 			 * The node isn't in the conf, see if the
 			 * controller has an address for it.
 			 */
-			slurm_node_alias_addrs_t *alias_addrs;
+			slurm_node_alias_addrs_t *alias_addrs = NULL;
 			if (!slurm_get_node_alias_addrs(stepmgr_nodename,
 							&alias_addrs)) {
 				add_remote_nodes_to_conf_tbls(
@@ -869,6 +915,7 @@ trystepmgr:
 		xfree(stepmgr_nodename);
 		stepmgr_nodename = rr_msg->stepmgr;
 		rr_msg->stepmgr = NULL;
+		slurm_free_msg_members(&resp_msg);
 		if (stepmgr_nodename)
 			goto trystepmgr;
 		else
@@ -903,20 +950,20 @@ trystepmgr:
 /*
  * slurm_allocation_lookup - retrieve info for an existing resource allocation
  * 			     without the addrs and such
- * IN jobid - job allocation identifier
+ * IN step_id - step_id containing the job allocation identifier
  * OUT info - job allocation information
  * RET SLURM_SUCCESS on success, otherwise return SLURM_ERROR with errno set
  * NOTE: free the response using slurm_free_resource_allocation_response_msg()
  */
-extern int slurm_allocation_lookup(uint32_t jobid,
-				   resource_allocation_response_msg_t **info)
+extern int (slurm_allocation_lookup)(slurm_step_id_t step_id,
+				     resource_allocation_response_msg_t **info)
 {
 	job_alloc_info_msg_t req;
 	slurm_msg_t req_msg;
 	slurm_msg_t resp_msg;
 
 	memset(&req, 0, sizeof(req));
-	req.step_id.job_id = jobid;
+	req.step_id = step_id;
 	req.req_cluster = slurm_conf.cluster_name;
 	slurm_msg_t_init(&req_msg);
 	slurm_msg_t_init(&resp_msg);
@@ -948,30 +995,26 @@ extern int slurm_allocation_lookup(uint32_t jobid,
 }
 
 /*
- * slurm_het_job_lookup - retrieve info for an existing heterogeneous job
- * 			   allocation without the addrs and such
- * IN jobid - job allocation identifier
- * OUT info - job allocation information
- * RET SLURM_SUCCESS on success, otherwise return SLURM_ERROR with errno set
- * NOTE: returns information an individual job as well
- * NOTE: free the response using list_destroy()
+ * Send REQUEST_HET_JOB_ALLOC_INFO to a single target and merge the response
+ * list into *info. If stepmgr_nodename is NULL, queries slurmctld.
  */
-extern int slurm_het_job_lookup(uint32_t jobid, list_t **info)
+static int _het_job_lookup_one(char *stepmgr_nodename, slurm_step_id_t step_id,
+			       list_t **info)
 {
 	job_alloc_info_msg_t req;
 	slurm_msg_t req_msg;
+	list_t *resp_list;
 	slurm_msg_t resp_msg;
-	char *stepmgr_nodename = NULL;
 
 	memset(&req, 0, sizeof(req));
-	req.step_id.job_id = jobid;
+	req.step_id = step_id;
 	req.req_cluster = slurm_conf.cluster_name;
 	slurm_msg_t_init(&req_msg);
 	slurm_msg_t_init(&resp_msg);
 	req_msg.msg_type = REQUEST_HET_JOB_ALLOC_INFO;
-	req_msg.data     = &req;
+	req_msg.data = &req;
 
-	if ((stepmgr_nodename = xstrdup(getenv("SLURM_STEPMGR")))) {
+	if (stepmgr_nodename) {
 		slurm_msg_set_r_uid(&req_msg, slurm_conf.slurmd_user_id);
 
 		if (slurm_conf_get_addr(stepmgr_nodename, &req_msg.address,
@@ -980,7 +1023,7 @@ extern int slurm_het_job_lookup(uint32_t jobid, list_t **info)
 			 * The node isn't in the conf, see if the
 			 * controller has an address for it.
 			 */
-			slurm_node_alias_addrs_t *alias_addrs;
+			slurm_node_alias_addrs_t *alias_addrs = NULL;
 			if (!slurm_get_node_alias_addrs(stepmgr_nodename,
 							&alias_addrs)) {
 				add_remote_nodes_to_conf_tbls(
@@ -991,7 +1034,6 @@ extern int slurm_het_job_lookup(uint32_t jobid, list_t **info)
 			slurm_conf_get_addr(stepmgr_nodename, &req_msg.address,
 					    req_msg.flags);
 		}
-		xfree(stepmgr_nodename);
 
 		if (slurm_send_recv_node_msg(&req_msg, &resp_msg, 0))
 			return SLURM_ERROR;
@@ -1000,17 +1042,21 @@ extern int slurm_het_job_lookup(uint32_t jobid, list_t **info)
 		return SLURM_ERROR;
 	}
 
-	req.req_cluster = NULL;
-
 	switch (resp_msg.msg_type) {
 	case RESPONSE_SLURM_RC:
 		if (_handle_rc_msg(&resp_msg) < 0)
 			return SLURM_ERROR;
-		*info = NULL;
 		break;
 	case RESPONSE_HET_JOB_ALLOCATION:
-		*info = resp_msg.data;
-		return SLURM_SUCCESS;
+		resp_list = resp_msg.data;
+		if (!(*info)) {
+			*info = resp_list;
+			resp_list = NULL;
+		} else {
+			list_transfer(*info, resp_list);
+		}
+
+		FREE_NULL_LIST(resp_list);
 		break;
 	default:
 		slurm_seterrno_ret(SLURM_UNEXPECTED_MSG_ERROR);
@@ -1018,6 +1064,61 @@ extern int slurm_het_job_lookup(uint32_t jobid, list_t **info)
 	}
 
 	return SLURM_SUCCESS;
+}
+
+extern int(slurm_het_job_lookup)(slurm_step_id_t step_id, list_t **info)
+{
+	char *het_size_env, *stepmgr_nodename = NULL;
+	uint32_t het_size = 0;
+	int rc = SLURM_SUCCESS;
+
+	*info = NULL;
+
+	/*
+	 * For stepmgr het jobs each component's stepmgr only knows its own
+	 * job_record_t. Fan out one REQUEST_HET_JOB_ALLOC_INFO per component
+	 * using SLURM_STEPMGR_HET_GROUP_<N> / SLURM_JOB_ID_HET_GROUP_<N> and
+	 * merge the responses.
+	 */
+	het_size_env = getenv("SLURM_HET_SIZE");
+	if (het_size_env && !parse_uint32(het_size_env, &het_size) &&
+	    (het_size > 1) && getenv("SLURM_STEPMGR_HET_GROUP_0")) {
+		for (uint32_t i = 0; i < het_size; i++) {
+			slurm_step_id_t het_id = SLURM_STEP_ID_INITIALIZER;
+			char *job_id_str;
+			char *name = NULL;
+			char *node;
+
+			xstrfmtcat(name, "SLURM_STEPMGR_HET_GROUP_%u", i);
+			node = getenv(name);
+			xfree(name);
+			xstrfmtcat(name, "SLURM_JOB_ID_HET_GROUP_%u", i);
+			job_id_str = getenv(name);
+			xfree(name);
+			if (!node || !job_id_str ||
+			    parse_uint32(job_id_str, &het_id.job_id)) {
+				FREE_NULL_LIST(*info);
+				return SLURM_ERROR;
+			}
+
+			rc = _het_job_lookup_one(node, het_id, info);
+			if (rc != SLURM_SUCCESS) {
+				FREE_NULL_LIST(*info);
+				return rc;
+			}
+		}
+
+		return SLURM_SUCCESS;
+	}
+
+	stepmgr_nodename = getenv("SLURM_STEPMGR");
+
+	rc = _het_job_lookup_one(stepmgr_nodename, step_id, info);
+
+	if (rc != SLURM_SUCCESS)
+		FREE_NULL_LIST(*info);
+
+	return rc;
 }
 
 /*
@@ -1050,7 +1151,7 @@ trystepmgr:
 			 * The node isn't in the conf, see if the
 			 * controller has an address for it.
 			 */
-			slurm_node_alias_addrs_t *alias_addrs;
+			slurm_node_alias_addrs_t *alias_addrs = NULL;
 			if (!slurm_get_node_alias_addrs(stepmgr_nodename,
 							&alias_addrs)) {
 				add_remote_nodes_to_conf_tbls(
@@ -1438,10 +1539,13 @@ static int _accept_msg_connection(int listen_fd, uint16_t msg_type, void **resp,
 /* Wait up to sleep_time for RPC from slurmctld indicating resource allocation
  * has occurred.
  * IN sleep_time: delay in seconds (0 means unbounded wait)
+ * IN interrupt_fd - If data can be read from this fd (POLLIN), then this
+ *	function will immediately stop blocking and return.
  * RET -1: error, 0: timeout, 1:ready to read */
-static int _wait_for_alloc_rpc(const listen_t *listen, int sleep_time)
+static int _wait_for_alloc_rpc(const listen_t *listen, int sleep_time,
+			       int interrupt_fd)
 {
-	struct pollfd fds[1];
+	struct pollfd fds[2];
 	int rc;
 	int timeout_ms;
 
@@ -1453,13 +1557,15 @@ static int _wait_for_alloc_rpc(const listen_t *listen, int sleep_time)
 
 	fds[0].fd = listen->fd;
 	fds[0].events = POLLIN;
+	fds[1].fd = interrupt_fd;
+	fds[1].events = POLLIN;
 
 	if (sleep_time != 0)
 		timeout_ms = sleep_time * 1000;
 	else
 		timeout_ms = -1;
 
-	while ((rc = poll(fds, 1, timeout_ms)) < 0) {
+	while ((rc = poll(fds, 2, timeout_ms)) < 0) {
 		switch (errno) {
 		case EAGAIN:
 		case EINTR:
@@ -1477,7 +1583,11 @@ static int _wait_for_alloc_rpc(const listen_t *listen, int sleep_time)
 
 	if (rc == 0) { /* poll timed out */
 		errno = ETIMEDOUT;
-	} else if (fds[0].revents & POLLIN) {
+	} else if (fds[1].revents & (POLLIN | POLLERR | POLLHUP)) {
+		/* poll() was interrupted by interrupt_fd */
+		errno = EINTR;
+		return -1;
+	} else if (fds[0].revents & (POLLIN | POLLERR | POLLHUP)) {
 		return 1;
 	}
 
@@ -1487,14 +1597,15 @@ static int _wait_for_alloc_rpc(const listen_t *listen, int sleep_time)
 static void _wait_for_allocation_response(slurm_step_id_t *step_id,
 					  const listen_t *listen,
 					  uint16_t msg_type, int timeout,
-					  void **resp)
+					  void **resp, int interrupt_fd)
 {
 	int errnum, rc;
 
 	info("job %u queued and waiting for resources", step_id->job_id);
 	*resp = NULL;
 	while (true) {
-		if ((rc = _wait_for_alloc_rpc(listen, timeout)) != 1)
+		if ((rc = _wait_for_alloc_rpc(listen, timeout, interrupt_fd)) !=
+		    1)
 			break;
 
 		if ((rc = _accept_msg_connection(listen->fd, msg_type, resp,
@@ -1503,6 +1614,7 @@ static void _wait_for_allocation_response(slurm_step_id_t *step_id,
 	}
 	if (rc <= 0) {
 		errnum = errno;
+
 		/* Maybe the resource allocation response RPC got lost
 		 * in the mail; surely it should have arrived by now.
 		 * Let's see if the controller thinks that the allocation
@@ -1510,13 +1622,13 @@ static void _wait_for_allocation_response(slurm_step_id_t *step_id,
 		 */
 		if (msg_type == RESPONSE_RESOURCE_ALLOCATION) {
 			if (slurm_allocation_lookup(
-				    step_id->job_id,
+				    *step_id,
 				    (resource_allocation_response_msg_t **)
 					    resp) >= 0)
 				return;
 		} else if (msg_type == RESPONSE_HET_JOB_ALLOCATION) {
-			if (slurm_het_job_lookup(step_id->job_id,
-						 (list_t **) resp) >= 0)
+			if (slurm_het_job_lookup(*step_id, (list_t **) resp) >=
+			    0)
 				return;
 		} else {
 			error("%s: Invalid msg_type (%u)", __func__, msg_type);

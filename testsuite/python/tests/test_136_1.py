@@ -1,11 +1,12 @@
 ############################################################################
 # Copyright (C) SchedMD LLC.
 ############################################################################
-import atf
+import re
 
 # import os
 import pytest
-import re
+
+import atf
 
 total_cpus = 0
 total_cores = 0
@@ -47,12 +48,6 @@ def node_names():
     return ",".join(nodes)
 
 
-@pytest.fixture(scope="function")
-def teardown_jobs():
-    yield
-    atf.cancel_all_jobs(quiet=True)
-
-
 def test_job_submit(node_names):
     """Verify a properly formed job submits with CoreSpecCount plugin enabled"""
 
@@ -69,7 +64,7 @@ def test_job_denied(node_names):
     assert exit_code != 0
 
 
-def test_node_state(node_names, teardown_jobs):
+def test_node_state(node_names):
     """Verify that sinfo state is returned as 'alloc' when using all cpus except specialized cores"""
 
     job_id = atf.submit_job_sbatch(

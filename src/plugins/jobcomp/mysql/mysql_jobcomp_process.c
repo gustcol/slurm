@@ -69,7 +69,7 @@ extern list_t *mysql_jobcomp_process_get_jobs(slurmdb_job_cond_t *job_cond)
 		itr = list_iterator_create(job_cond->step_list);
 		while ((selected_step = list_next(itr))) {
 			if (set)
-				xstrcat(extra, " || ");
+				xstrcat(extra, " or ");
 			tmp = xstrdup_printf("jobid=%u",
 					     selected_step->step_id.job_id);
 			xstrcat(extra, tmp);
@@ -83,14 +83,14 @@ extern list_t *mysql_jobcomp_process_get_jobs(slurmdb_job_cond_t *job_cond)
 	if (job_cond->partition_list && list_count(job_cond->partition_list)) {
 		set = 0;
 		if (extra)
-			xstrcat(extra, " && (");
+			xstrcat(extra, " and (");
 		else
 			xstrcat(extra, " where (");
 
 		itr = list_iterator_create(job_cond->partition_list);
 		while ((selected_part = list_next(itr))) {
 			if (set)
-				xstrcat(extra, " || ");
+				xstrcat(extra, " or ");
 			tmp = xstrdup_printf("`partition`='%s'",
 					      selected_part);
 			xstrcat(extra, tmp);
@@ -172,6 +172,8 @@ extern list_t *mysql_jobcomp_process_get_jobs(slurmdb_job_cond_t *job_cond)
 		job->geo = xstrdup(row[JOBCOMP_REQ_GEOMETRY]);
 		job->bg_start_point = xstrdup(row[JOBCOMP_REQ_START]);
 		job->blockid = xstrdup(row[JOBCOMP_REQ_BLOCKID]);
+		job->sluid = xstrdup(row[JOBCOMP_REQ_SLUID]);
+		job->original_sluid = xstrdup(row[JOBCOMP_REQ_ORIGINAL_SLUID]);
 		list_append(job_list, job);
 	}
 

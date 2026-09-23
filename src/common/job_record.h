@@ -48,6 +48,11 @@ typedef struct slurmctld_resv slurmctld_resv_t;
 extern time_t last_job_update;	/* time of last update to job records */
 extern list_t *purge_files_list; /* list of job ids to purge files of */
 
+/*
+ * WARNING: STEP_ID_FROM_JOB_RECORD resets .step_id and .step_het_comp to
+ * NO_VAL which calling code might need to replace these values that get
+ * changed by the macro.
+ */
 #define STEP_ID_FROM_JOB_RECORD(job_ptr) \
 	(slurm_step_id_t) \
 	{ \
@@ -127,6 +132,8 @@ typedef struct {
 	multi_core_data_t *mc_ptr;	/* multi-core specific data */
 	char *mem_bind;			/* binding map for map/mask_cpu */
 	uint16_t mem_bind_type;		/* see mem_bind_type_t */
+	uint16_t mem_update_delay; /* auto-reduce delay in minutes */
+	uint16_t mem_update_margin; /* auto-reduce margin percent */
 	uint32_t min_cpus;		/* minimum number of cpus */
 	uint32_t orig_min_cpus;		/* requested value of min_cpus */
 	int min_gres_cpu;		/* Minimum CPU count per node required
@@ -150,6 +157,8 @@ typedef struct {
 	uint64_t pn_min_memory;		/* minimum memory per node (MB) OR
 					 * memory per allocated
 					 * CPU | MEM_PER_CPU */
+	uint64_t pn_min_memory_pre_resize; /* saved pn_min_memory to revert
+					      failed resize */
 	uint64_t orig_pn_min_memory;	/* requested value of pn_min_memory */
 	uint16_t oom_kill_step;		/* Kill whole step in case of OOM */
 	uint32_t pn_min_tmp_disk;	/* minimum tempdisk per node, MB */
@@ -269,6 +278,12 @@ struct job_record {
 	char    *admin_comment;		/* administrator's arbitrary comment */
 	char	*alias_list;		/* node name to address aliases */
 	char    *alloc_node;		/* local node making resource alloc */
+	char *alloc_partition; /* allocated partition name, set for
+				* a running or suspended job and
+				* state saved so part_ptr can be
+				* recovered on restart or reconfigure.
+				* At runtime prefer part_ptr, which is
+				* authoritative. */
 	char *alloc_tls_cert;		/* TLS certificate for client that is
 					 * getting/has allocation
 					 * (srun, salloc,etc.) */
@@ -319,6 +334,11 @@ struct job_record {
 					   going to end. */
 	uint16_t epilog_failed;		/* true if any Epilog failed */
 	bool epilog_running;		/* true of EpilogSlurmctld is running */
+	/*
+	 * JOB_EXCLUSIVE_* display string, only set in slurmdbd reconstructed
+	 * job_record_t for accounting storage. NULL in live ctld jobs.
+	 */
+	char *exclusive;
 	uint32_t exit_code;		/* exit code for job (status from
 					 * wait call) */
 	char *extra;			/* Arbitrary string */
@@ -391,6 +411,7 @@ struct job_record {
 	bitstr_t *node_bitmap;		/* bitmap of nodes allocated to job */
 	bitstr_t *node_bitmap_cg;	/* bitmap of nodes completing job */
 	bitstr_t *node_bitmap_pr;	/* bitmap of nodes with running prolog */
+	bitstr_t *node_bitmap_rs; /* bitmap of nodes with mem resize */
 	bitstr_t *node_bitmap_preempt; /* bitmap of nodes selected for the job
 					 * when trying to preempt other jobs.
 					 * (DO NOT SAVE OR PACK). */
@@ -411,14 +432,26 @@ struct job_record {
 					 * used only to dump/load nodes from/to dump file */
 	char *nodes_pr;			/* nodes with prolog running,
 					 * used only to dump/load nodes from/to dump file */
+	char *nodes_rs; /* nodes pending mem resize confirm,
+			 * used only to dump/load nodes from/to dump file */
 	char *origin_cluster;		/* cluster name that the job was
 					 * submitted from */
 	uint16_t other_port;		/* port for client communications */
+	/*
+	 * JOB_OVERSUBSCRIBE_* display string, only set in slurmdbd reconstructed
+	 * job_record_t for accounting storage. NULL in live ctld jobs.
+	 */
+	char *oversubscribe;
 	char *partition;		/* name of job partition(s) */
 	list_t *part_ptr_list;		/* list of pointers to partition recs */
 	bool part_nodes_missing;	/* set if job's nodes removed from this
 					 * partition */
 	part_record_t *part_ptr;	/* pointer to the partition record */
+	uint32_t pending_async_steps; /* count of async pending placeholders in
+				       * step_list; combined with a step_list
+				       * walk for running steps, gates swait.
+				       * Only maintained in stepmgr context;
+				       * always 0 elsewhere. DON'T PACK */
 	priority_mult_t *prio_mult;	/* priority based on requested partition
 					 * and qos */
 	time_t pre_sus_time;		/* time job ran prior to last suspend */
@@ -460,6 +493,7 @@ struct job_record {
 	uint16_t resv_port_cnt;		/* count of MPI ports reserved per node */
 	uint32_t requid;	    	/* requester user ID */
 	char *resp_host;		/* host for srun communications */
+	char *runtime; /* Job runtime plugin type */
 	char *sched_nodes;		/* list of nodes scheduled for job */
 	char *selinux_context;		/* SELinux context */
 	uint32_t site_factor;		/* factor to consider in priority */
@@ -467,6 +501,15 @@ struct job_record {
 					 * and epilog scripts as set by SPANK
 					 * plugins */
 	uint32_t spank_job_env_size;	/* element count in spank_env */
+	/*
+	 * Time the first RPC that drives srun_response() was queued for
+	 * dispatch since the last reply. 0 if no request is outstanding.
+	 * Subsequent sends do not update it; only srun_response() clears it
+	 * back to 0.
+	 *
+	 * DON'T PACK.
+	 */
+	time_t srun_no_resp_time;
 	uint16_t start_protocol_ver;	/* Slurm version job was
 					 * started with either the
 					 * creating message or the
@@ -481,6 +524,9 @@ struct job_record {
 					 * priority or resources, only stored in
 					 * the database. */
 	list_t *step_list;		/* list of job's steps */
+	list_t *steps_drained_subs; /* list of steps-drained subscribers
+				     * (steps_drained_sub_t); only populated in
+				     * stepmgr. DON'T PACK */
 	time_t suspend_time;		/* time job last suspended or resumed */
 	void *switch_jobinfo;		/* opaque blob for switch plugin */
 	char *system_comment;		/* slurmctld's arbitrary comment */
@@ -532,6 +578,14 @@ struct job_record {
 	uint32_t wait4switch; /* Maximum time to wait for Maximum switches */
 	bool     best_switch; /* true=min number of switches met           */
 	time_t wait4switch_start; /* Time started waiting for switch       */
+
+	/* Adaptive resilience (ADAPTIVE_RESILIENCE bit_flag) state */
+	time_t resilience_shrink_time; /* Time of first resilience shrink,
+					* zero if the job never lost a node */
+	uint32_t resilience_orig_node_cnt; /* Node count before the first
+					    * resilience shrink */
+	bitstr_t *resilience_orig_bitmap; /* Node bitmap before the first
+					   * resilience shrink */
 };
 
 /* Job dependency specification, used in "depend_list" within job_record */
@@ -587,6 +641,7 @@ typedef struct {
 					/* DO NOT ALPHABETIZE */
 	char *container;		/* OCI Container bundle path */
 	char *container_id;		/* OCI Container ID */
+	char *runtime; /* Job runtime plugin type */
 	bitstr_t *core_bitmap_job;	/* bitmap of cores allocated to this
 					 * step relative to job's nodes,
 					 * see src/common/job_resources.h */
@@ -602,8 +657,6 @@ typedef struct {
 	uint16_t cpus_per_task;		/* cpus per task initiated */
 	uint16_t ntasks_per_core;	/* Maximum tasks per core */
 	char *cpus_per_tres;		/* semicolon delimited list of TRES=# values */
-	uint16_t cyclic_alloc;		/* set for cyclic task allocation
-					 * across nodes */
 	uint32_t exit_code;		/* highest exit code from any task */
 	bitstr_t *exit_node_bitmap;	/* bitmap of exited nodes */
 	uint32_t flags;		        /* flags from step_spec_flags_t */
@@ -613,6 +666,7 @@ typedef struct {
 	job_record_t *job_ptr;		/* ptr to the job that owns the step */
 	jobacctinfo_t *jobacct;         /* keep track of process info in the
 					 * step */
+	bool launch_sent; /* batch launch RPC has been sent */
 	char *mem_per_tres;		/* semicolon delimited list of TRES=# values */
 	uint64_t *memory_allocated;	/* per node array of memory allocated */
 	char *name;			/* name of job step */
@@ -644,6 +698,7 @@ typedef struct {
 	char *std_err;			/* pathname of step's stderr file */
 	char *std_in;			/* pathname of step's stdin file */
 	char *std_out;			/* pathname of step's stdout file */
+	job_step_create_request_msg_t *step_req;
 /*	time_t suspend_time;		 * time step last suspended or resumed
 					 * implicitly the same as suspend_time
 					 * in the job record */
@@ -791,6 +846,14 @@ extern step_record_t *find_step_record(job_record_t *job_ptr,
 				       slurm_step_id_t *step_id);
 
 /*
+ * Return true if the job has at least one step in JOB_RUNNING state (with a
+ * non-special step_id and not JOB_COMPLETING).
+ * IN job_ptr - pointer to the job record
+ * RET true if a running step is present, false otherwise
+ */
+extern bool job_has_running_step(job_record_t *job_ptr);
+
+/*
  * Realloc and possibly update a job_ptr->limit_set->tres array.
  *
  * If a new TRES is added the TRES positions in the array could have been moved
@@ -810,5 +873,13 @@ extern void job_record_set_sluid(job_record_t *job_ptr, bool requeue);
  * Allocate and initialize multicore data block
  */
 extern multi_core_data_t *job_record_create_mc(void);
+
+/*
+ * Set or clear various flags based on other portions of the job.
+ *
+ * ALLOW_OVERCOMMIT_TRES_PER_TASK on job_ptr from overcommit and tres_per_task.
+ *
+ */
+extern void job_record_set_flags(job_record_t *job_ptr);
 
 #endif /* _SLURM_JOB_RECORD_H */

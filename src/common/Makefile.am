@@ -28,20 +28,24 @@ libcommon_la_SOURCES =				\
 	daemonize.h				\
 	data.c					\
 	data.h					\
+	duplex_relay.c				\
+	duplex_relay.h				\
 	dynamic_plugin_data.c			\
 	dynamic_plugin_data.h			\
 	eio.c					\
 	eio.h					\
 	env.c					\
 	env.h					\
-	extra_constraints.c			\
-	extra_constraints.h			\
 	events.c				\
 	events.h				\
+	extra_constraints.c			\
+	extra_constraints.h			\
 	fd.c					\
 	fd.h					\
 	fetch_config.c				\
 	fetch_config.h				\
+	file_bcast.c				\
+	file_bcast.h				\
 	forward.c				\
 	forward.h				\
 	global_defaults.c			\
@@ -51,20 +55,22 @@ libcommon_la_SOURCES =				\
 	half_duplex.h				\
 	hostlist.c				\
 	hostlist.h				\
-	http.h					\
 	http.c					\
-	http_con.h				\
+	http.h					\
 	http_con.c				\
-	http_mime.h				\
+	http_con.h				\
 	http_mime.c				\
-	http_router.h				\
+	http_mime.h				\
+	http_request.c				\
+	http_request.h				\
 	http_router.c				\
-	http_switch.h				\
+	http_router.h				\
 	http_switch.c				\
-	identity.h				\
-	identity.c				\
-	id_util.h				\
+	http_switch.h				\
 	id_util.c				\
+	id_util.h				\
+	identity.c				\
+	identity.h				\
 	io_hdr.c				\
 	io_hdr.h				\
 	job_features.c				\
@@ -94,10 +100,14 @@ libcommon_la_SOURCES =				\
 	oci_config.h				\
 	openapi.c				\
 	openapi.h				\
+	openssl_helper.c			\
+	openssl_helper.h			\
 	optz.c					\
 	optz.h					\
 	pack.c					\
 	pack.h					\
+	pack_data.c				\
+	pack_data.h				\
 	parse_config.c				\
 	parse_config.h				\
 	parse_time.c				\
@@ -114,6 +124,8 @@ libcommon_la_SOURCES =				\
 	plugrack.h				\
 	port_mgr.c				\
 	port_mgr.h				\
+	power_action.c				\
+	power_action.h				\
 	print_fields.c				\
 	print_fields.h				\
 	probes.c				\
@@ -133,6 +145,8 @@ libcommon_la_SOURCES =				\
 	sack_api.h				\
 	sercli.c				\
 	sercli.h				\
+	serdes.c				\
+	serdes.h				\
 	setproctitle.c				\
 	setproctitle.h				\
 	sluid.c					\
@@ -147,10 +161,10 @@ libcommon_la_SOURCES =				\
 	slurm_protocol_defs.h			\
 	slurm_protocol_pack.c			\
 	slurm_protocol_pack.h			\
-	slurm_protocol_util.c			\
-	slurm_protocol_util.h			\
 	slurm_protocol_socket.c			\
 	slurm_protocol_socket.h			\
+	slurm_protocol_util.c			\
+	slurm_protocol_util.h			\
 	slurm_resolv.c				\
 	slurm_resolv.h				\
 	slurm_resource_info.c			\
@@ -174,6 +188,8 @@ libcommon_la_SOURCES =				\
 	spank.h					\
 	state_save.c				\
 	state_save.h				\
+	step_ctx.c				\
+	step_ctx.h				\
 	stepd_api.c				\
 	stepd_api.h				\
 	stepd_proxy.c				\
@@ -197,16 +213,22 @@ libcommon_la_SOURCES =				\
 	uthash.h				\
 	util-net.c				\
 	util-net.h				\
+	workerpool.c				\
+	workerpool.h				\
 	working_cluster.c			\
 	working_cluster.h			\
+	workq.c					\
+	workq.h					\
 	write_labelled_message.c		\
 	write_labelled_message.h		\
 	x11_util.c				\
 	x11_util.h				\
-	xassert.c				\
-	xassert.h				\
 	xahash.c				\
 	xahash.h				\
+	xassert.c				\
+	xassert.h				\
+	xbase64.c				\
+	xbase64.h				\
 	xhash.c					\
 	xhash.h					\
 	xmalloc.c				\
@@ -217,12 +239,14 @@ libcommon_la_SOURCES =				\
 	xregex.h				\
 	xsched.c				\
 	xsched.h				\
-	xsystemd.c				\
-	xsystemd.h				\
 	xsignal.c				\
 	xsignal.h				\
 	xstring.c				\
-	xstring.h
+	xstring.h				\
+	xsystemd.c				\
+	xsystemd.h				\
+	xutf.c					\
+	xutf.h
 
 libcommon_la_LIBADD   = $(libselinux_LIBS)
 

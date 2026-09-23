@@ -90,13 +90,11 @@ typedef struct {
 	gid_t   gid;       /* GID. valid only if verified == true            */
 	void *data;        /* payload data */
 	int dlen;          /* payload data length */
+	time_t ctime; /* credential creation (encode) time */
 } auth_credential_t;
 
 extern auth_credential_t *auth_p_create(char *opts, uid_t r_uid, void *data,
 					int dlen);
-extern auth_credential_t *auth_p_cred_generate(const char *token,
-					       const char *username, uid_t uid,
-					       gid_t gid);
 extern void auth_p_destroy(auth_credential_t *cred);
 
 /* Static prototypes */
@@ -406,6 +404,14 @@ extern int auth_p_get_data(auth_credential_t *cred, char **data, uint32_t *len)
 	return SLURM_SUCCESS;
 }
 
+extern time_t auth_p_get_time(auth_credential_t *cred)
+{
+	if (!cred)
+		return 0;
+
+	return cred->ctime;
+}
+
 extern void *auth_p_get_identity(auth_credential_t *cred)
 {
 	if (!cred) {
@@ -446,7 +452,6 @@ int auth_p_pack(auth_credential_t *cred, buf_t *buf, uint16_t protocol_version)
  */
 auth_credential_t *auth_p_unpack(buf_t *buf, uint16_t protocol_version)
 {
-	char *token = NULL;
 	auth_credential_t *cred = NULL;
 
 	if (!buf) {
@@ -455,24 +460,24 @@ auth_credential_t *auth_p_unpack(buf_t *buf, uint16_t protocol_version)
 	}
 
 	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
-		safe_unpackstr(&token, buf);
+		/* Allocate and initialize credential. */
+		cred = xmalloc(sizeof(*cred));
+		cred->magic = MUNGE_MAGIC;
+		cred->verified = false;
+		cred->m_xstr = true;
+
+		safe_unpackstr(&cred->m_str, buf);
 	} else {
 		error("%s: unknown protocol version %u",
 		      __func__, protocol_version);
 		goto unpack_error;
 	}
 
-	/* Allocate and initialize credential. */
-	cred = auth_p_cred_generate(token, NULL, SLURM_AUTH_NOBODY,
-				    SLURM_AUTH_NOBODY);
-	xassert(!cred->verified);
-	xfree(token);
 	return cred;
 
 unpack_error:
 	errno = ESLURM_AUTH_UNPACK;
 	auth_p_destroy(cred);
-	xfree(token);
 	return NULL;
 }
 
@@ -551,6 +556,11 @@ again:
 		error("auth_munge: Unable to retrieve addr: %s",
 		      munge_ctx_strerror(ctx));
 
+	if (munge_ctx_get(ctx, MUNGE_OPT_ENCODE_TIME, &c->ctime) !=
+	    EMUNGE_SUCCESS)
+		error("auth_munge: Unable to retrieve encode time: %s",
+		      munge_ctx_strerror(ctx));
+
 	if (c->uid == SLURM_AUTH_NOBODY)
 		err = EMUNGE_CRED_INVALID;
 	else if (c->gid == SLURM_AUTH_NOBODY)
@@ -627,33 +637,7 @@ char *auth_p_token_generate(const char *username, int lifespan)
 	return NULL;
 }
 
-extern int auth_p_get_reconfig_fd(void)
+extern int auth_p_prepare_reconfig_fd(char ***env)
 {
 	return -1;
-}
-
-extern auth_credential_t *auth_p_cred_generate(const char *token,
-					       const char *username, uid_t uid,
-					       gid_t gid)
-
-{
-	auth_credential_t *cred = NULL;
-
-	if (!token || !token[0]) {
-		error("%s: required token not provided", __func__);
-		errno = ESLURM_AUTH_CRED_INVALID;
-		return NULL;
-	}
-
-	/* Allocate a new credential. */
-	cred = xmalloc(sizeof(*cred));
-	*cred = (auth_credential_t) {
-		.magic = MUNGE_MAGIC,
-		.m_xstr = true,
-		.m_str = xstrdup(token),
-		.uid = uid,
-		.gid = gid,
-	};
-
-	return cred;
 }

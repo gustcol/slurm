@@ -1,0 +1,11 @@
+[Docs] @nvidia/schedmd/groups/slurm-doc-reviewers
+!/doc/**/Makefile.*
+!/doc/html/openapi_release_notes/
+/doc/
+
+[Testsuite] @nvidia/schedmd/groups/slurm-qa-reviewers
+!/testsuite/**/Makefile.*
+!/testsuite/README
+!/testsuite/python/tests/
+!/testsuite/slurm_unit/
+/testsuite/

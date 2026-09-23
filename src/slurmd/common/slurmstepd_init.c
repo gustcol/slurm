@@ -180,7 +180,7 @@ extern void pack_slurm_conf_lite(buf_t *buffer)
 	/* eio_timeout */
 	/* enforce_part_limits */
 	packstr_array(slurm_conf.epilog, slurm_conf.epilog_cnt, buffer);
-	/* epilog_msg_time */
+	pack32(slurm_conf.epilog_msg_time, buffer);
 	/* epilog_slurmctld */
 	/* epilog_timeout */
 	/* fed_params */
@@ -196,6 +196,7 @@ extern void pack_slurm_conf_lite(buf_t *buffer)
 	/* health_check_interval */
 	/* health_check_node_state */
 	/* health_check_program */
+	/* health_check_timeout */
 	/* http_parser_type */
 	/* inactive_limit */
 	/* interactive_step_opts */
@@ -210,6 +211,7 @@ extern void pack_slurm_conf_lite(buf_t *buffer)
 	/* job_comp_port */
 	/* job_comp_type */
 	/* job_comp_user */
+	packstr(slurm_conf.def_runtime_plugin, buffer);
 	packstr(slurm_conf.namespace_plugin, buffer);
 	/* job_defaults_list */
 	pack16(slurm_conf.job_file_append, buffer);
@@ -222,6 +224,7 @@ extern void pack_slurm_conf_lite(buf_t *buffer)
 	pack16(slurm_conf.kill_wait, buffer);
 	packstr(slurm_conf.launch_params, buffer);
 	/* licenses */
+	pack16((uint16_t) slurm_conf.log_flags, buffer);
 	pack16(slurm_conf.log_fmt, buffer);
 	/* mail_domain */
 	/* mail_prog */
@@ -297,8 +300,9 @@ extern void pack_slurm_conf_lite(buf_t *buffer)
 	/* schedtype */
 	/* scron_params */
 	packstr(slurm_conf.select_type, buffer);
-	/* select_conf_key_pairs */
 	pack16(slurm_conf.select_type_param, buffer);
+	/* serializer_params */
+	/* serializer_plugins */
 	/* site_factor_plugin */
 	/* site_factor_params */
 	/* slurm_conf */
@@ -327,6 +331,7 @@ extern void pack_slurm_conf_lite(buf_t *buffer)
 	packstr(slurm_conf.slurmd_spooldir, buffer);
 	/* slurmd_syslog_debug */
 	/* slurmd_timeout */
+	packstr(slurm_conf.slurmstepd_params, buffer);
 	/* srun_epilog */
 	if (slurm_conf.srun_port_range) {
 		pack16(slurm_conf.srun_port_range[0], buffer);
@@ -368,6 +373,7 @@ extern void pack_slurm_conf_lite(buf_t *buffer)
 extern int unpack_slurm_conf_lite_no_alloc(buf_t *buffer)
 {
 	uint16_t srun_port_min = 0, srun_port_max = 0;
+	uint16_t uint16_tmp = 0;
 
 	init_slurm_conf(&slurm_conf);
 	/* last_update */
@@ -416,7 +422,7 @@ extern int unpack_slurm_conf_lite_no_alloc(buf_t *buffer)
 	/* enforce_part_limits */
 	safe_unpackstr_array(&slurm_conf.epilog, &slurm_conf.epilog_cnt,
 			     buffer);
-	/* epilog_msg_time */
+	safe_unpack32(&slurm_conf.epilog_msg_time, buffer);
 	/* epilog_slurmctld */
 	/* epilog_timeout */
 	/* fed_params */
@@ -432,6 +438,7 @@ extern int unpack_slurm_conf_lite_no_alloc(buf_t *buffer)
 	/* health_check_interval */
 	/* health_check_node_state */
 	/* health_check_program */
+	/* health_check_timeout */
 	/* inactive_limit */
 	/* interactive_step_opts */
 	safe_unpackstr(&slurm_conf.job_acct_gather_freq, buffer);
@@ -445,6 +452,7 @@ extern int unpack_slurm_conf_lite_no_alloc(buf_t *buffer)
 	/* job_comp_port */
 	/* job_comp_type */
 	/* job_comp_user */
+	safe_unpackstr(&slurm_conf.def_runtime_plugin, buffer);
 	safe_unpackstr(&slurm_conf.namespace_plugin, buffer);
 	/* job_defaults_list */
 	safe_unpack16(&slurm_conf.job_file_append, buffer);
@@ -457,6 +465,8 @@ extern int unpack_slurm_conf_lite_no_alloc(buf_t *buffer)
 	safe_unpack16(&slurm_conf.kill_wait, buffer);
 	safe_unpackstr(&slurm_conf.launch_params, buffer);
 	/* licenses */
+	safe_unpack16(&uint16_tmp, buffer);
+	slurm_conf.log_flags = uint16_tmp;
 	safe_unpack16(&slurm_conf.log_fmt, buffer);
 	/* mail_domain */
 	/* mail_prog */
@@ -532,8 +542,9 @@ extern int unpack_slurm_conf_lite_no_alloc(buf_t *buffer)
 	/* schedtype */
 	/* scron_params */
 	safe_unpackstr(&slurm_conf.select_type, buffer);
-	/* select_conf_key_pairs */
 	safe_unpack16(&slurm_conf.select_type_param, buffer);
+	/* serializer_params */
+	/* serializer_plugins */
 	/* site_factor_plugin */
 	/* site_factor_params */
 	/* &slurm_conf */
@@ -562,6 +573,7 @@ extern int unpack_slurm_conf_lite_no_alloc(buf_t *buffer)
 	safe_unpackstr(&slurm_conf.slurmd_spooldir, buffer);
 	/* slurmd_syslog_debug */
 	/* slurmd_timeout */
+	safe_unpackstr(&slurm_conf.slurmstepd_params, buffer);
 	/* srun_epilog */
 	safe_unpack16(&srun_port_min, buffer);
 	safe_unpack16(&srun_port_max, buffer);

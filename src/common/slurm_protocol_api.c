@@ -66,6 +66,7 @@
 #include "src/common/macros.h"
 #include "src/common/net.h"
 #include "src/common/pack.h"
+#include "src/common/persist_conn.h"
 #include "src/common/read_config.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/slurm_protocol_common.h"
@@ -697,6 +698,20 @@ int slurm_init_msg_engine_ports(uint16_t *ports)
 	return net_stream_listen_ports(&fd, &port, ports, false);
 }
 
+extern int slurm_init_msg_engine_srun_ports(int *listen_fd, uint16_t *port)
+{
+	uint16_t *srun_ports = NULL;
+	int rc = SLURM_SUCCESS;
+
+	if ((srun_ports = slurm_get_srun_port_range()))
+		rc = net_stream_listen_ports(listen_fd, port, srun_ports,
+					     false);
+	else
+		rc = net_stream_listen(listen_fd, port);
+
+	return ((rc < 0) ? SLURM_ERROR : SLURM_SUCCESS);
+}
+
 /**********************************************************************\
  * msg connection establishment functions used by msg clients
 \**********************************************************************/
@@ -1182,7 +1197,7 @@ extern list_t *slurm_receive_msgs(conn_t *conn, int steps, int timeout)
 	 *  the message.
 	 */
 	if (slurm_msg_recvfrom_timeout(conn, &buf, &buflen, timeout) < 0) {
-		forward_init(&header.forward);
+		header.forward = FORWARD_INITIALIZER;
 		rc = errno;
 		goto total_return;
 	}
@@ -1367,7 +1382,7 @@ extern list_t *slurm_receive_resp_msgs(conn_t *conn, int steps, int timeout)
 	 * message.
 	 */
 	if (slurm_msg_recvfrom_timeout(conn, &buf, &buflen, timeout) < 0) {
-		forward_init(&header.forward);
+		header.forward = FORWARD_INITIALIZER;
 		rc = errno;
 		goto total_return;
 	}
@@ -1648,7 +1663,13 @@ extern int slurm_buffers_pack_msg(slurm_msg_t *msg, msg_bufs_t *buffers,
 	 * Pack message into buffer
 	 */
 	buffers->body = init_buf(BUF_SIZE);
-	pack_msg(msg, buffers->body);
+	if ((rc = pack_msg(msg, buffers->body))) {
+		error("%s: packing %s failed: %s", __func__,
+		      rpc_num2string(msg->msg_type), slurm_strerror(rc));
+		/* pack_msg() can return SLURM_ERROR, which is not an errno */
+		rc = SLURM_COMMUNICATIONS_SEND_ERROR;
+		goto failed;
+	}
 	log_flag_hex(NET_RAW, get_buf_data(buffers->body),
 		     get_buf_offset(buffers->body),
 		     "%s: packed body", __func__);
@@ -1683,7 +1704,7 @@ extern int slurm_buffers_pack_msg(slurm_msg_t *msg, msg_bufs_t *buffers,
 skip_auth1:
 
 	if (msg->forward.init != FORWARD_INIT) {
-		forward_init(&msg->forward);
+		msg->forward = FORWARD_INITIALIZER;
 		msg->ret_list = NULL;
 	}
 
@@ -1728,10 +1749,8 @@ skip_auth1:
 	if (rc) {
 		error("%s: auth_g_pack: %s has  authentication error: %m",
 		      __func__, rpc_num2string(header.msg_type));
-		auth_g_destroy(auth_cred);
-		FREE_NULL_BUFFER(buffers->auth);
-		FREE_NULL_BUFFER(buffers->body);
-		slurm_seterrno_ret(SLURM_PROTOCOL_AUTHENTICATION_ERROR);
+		rc = SLURM_PROTOCOL_AUTHENTICATION_ERROR;
+		goto failed;
 	}
 	auth_g_destroy(auth_cred);
 	log_flag_hex(NET_RAW, get_buf_data(buffers->auth),
@@ -1751,6 +1770,19 @@ skip_auth2:
 		     "%s: packed header", __func__);
 
 	return rc;
+
+failed:
+	/*
+	 * auth_g_destroy() asserts the plugin layer is up before it checks for
+	 * NULL, so only call it when a credential was actually created. The
+	 * pack failure above jumps here from before auth runs, and a
+	 * SLURM_NO_AUTH_CRED message never brings the layer up at all.
+	 */
+	if (auth_cred)
+		auth_g_destroy(auth_cred);
+	FREE_NULL_BUFFER(buffers->auth);
+	FREE_NULL_BUFFER(buffers->body);
+	slurm_seterrno_ret(rc);
 }
 
 /**********************************************************************\
@@ -2239,7 +2271,7 @@ extern int slurm_send_recv_controller_msg(slurm_msg_t * request_msg,
 	 * since we KNOW that we are only sending to one node (the controller),
 	 * we initialize some forwarding variables to disable forwarding.
 	 */
-	forward_init(&request_msg->forward);
+	request_msg->forward = FORWARD_INITIALIZER;
 	request_msg->ret_list = NULL;
 	request_msg->forward_struct = NULL;
 	slurm_msg_set_r_uid(request_msg, SLURM_AUTH_UID_ANY);
@@ -2650,7 +2682,7 @@ int slurm_send_recv_rc_msg_only_one(slurm_msg_t *req, int *rc, int timeout)
 	 * since we KNOW that we are only sending to one node,
 	 * we initialize some forwarding variables to disable forwarding.
 	 */
-	forward_init(&req->forward);
+	req->forward = FORWARD_INITIALIZER;
 	req->ret_list = NULL;
 	req->forward_struct = NULL;
 

@@ -709,8 +709,8 @@ function __slurm_comp_filter() {
 
 # Determine if a slurmctld will respond
 function __slurm_ctld_status() {
-	local output exit_code
-	output=$(scontrol ping >/dev/null 2>&1)
+	local exit_code
+	scontrol ping >/dev/null 2>&1
 	exit_code=$?
 
 	if ((exit_code == 0)); then
@@ -724,8 +724,8 @@ function __slurm_ctld_status() {
 
 # Determine if a slurmdbd will respond
 function __slurm_dbd_status() {
-	local output exit_code
-	output=$(sacctmgr ping >/dev/null 2>&1)
+	local exit_code
+	sacctmgr ping >/dev/null 2>&1
 	exit_code=$?
 
 	if ((exit_code == 0)); then
@@ -810,6 +810,21 @@ function __slurm_boolean() {
 	local boolean=(
 		"no"
 		"yes"
+	)
+	local output
+	output="${boolean[*]}"
+
+	__slurm_log_trace "$(__func__): output='$output'"
+	echo "${output}"
+}
+
+# Slurm helper function to return accepted true/false values
+#
+# RET: boolean list
+function __slurm_boolean_true_false() {
+	local boolean=(
+		"false"
+		"true"
 	)
 	local output
 	output="${boolean[*]}"
@@ -1011,6 +1026,22 @@ function __slurm_licenses() {
 	__slurm_ctld_cmd "$cmd"
 }
 
+# Slurm helper function to get the list of HRES names
+#
+# RET: space delimited list
+function __slurm_hres() {
+	local cmd="scontrol -o show license | grep -P 'Mode=' | grep -Po 'LicenseName=\S+' | cut -d'=' -f2 | sort -u"
+	__slurm_ctld_cmd "$cmd"
+}
+
+# Slurm helper function to get the list of HRES layer names
+#
+# RET: space delimited list
+function __slurm_hres_layers() {
+	local cmd="scontrol -o show license | grep -Po 'LayerName=\S+' | cut -d'=' -f2 | sort -u"
+	__slurm_ctld_cmd "$cmd"
+}
+
 # Slurm helper function to get node list
 #
 # RET: space delimited list
@@ -1090,6 +1121,24 @@ function __slurm_signals() {
 		"SIGTTIN"
 		"SIGTTOU"
 		"SIGXCPU"
+	)
+	local output="${signals[*]}"
+
+	__slurm_log_trace "$(__func__): output='$output'"
+	echo "${output}"
+}
+
+# Slurm helper function to return allowed --ignore-signals list
+#
+# RET: signals
+function __slurm_srun_ignorable_signals() {
+	local signals=(
+		"SIGINT"
+		"SIGQUIT"
+		"SIGTERM"
+		"SIGHUP"
+		"SIGUSR1"
+		"SIGUSR2"
 	)
 	local output="${signals[*]}"
 
@@ -1314,6 +1363,7 @@ function __slurm_comp_common_flags() {
 		"S"
 	)
 	local exclusive_types=(
+		"allocation"
 		"exclusive"
 		"mcs"
 		"oversubscribe"
@@ -1375,7 +1425,6 @@ function __slurm_comp_common_flags() {
 		"none"
 		"prefer"
 		"rank"
-		"sort"
 	)
 	local mpi_types=(
 		"list"
@@ -1466,6 +1515,7 @@ function __slurm_comp_common_flags() {
 	--gres-flag?(s)) __slurm_compreply "${gres_flags[*]}" ;;
 	--hint) __slurm_compreply "${hints[*]}" ;;
 	-i | --input) _filedir ;;
+	--ignore-signals) __slurm_compreply_list "$(__slurm_srun_ignorable_signals)" ;;
 	--jobid) __slurm_compreply "$(__slurm_jobs)" ;;
 	-K)
 		# warning: salloc and srun overload -K
@@ -2642,11 +2692,15 @@ function __sacctmgr_archive_dump() {
 		"events"
 		"purgeeventafter="
 		"purgejobafter="
+		"purgejobenvafter="
+		"purgejobscriptafter="
 		"purgestepafter="
 		"purgesuspendafter="
 		"script="
 		"steps"
 		"suspend"
+		"jobscript"
+		"jobenv"
 	)
 
 	__slurm_log_debug "$(__func__): prev='$prev' cur='$cur'"
@@ -3270,6 +3324,7 @@ function __scontrol_create_nodename() {
 		"cpuspeclist="
 		"features="
 		"gres="
+		"hres="
 		"memspeclimit="
 		"nodeaddr="
 		"nodehostname="
@@ -3409,6 +3464,7 @@ function __scontrol_pidinfo() {
 # completion handler for: scontrol power up *
 function __scontrol_power_up() {
 	local parameters=(
+		"action="
 	)
 
 	__slurm_log_debug "$(__func__): prev='$prev' cur='$cur'"
@@ -3416,7 +3472,8 @@ function __scontrol_power_up() {
 	__slurm_log_trace "$(__func__): parameters[*]='${parameters[*]}'"
 
 	case "${prev}" in
-	up) __slurm_compreply_list "$(__slurm_nodes)" "ALL" "true" ;;
+	up) __slurm_compreply_list "$(__slurm_nodes)" "ALL force" "true" ;;
+	force) __slurm_compreply_list "$(__slurm_nodes)" "ALL" "true" ;;
 	*)
 		$split && return
 		__slurm_compreply_param "${parameters[*]}"
@@ -3428,6 +3485,7 @@ function __scontrol_power_up() {
 function __scontrol_power_down() {
 	local parameters=(
 		"reason="
+		"action="
 	)
 
 	__slurm_log_debug "$(__func__): prev='$prev' cur='$cur'"
@@ -3475,8 +3533,10 @@ function __scontrol_listpids() {
 function __scontrol_reboot() {
 	local parameters=(
 		"asap"
+		"force"
 		"nextstate="
 		"reason="
+		"action="
 	)
 	local states=(
 		"down"
@@ -3489,7 +3549,8 @@ function __scontrol_reboot() {
 
 	case "${prev}" in
 	nextstate) __slurm_compreply "${states[*]}" ;;
-	reboot) __slurm_compreply_list "$(__slurm_nodes)" "ALL" "true" ;;
+	reboot) __slurm_compreply_list "$(__slurm_nodes)" "ALL force" "true" ;;
+	force) __slurm_compreply_list "$(__slurm_nodes)" "ALL" "true" ;;
 	*)
 		$split && return
 		__slurm_compreply_param "${parameters[*]}"
@@ -3912,6 +3973,36 @@ function __scontrol_update_frontendname() {
 	esac
 }
 
+# completion handler for: scontrol update hresname=* [key=val]...
+function __scontrol_update_hresname() {
+	local parameters=(
+		"base="
+		"count="
+		"disablehres="
+		"disablelayer="
+		"hresname=" # meta
+		"layername="
+		"nodes="
+	)
+
+	__slurm_log_debug "$(__func__): prev='$prev' cur='$cur'"
+	__slurm_log_trace "$(__func__): #parameters[@]='${#parameters[@]}'"
+	__slurm_log_trace "$(__func__): parameters[*]='${parameters[*]}'"
+
+	case "${prev}" in
+	disablehres | disablelayer)
+		__slurm_compreply "$(__slurm_boolean_true_false)"
+		;;
+	hresname) __slurm_compreply "$(__slurm_hres)" ;;
+	layername) __slurm_compreply "$(__slurm_hres_layers)" ;;
+	nodes) __slurm_compreply_list "$(__slurm_nodes)" "" "true" ;;
+	*)
+		$split && return
+		__slurm_compreply_param "${parameters[*]}"
+		;;
+	esac
+}
+
 # completion handler for: scontrol update jobname=* [key=val]...
 function __scontrol_update_jobname() {
 	__scontrol_update_jobid
@@ -3927,6 +4018,7 @@ function __scontrol_update_jobid() {
 		"clusters="
 		"clusterfeatures="
 		"comment="
+		"consolidatesegments="
 		"contiguous="
 		"corespec="
 		"cpuspertask="
@@ -3970,7 +4062,9 @@ function __scontrol_update_jobid() {
 		"irequeue="
 		"reservationname="
 		"resetaccruetime="
+		"segmentsize="
 		"sitefactor="
+		"spreadsegments="
 		"stderr="
 		"stdin="
 		"stdout="
@@ -4013,6 +4107,7 @@ function __scontrol_update_jobid() {
 	account?(s)) __slurm_compreply "$(__slurm_accounts)" ;;
 	cluster?(s)) __slurm_compreply_list "$(__slurm_clusters)" ;;
 	clusterfeature?(s)) __slurm_compreply_list "$(__slurm_features)" ;;
+	consolidatesegments) __slurm_compreply "$(__slurm_boolean)" ;;
 	contiguous) __slurm_compreply "$(__slurm_boolean)" ;;
 	dependency) __slurm_comp_dependency ;;
 	excnodelist) __slurm_compreply_list "$(__slurm_nodes)" "ALL" "true" ;;
@@ -4032,6 +4127,7 @@ function __scontrol_update_jobid() {
 	reqnodelist) __slurm_compreply_list "$(__slurm_nodes)" "ALL" "true" ;;
 	irequeue) __slurm_compreply "${binary[*]}" ;;
 	reservationname?(s)) __slurm_compreply_list "$(__slurm_reservations)" ;;
+	spreadsegments) __slurm_compreply "$(__slurm_boolean)" ;;
 	stderr) _filedir ;;
 	stdin) _filedir ;;
 	stdout) _filedir ;;
@@ -4117,7 +4213,7 @@ function __scontrol_update_partitionname() {
 		"denyaccounts="
 		"denyqos="
 		"disablerootjobs="
-		"exclusiveuser="
+		"exclusive="
 		"gracetime="
 		"hidden="
 		"jobdefaults="
@@ -4153,10 +4249,15 @@ function __scontrol_update_partitionname() {
 		"defmempergpu="
 	)
 	local oversubscribe_types=(
-		"exclusive"
 		"force"
 		"no"
 		"yes"
+	)
+	local part_exclusive_types=(
+		"no"
+		"node"
+		"topo"
+		"user"
 	)
 	local states=(
 		"down"
@@ -4186,7 +4287,7 @@ function __scontrol_update_partitionname() {
 	denyaccount?(s)) __slurm_compreply_list "$(__slurm_accounts)" ;;
 	denyqos) __slurm_compreply_list "$(__slurm_qos)" ;;
 	disablerootjob?(s)) __slurm_compreply "$(__slurm_boolean)" ;;
-	exclusiveuser) __slurm_compreply "$(__slurm_boolean)" ;;
+	exclusive) __slurm_compreply "${part_exclusive_types[*]}" ;;
 	hidden) __slurm_compreply "$(__slurm_boolean)" ;;
 	jobdefault?(s)) __slurm_compreply "${job_defaults[*]}" ;;
 	lln) __slurm_compreply "$(__slurm_boolean)" ;;
@@ -4380,6 +4481,7 @@ function __scontrol_update_suspendexcstates() {
 function __scontrol_update() {
 	local parameters=(
 		"frontendname="
+		"hresname="
 		"jobid="
 		"jobname="
 		"nodename="
@@ -4475,6 +4577,7 @@ function _scontrol() {
 		"delete"
 		"errnumstr"
 		"fsdampeningfactor"
+		"getent"
 		"help"
 		"hold"
 		"notify"
@@ -5196,6 +5299,43 @@ function _strigger() {
 	fi
 }
 complete -o nospace -F _strigger strigger
+
+################################################################################
+#			SWAIT Completion Functions
+################################################################################
+
+# Slurm completion helper for swait flag completion
+#
+# RET: 0 = did completion; 1 = no completion
+function __slurm_comp_swait_flags() {
+	local cmd="$1"
+
+	__slurm_log_debug "$(__func__): prev='$prev' cur='$cur' cmd='$cmd'"
+
+	__slurm_comp_flags "$cmd" && return 0
+	__slurm_is_opt || return 1
+
+	case "${prev}" in
+	--timeout) ;;
+	*) return 1 ;;
+	esac
+
+	return 0
+}
+
+# swait completion handler
+# https://slurm.schedmd.com/swait.html
+function _swait() {
+	local cur prev words cword split
+	__slurm_compinit "$1" || return
+	__slurm_log_info "$(__func__): prev='$prev' cur='$cur'"
+
+	__slurm_comp_swait_flags "$1" && return
+	$split && return
+
+	__slurm_compreply "$(__slurm_jobs)"
+}
+complete -o nospace -F _swait swait
 
 ################################################################################
 #			SLURMRESTD Completion Functions

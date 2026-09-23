@@ -1,9 +1,13 @@
 ############################################################################
 # Copyright (C) SchedMD LLC.
 ############################################################################
-import atf
-import pytest
 import time
+
+import pytest
+
+import atf
+
+pytestmark = pytest.mark.slow
 
 # Note that node_prefix needs to be known or handled properly in s2n variant
 node_prefix = "node"
@@ -160,7 +164,7 @@ def test_cloud_state_cycle():
 
     # Make sure the cloud node starts suspending once it hasn't received a job
     # for suspend_time
-    atf.wait_for_node_state_any(
+    atf.wait_for_node_state(
         f"{node_prefix}1",
         ["POWER_DOWN", "POWERING_DOWN"],
         timeout=suspend_time + 5,
@@ -654,7 +658,7 @@ def test_scontrol_power_down_force():
 
     # Change power save thread minimum interval and restart slurmctld
     atf.require_config_parameter_includes(
-        "SlurmctldParameters", f"power_save_min_interval={power_interval}"
+        "SlurmctldParameters", ("power_save_min_interval", power_interval)
     )
     atf.restart_slurmctld(clean=True)
 

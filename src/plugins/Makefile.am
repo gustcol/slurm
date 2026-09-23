@@ -9,6 +9,7 @@ SUBDIRS = \
 	certgen			\
 	certmgr			\
 	cli_filter		\
+	compress		\
 	cred			\
 	data_parser		\
 	gpu			\
@@ -28,6 +29,7 @@ SUBDIRS = \
 	prep			\
 	priority		\
 	proctrack		\
+	runtime			\
 	sched			\
 	select			\
 	serializer		\
@@ -35,7 +37,8 @@ SUBDIRS = \
 	switch			\
 	task			\
 	tls			\
-	topology
+	topology		\
+	url_parser
 
 if WITH_CGROUP
 SUBDIRS += cgroup

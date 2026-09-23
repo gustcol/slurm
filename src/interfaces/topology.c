@@ -42,6 +42,7 @@
 
 #include "src/common/log.h"
 #include "src/common/plugrack.h"
+#include "src/common/read_config.h"
 #include "src/common/sercli.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/timers.h"
@@ -55,14 +56,18 @@
 strong_alias(topology_g_build_config, slurm_topology_g_build_config);
 strong_alias(topology_g_destroy_config, slurm_topology_g_detroy_config);
 
+#define TOPOLOGY_MAJOR_TYPE "topology"
+
 typedef struct slurm_topo_ops {
 	uint32_t (*plugin_id);
 	char(*plugin_type);
 	bool(*supports_exclusive_topo);
 	int (*add_rm_node)(node_record_t *node_ptr, char *addr,
 			   topology_ctx_t *tctx);
+	bool (*allow_one_node)(void *tctx);
 	int (*build_config)(topology_ctx_t *tctx);
 	int (*destroy_config)(topology_ctx_t *tctx);
+	int (*eval_node)(topology_eval_t *topo_eval, int node_inx);
 	int (*eval_nodes) (topology_eval_t *topo_eval);
 
 	int (*whole_topo)(bitstr_t *node_mask, void *tctx);
@@ -93,6 +98,8 @@ typedef struct slurm_topo_ops {
 	uint32_t (*get_fragmentation)(bitstr_t *node_mask, void *tctx);
 	void (*get_topology_str)(node_record_t *node_ptr,
 				 char **topology_str_ptr, topology_ctx_t *tctx);
+	int (*get_rank)(bitstr_t *node_bitmap, uint32_t **node_rank,
+			uint32_t *size, void *tctx);
 } slurm_topo_ops_t;
 
 /*
@@ -103,8 +110,10 @@ static const char *syms[] = {
 	"plugin_type",
 	"supports_exclusive_topo",
 	"topology_p_add_rm_node",
+	"topology_p_allow_one_node",
 	"topology_p_build_config",
 	"topology_p_destroy_config",
+	"topology_p_eval_node",
 	"topology_p_eval_nodes",
 	"topology_p_whole_topo",
 	"topology_p_get_bitmap",
@@ -122,6 +131,7 @@ static const char *syms[] = {
 	"topology_p_jobinfo_get",
 	"topology_p_get_fragmentation",
 	"topology_p_get_topology_str",
+	"topology_p_get_rank",
 };
 
 static slurm_topo_ops_t *ops = NULL;
@@ -135,13 +145,16 @@ static int tctx_num = -1;
 static void _free_topology_ctx_members(topology_ctx_t *tctx_ptr)
 {
 	if (tctx_ptr) {
-		/* topology/flat has NULL config */
 		if (!xstrcmp(tctx_ptr->plugin, "topology/tree"))
 			free_topology_tree_config(tctx_ptr->config);
 		else if (!xstrcmp(tctx_ptr->plugin, "topology/block"))
 			free_topology_block_config(tctx_ptr->config);
+		else if (!xstrcmp(tctx_ptr->plugin, "topology/flat"))
+			free_topology_flat_config(tctx_ptr->config);
 		else if (!xstrcmp(tctx_ptr->plugin, "topology/ring"))
 			free_topology_ring_config(tctx_ptr->config);
+		else if (!xstrcmp(tctx_ptr->plugin, "topology/torus3d"))
+			free_topology_torus3d_config(tctx_ptr->config);
 
 		xfree(tctx_ptr->name);
 		xfree(tctx_ptr->plugin);
@@ -174,22 +187,20 @@ static int _get_plugin_index(int plugin_id)
 
 static int _get_plugin_index_by_type(char *type)
 {
-	char *plugin_type = "topo";
-
 	for (int i = 0; i < g_context_num; i++)
-		if (!xstrcmp(plugin_type, ops[i].plugin_type))
+		if (!xstrcmp(type, ops[i].plugin_type))
 			return i;
 
 	xrecalloc(ops, g_context_num + 1, sizeof(slurm_topo_ops_t));
 	xrecalloc(g_context, g_context_num + 1, sizeof(plugin_context_t *));
 
 	g_context[g_context_num] =
-		plugin_context_create(plugin_type, type,
+		plugin_context_create(TOPOLOGY_MAJOR_TYPE, type,
 				      (void **) &ops[g_context_num], syms,
 				      sizeof(syms));
 	if (!g_context[g_context_num]) {
 		error("%s: cannot create %s context for %s",
-		      __func__, plugin_type, type);
+		      __func__, TOPOLOGY_MAJOR_TYPE, type);
 		return -1;
 	}
 
@@ -218,58 +229,38 @@ static int _cmp_tctx(const void *x, const void *y)
 	return 0;
 }
 
-static int _parse_yaml(char *topo_conf)
+/*
+ * Sort a populated topology context array and resolve plugin indices.
+ * IN/OUT tctx_array - topology context array; .tctx entries are sorted and
+ *                     each .idx is populated on success
+ * RET SLURM_SUCCESS or SLURM_ERROR
+ */
+static int _process_conf(topology_ctx_array_t *tctx_array)
 {
-	int retval = SLURM_SUCCESS;
-	buf_t *conf_buf = NULL;
-	topology_ctx_array_t tctx_array = {
-		.tctx_num = -1,
-	};
-
-	serializer_required(MIME_TYPE_YAML);
-
-	if (!(conf_buf = create_mmap_buf(topo_conf))) {
-		error("could not load %s, and thus cannot create topo contexts",
-		      topo_conf);
-		retval = SLURM_ERROR;
-		plugin_inited = PLUGIN_NOT_INITED;
-		goto done;
-	}
-
-	DATA_PARSE_FROM_STR(TOPOLOGY_CONF_ARRAY, conf_buf->head, conf_buf->size,
-			    tctx_array, NULL, MIME_TYPE_YAML, retval);
-	if (retval)
-		fatal("Something wrong with reading %s: %s", topo_conf,
-		      slurm_strerror(retval));
-	qsort(tctx_array.tctx, tctx_array.tctx_num, sizeof(topology_ctx_t),
+	qsort(tctx_array->tctx, tctx_array->tctx_num, sizeof(topology_ctx_t),
 	      _cmp_tctx);
-	for (int i = 0; i < tctx_array.tctx_num; i++) {
-		debug("Plugin: %s, Topology Name:%s", tctx_array.tctx[i].plugin,
-		     tctx_array.tctx[i].name);
-		if ((tctx_array.tctx[i].idx =
-			     _get_plugin_index_by_type(tctx_array.tctx[i]
+	for (int i = 0; i < tctx_array->tctx_num; i++) {
+		debug("Plugin: %s, Topology Name:%s",
+		      tctx_array->tctx[i].plugin, tctx_array->tctx[i].name);
+		if ((tctx_array->tctx[i].idx =
+			     _get_plugin_index_by_type(tctx_array->tctx[i]
 							       .plugin)) < 0) {
-			retval = SLURM_ERROR;
-			goto done;
+			return SLURM_ERROR;
 		}
 	}
 
 	if (get_log_level() > LOG_LEVEL_DEBUG2) {
 		char *dump_str = NULL;
-		DATA_DUMP_TO_STR(TOPOLOGY_CONF_ARRAY, tctx_array, dump_str,
-				 NULL, MIME_TYPE_YAML, SER_FLAGS_NO_TAG,
-				 retval);
-		debug2("%s", dump_str);
+
+		if (!(SERCLI_DUMP_STR(TOPOLOGY_CONF_ARRAY, NULL, (*tctx_array),
+				      dump_str, MIME_TYPE_YAML,
+				      SER_FLAGS_NO_TAG)))
+			debug2("%s", dump_str);
+
 		xfree(dump_str);
 	}
 
-	tctx_num = tctx_array.tctx_num;
-	tctx = tctx_array.tctx;
-
-done:
-
-	FREE_NULL_BUFFER(conf_buf);
-	return retval;
+	return SLURM_SUCCESS;
 }
 
 /*
@@ -281,20 +272,33 @@ done:
 extern int topology_g_init(void)
 {
 	int retval = SLURM_SUCCESS;
-	struct stat st;
-	char *yaml_config_path = NULL;
+	topology_ctx_array_t tctx_array = {
+		.tctx_num = -1,
+	};
 
 	slurm_mutex_lock(&g_context_lock);
 
 	if (plugin_inited)
 		goto done;
 
-	yaml_config_path = get_extra_conf_path("topology.yaml");
-	if (!stat(yaml_config_path, &st)) {
-		retval = _parse_yaml(yaml_config_path);
+	retval = CONF_PARSE(TOPOLOGY_CONF_ARRAY, "topology.yaml", tctx_array);
+	if (!retval) {
+		if (!(retval = _process_conf(&tctx_array))) {
+			tctx_num = tctx_array.tctx_num;
+			tctx = tctx_array.tctx;
+		}
 		plugin_inited = PLUGIN_INITED;
 		goto done;
 	}
+	if (retval != ENOENT) {
+		error("Failed to load topology.yaml: %s",
+		      slurm_strerror(retval));
+		plugin_inited = PLUGIN_NOT_INITED;
+		goto done;
+	}
+
+	/* ENOENT: topology.yaml absent, fall through to plugrack */
+	retval = SLURM_SUCCESS;
 
 	xassert(slurm_conf.topology_plugin);
 
@@ -314,7 +318,6 @@ extern int topology_g_init(void)
 done:
 
 	slurm_mutex_unlock(&g_context_lock);
-	xfree(yaml_config_path);
 	return retval;
 }
 
@@ -363,7 +366,7 @@ extern int topology_g_build_config(void)
 		int rc2 = (*(ops[tctx[i].idx].build_config))(&(tctx[i]));
 		if (rc2) {
 			debug("%s: %s: %s",
-			      __func__, g_context[i]->type,
+			      __func__, g_context[tctx[i].idx]->type,
 			      slurm_strerror(rc2));
 			rc = SLURM_ERROR;
 		}
@@ -388,7 +391,7 @@ extern int topology_g_destroy_config(void)
 		int rc2 = (*(ops[tctx[i].idx].destroy_config))(&(tctx[i]));
 		if (rc2) {
 			debug("%s: %s: %s",
-			      __func__, g_context[i]->type,
+			      __func__, g_context[tctx[i].idx]->type,
 			      slurm_strerror(rc2));
 			rc = SLURM_ERROR;
 		}
@@ -402,18 +405,14 @@ extern int topology_g_destroy_config(void)
 
 extern char *topology_g_get_config(void)
 {
-	int retval = SLURM_SUCCESS;
 	char *dump_str = NULL;
 	topology_ctx_array_t tctx_array = {
 		.tctx = tctx,
 		.tctx_num = tctx_num,
 	};
 
-	DATA_DUMP_TO_STR(TOPOLOGY_CONF_ARRAY, tctx_array, dump_str, NULL,
-			 MIME_TYPE_YAML, SER_FLAGS_NO_TAG, retval);
-
-	if (retval)
-		xfree(dump_str);
+	(void) SERCLI_DUMP_STR(TOPOLOGY_CONF_ARRAY, NULL, tctx_array, dump_str,
+			       MIME_TYPE_YAML, SER_FLAGS_NO_TAG);
 
 	return dump_str;
 }
@@ -435,6 +434,25 @@ extern int topology_g_eval_nodes(topology_eval_t *topo_eval)
 	topo_eval->tctx = &(tctx[idx]);
 
 	return (*(ops[tctx[idx].idx].eval_nodes))(topo_eval);
+}
+
+extern int topology_g_eval_node(topology_eval_t *topo_eval, int node_inx)
+{
+	int idx = topo_eval->job_ptr->part_ptr->topology_idx;
+
+	xassert(plugin_inited != PLUGIN_NOT_INITED);
+	xassert((idx >= 0) && (idx < tctx_num));
+
+	/*
+	 * topo_jobinfo needs to be reset in interface before entering plugin in
+	 * case it was set by a different topology plugin.
+	 */
+	topology_g_jobinfo_free(topo_eval->job_ptr->topo_jobinfo);
+	topo_eval->job_ptr->topo_jobinfo = NULL;
+
+	topo_eval->tctx = &(tctx[idx]);
+
+	return (*(ops[tctx[idx].idx].eval_node))(topo_eval, node_inx);
 }
 
 extern int topology_g_whole_topo(bitstr_t *node_mask, int idx)
@@ -514,6 +532,14 @@ extern int topology_g_add_rm_node(node_record_t *node_ptr)
 	xfree(topology_str);
 
 	return rc;
+}
+
+extern bool topology_g_allow_one_node(int idx)
+{
+	xassert(plugin_inited);
+	xassert((idx >= 0) && (idx < tctx_num));
+
+	return (*(ops[tctx[idx].idx].allow_one_node))(tctx[idx].plugin_ctx);
 }
 
 extern char *topology_g_get_topology_str(node_record_t *node_ptr)
@@ -703,9 +729,8 @@ extern int topology_g_topoinfo_print(dynamic_plugin_data_t *topoinfo,
 	if (plugin_inx < 0)
 		return SLURM_ERROR;
 
-	return (*(ops[tctx[plugin_inx].idx].topoinfo_print))(topoinfo->data,
-							     nodes_list, unit,
-							     out);
+	return (*(ops[plugin_inx].topoinfo_print))(topoinfo->data, nodes_list,
+						   unit, out);
 }
 
 extern int topology_g_topoinfo_unpack(dynamic_plugin_data_t **topoinfo,
@@ -737,9 +762,8 @@ extern int topology_g_topoinfo_unpack(dynamic_plugin_data_t **topoinfo,
 		goto unpack_error;
 	}
 
-	if ((*(ops[tctx[plugin_inx].idx].topoinfo_unpack))(&topoinfo_ptr->data,
-							   buffer,
-							   protocol_version) !=
+	if ((*(ops[plugin_inx].topoinfo_unpack))(&topoinfo_ptr->data, buffer,
+						 protocol_version) !=
 	    SLURM_SUCCESS)
 		goto unpack_error;
 
@@ -862,6 +886,16 @@ extern uint32_t topology_g_get_fragmentation(bitstr_t *node_mask)
 	return fragmentation;
 }
 
+extern int topology_g_get_rank(bitstr_t *node_bitmap, uint32_t **node_rank,
+			       uint32_t *size, int idx)
+{
+	xassert(plugin_inited);
+	xassert((idx >= 0) && (idx < tctx_num));
+
+	return (*(ops[tctx[idx].idx].get_rank))(node_bitmap, node_rank, size,
+						tctx[idx].plugin_ctx);
+}
+
 extern void free_topology_ctx(topology_ctx_t *tctx_ptr)
 {
 	if (tctx_ptr) {
@@ -897,6 +931,11 @@ extern void free_topology_block_config(topology_block_config_t *config)
 	}
 }
 
+extern void free_topology_flat_config(topology_flat_config_t *config)
+{
+	xfree(config);
+}
+
 static void _free_ring_conf_members(slurm_conf_ring_t *config)
 {
 	if (config) {
@@ -919,6 +958,38 @@ extern void free_topology_ring_config(topology_ring_config_t *config)
 		for (int i = 0; i < config->config_cnt; i++)
 			_free_ring_conf_members(&config->ring_configs[i]);
 		xfree(config->ring_configs);
+		xfree(config);
+	}
+}
+
+static void _free_torus3d_conf_members(slurm_conf_torus3d_t *config)
+{
+	if (config) {
+		xfree(config->name);
+		xfree(config->nodes);
+		xfree(config->placements);
+		if (config->regions) {
+			for (int i = 0; i < config->region_count; i++)
+				xfree(config->regions[i].nodes);
+		}
+		xfree(config->regions);
+	}
+}
+
+extern void free_torus3d_conf(slurm_conf_torus3d_t *config)
+{
+	if (config) {
+		_free_torus3d_conf_members(config);
+		xfree(config);
+	}
+}
+
+extern void free_topology_torus3d_config(topology_torus3d_config_t *config)
+{
+	if (config) {
+		for (int i = 0; i < config->config_cnt; i++)
+			_free_torus3d_conf_members(&config->torus3d_configs[i]);
+		xfree(config->torus3d_configs);
 		xfree(config);
 	}
 }

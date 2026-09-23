@@ -34,14 +34,19 @@
 \*****************************************************************************/
 
 #include "src/common/read_config.h"
+#include "src/common/slurm_time.h"
 #include "src/common/stepd_api.h"
 #include "src/common/threadpool.h"
 #include "src/common/xstring.h"
+
+#include "src/conmgr/conmgr.h"
 
 #include "src/interfaces/prep.h"
 
 #include "src/slurmd/common/slurmd_common.h"
 #include "src/slurmd/slurmd/slurmd.h"
+
+#define EPILOG_SYNC_MIN_HOSTS 64
 
 typedef struct {
 	uint32_t job_id;
@@ -54,10 +59,11 @@ typedef struct {
 static pthread_mutex_t prolog_serial_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /*
- * Delay a message based upon the host index, total host count and RPC_TIME.
+ * Delay a message based upon the host index, total host count and
+ * usec_per_rpc.
  * This logic depends upon synchronized clocks across the cluster.
  */
-static void _delay_rpc(int host_inx, int host_cnt, int usec_per_rpc)
+static void _delay_rpc(int host_inx, int host_cnt, uint32_t usec_per_rpc)
 {
 	struct timeval tv1;
 	uint32_t cur_time;	/* current time in usec (just 9 digits) */
@@ -66,6 +72,11 @@ static void _delay_rpc(int host_inx, int host_cnt, int usec_per_rpc)
 	uint32_t target_time;	/* desired time to issue the RPC */
 	uint32_t delta_time;
 
+	if ((usec_per_rpc == 0) || (usec_per_rpc > EPILOG_MSG_TIME_MAX)) {
+		error("%s: invalid usec_per_rpc=%u, using default %u",
+		      __func__, usec_per_rpc, DEFAULT_EPILOG_MSG_TIME);
+		usec_per_rpc = DEFAULT_EPILOG_MSG_TIME;
+	}
 again:
 	if (gettimeofday(&tv1, NULL)) {
 		usleep(host_inx * usec_per_rpc);
@@ -90,12 +101,11 @@ again:
 	}
 }
 
-
 /*
  * On a parallel job, every slurmd may send the EPILOG_COMPLETE message to the
  * slurmctld at the same time, resulting in lost messages. We add a delay here
  * to spread out the message traffic assuming synchronized clocks across the
- * cluster. Allow 10 msec processing time in slurmctld for each RPC.
+ * cluster. Delay per host is controlled by EpilogMsgTime (usec).
  */
 static void _sync_messages_kill(char *node_list)
 {
@@ -105,8 +115,7 @@ static void _sync_messages_kill(char *node_list)
 
 	hosts = hostset_create(node_list);
 	host_cnt = hostset_count(hosts);
-
-	if (host_cnt <= 64)
+	if (host_cnt <= EPILOG_SYNC_MIN_HOSTS)
 		goto fini;
 	if (!conf->hostname)
 		goto fini;	/* should never happen */
@@ -209,21 +218,39 @@ static bool _is_job_running(slurm_step_id_t *step_id, bool ignore_extern)
  *  Returns true if all job processes are gone
  */
 extern bool pause_for_job_completion(slurm_step_id_t *step_id, int max_time,
-				     bool ignore_extern)
+				     bool ignore_extern, bool skip_on_shutdown)
 {
 	int sec = 0;
 	int pause = 1;
 	bool rc = false;
 	int count = 0;
+	const timespec_t start = timespec_now();
 
 	while ((sec < max_time) || (max_time == 0)) {
 		rc = _is_job_running(step_id, ignore_extern);
 		if (!rc)
 			break;
+		/*
+		 * If slurmd is shutting down, stop waiting for the step so
+		 * the terminate/abort handler can return and slurmd can
+		 * exit. The step's slurmstepd survives slurmd and delivers
+		 * its completion once slurmctld is back.
+		 * Only slurmd's handlers set skip_on_shutdown; slurmstepd's
+		 * callers pass false (it also links conmgr and requests a
+		 * conmgr shutdown on its own signals, so this must not key
+		 * off conmgr_is_shutdown() alone there).
+		 */
+		if (skip_on_shutdown && conmgr_is_shutdown()) {
+			debug("Waited %s for %pI; slurmd shutting down",
+			      TIMESPEC_ELAPSED_STR(start), step_id);
+			break;
+		}
 		if ((max_time == 0) && (sec > 1)) {
 			terminate_all_steps(step_id, true, !ignore_extern);
 		}
 		if (sec > 10) {
+			debug("Still waiting for %pI to complete: %s",
+			      step_id, TIMESPEC_ELAPSED_STR(start));
 			/* Reduce logging frequency about unkillable tasks */
 			if (max_time)
 				pause = MIN((max_time - sec), 10);
@@ -444,4 +471,29 @@ extern int run_epilog(job_env_t *job_env, slurm_cred_t *cred)
 		slurm_mutex_unlock(&prolog_serial_mutex);
 
 	return error_code;
+}
+
+extern int notify_slurmctld_mem_update_fini(slurm_step_id_t *step_id,
+					    uint64_t job_mem_per_node,
+					    int return_code, bool all_nodes)
+{
+	int ret_c, rc;
+	slurm_msg_t resp_msg;
+	response_update_job_mem_msg_t resp = { 0 };
+
+	resp.node_name = conf->node_name;
+	resp.step_id = *step_id;
+	resp.job_mem_per_node = job_mem_per_node;
+	resp.return_code = return_code;
+	resp.all_nodes = all_nodes;
+
+	slurm_msg_t_init(&resp_msg);
+	resp_msg.msg_type = RESPONSE_UPDATE_JOB_MEM;
+	resp_msg.data = &resp;
+
+	if ((ret_c = slurm_send_recv_controller_rc_msg(&resp_msg, &rc,
+						       working_cluster_rec)))
+		error("Error sending memory update completion notification: %m");
+
+	return ret_c;
 }

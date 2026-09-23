@@ -180,6 +180,7 @@ typedef struct {
 	char *cgroup_mountpoint;
 	char *cgroup_plugin;
 	char *cgroup_prepend;
+	bool cgroup_job_id_paths;
 	char *cgroup_slice;
 	bool constrain_cores;
 	bool constrain_devices;
@@ -406,6 +407,13 @@ extern int cgroup_g_task_addto(cgroup_ctl_type_t sub, stepd_step_rec_t *step,
 extern cgroup_acct_t *cgroup_g_task_get_acct_data(uint32_t taskid);
 
 /*
+ * Return accounting data from the job-level cgroup.
+ *
+ * RET cgroup_acct_t - struct containing the required data.
+ */
+extern cgroup_acct_t *cgroup_g_job_get_acct_data(void);
+
+/*
  * Return conversion units used for stats gathered from cpuacct.
  * Dividing the provided data by this number will give seconds.
  *
@@ -435,10 +443,10 @@ extern char *cgroup_g_get_task_empty_event_path(uint32_t taskid,
 extern int cgroup_g_is_task_empty(uint32_t taskid);
 
 /* BPF token functions */
-extern int cgroup_g_bpf_fsopen();
+extern int cgroup_g_bpf_fsopen(void);
 extern int cgroup_g_bpf_fsconfig(int fd);
 extern int cgroup_g_bpf_create_token(int fd);
-extern int cgroup_g_bpf_get_token();
+extern int cgroup_g_bpf_get_token(void);
 extern void cgroup_g_bpf_set_token(int fd);
 
 #endif

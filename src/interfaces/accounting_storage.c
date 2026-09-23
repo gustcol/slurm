@@ -42,14 +42,17 @@
 #include <pthread.h>
 #include <string.h>
 
+#include "slurm/slurm_errno.h"
+
 #include "src/common/list.h"
+#include "src/common/persist_conn.h"
 #include "src/common/plugin.h"
 #include "src/common/plugrack.h"
-#include "src/interfaces/select.h"
-#include "src/interfaces/accounting_storage.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/slurm_protocol_defs.h"
 #include "src/common/xstring.h"
+#include "src/interfaces/accounting_storage.h"
+#include "src/interfaces/select.h"
 #include "src/slurmctld/slurmctld.h"
 
 uid_t db_api_uid = -1;
@@ -149,7 +152,7 @@ typedef struct slurm_acct_storage_ops {
 				    slurmdb_cluster_cond_t *cluster_cond);
 	list_t *(*get_federations) (void *db_conn, uint32_t uid,
 				    slurmdb_federation_cond_t *fed_cond);
-	list_t *(*get_config)      (void *db_conn, char *config_name);
+	int (*get_config)(void *db_conn, slurmdbd_conf_t **slurmdbd_conf_ptr);
 	list_t *(*get_tres)        (void *db_conn, uint32_t uid,
 				    slurmdb_tres_cond_t *tres_cond);
 	list_t *(*get_assocs)      (void *db_conn, uint32_t uid,
@@ -191,6 +194,7 @@ typedef struct slurm_acct_storage_ops {
 				    uint16_t rpc_version);
 	int  (*register_ctld)      (void *db_conn, uint16_t port);
 	int  (*register_disconn_ctld)(void *db_conn, char *control_host);
+	void (*ctld_recovered)     (void);
 	int  (*fini_ctld)          (void *db_conn,
 				    slurmdb_cluster_rec_t *cluster_rec);
 	int  (*job_start)          (void *db_conn, job_record_t *job_ptr);
@@ -284,6 +288,7 @@ static const char *syms[] = {
 	"clusteracct_storage_p_cluster_tres",
 	"clusteracct_storage_p_register_ctld",
 	"clusteracct_storage_p_register_disconn_ctld",
+	"clusteracct_storage_p_ctld_recovered",
 	"clusteracct_storage_p_fini_ctld",
 	"jobacct_storage_p_job_start",
 	"jobacct_storage_p_job_heavy",
@@ -843,14 +848,15 @@ extern list_t *acct_storage_g_get_federations(void *db_conn, uint32_t uid,
 	return (*(ops.get_federations))(db_conn, uid, fed_cond);
 }
 
-extern list_t *acct_storage_g_get_config(void *db_conn, char *config_name)
+extern int acct_storage_g_get_config(void *db_conn,
+				     slurmdbd_conf_t **slurmdbd_conf_ptr)
 {
 	xassert(plugin_inited != PLUGIN_NOT_INITED);
 
 	if (plugin_inited == PLUGIN_NOOP)
-		return NULL;
+		return ESLURM_NOT_SUPPORTED;
 
-	return (*(ops.get_config))(db_conn, config_name);
+	return (*(ops.get_config))(db_conn, slurmdbd_conf_ptr);
 }
 
 extern list_t *acct_storage_g_get_tres(
@@ -1032,13 +1038,12 @@ extern int clusteracct_storage_g_node_up(void *db_conn,
 {
 	xassert(plugin_inited != PLUGIN_NOT_INITED);
 
-	if (plugin_inited == PLUGIN_NOOP)
-		return SLURM_SUCCESS;
-
-
 	xfree(node_ptr->reason);
 	node_ptr->reason_time = 0;
 	node_ptr->reason_uid = NO_VAL;
+
+	if (plugin_inited == PLUGIN_NOOP)
+		return SLURM_SUCCESS;
 
 	return (*(ops.node_up))(db_conn, node_ptr, event_time);
 }
@@ -1077,6 +1082,16 @@ extern int clusteracct_storage_g_register_ctld(void *db_conn, uint16_t port)
 		return SLURM_SUCCESS;
 
 	return (*(ops.register_ctld))(db_conn, port);
+}
+
+extern void clusteracct_storage_g_ctld_recovered(void)
+{
+	xassert(plugin_inited != PLUGIN_NOT_INITED);
+
+	if (plugin_inited == PLUGIN_NOOP)
+		return;
+
+	(*(ops.ctld_recovered))();
 }
 
 extern int clusteracct_storage_g_register_disconn_ctld(

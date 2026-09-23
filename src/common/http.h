@@ -193,13 +193,33 @@ extern const char *url_get_scheme_string(const url_scheme_t scheme);
  */
 extern data_t *parse_url_path(const char *path, bool convert_types,
 			      bool allow_templates);
+/*
+ * Callback for parsing URL path
+ * IN entry - entry in path
+ * IN template - True when entry is a {template} variable name
+ * IN arg - arbitrary pointer
+ * RET SLURM_SUCESS to continue parsing or error to stop
+ */
+typedef int (*on_url_path_entry_t)(const char *entry, bool template, void *arg);
+
+/*
+ * Walk each entry/dir in a URL path
+ * IN path - URL path to walk by each entry
+ * IN allow_templates - Allow {variable} template entries
+ * IN on_entry - Callback on each entry to call
+ * IN arg - arbitrary pointer to pass to on_entry()
+ * RETURN SLURM_SUCCESS or error
+ */
+extern int url_path_walk(const char *path, bool allow_templates,
+			 on_url_path_entry_t on_entry, void *arg);
 
 /*
  * Decodes URL escape sequence (denoted via %XX)
  * IN ptr - pointing to % character
  * RET \0 on error or decoded character
  */
-extern unsigned char url_decode_escape_seq(const char *ptr);
+extern unsigned char url_decode_escape_seq(const char *ptr,
+					   const char *ptr_end);
 
 typedef struct {
 	url_scheme_t scheme;

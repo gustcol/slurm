@@ -64,6 +64,7 @@
 #include "src/common/daemonize.h"
 #include "src/common/extra_constraints.h"
 #include "src/common/fd.h"
+#include "src/common/forward.h"
 #include "src/common/group_cache.h"
 #include "src/common/hostlist.h"
 #include "src/common/http_switch.h"
@@ -71,6 +72,7 @@
 #include "src/common/log.h"
 #include "src/common/macros.h"
 #include "src/common/pack.h"
+#include "src/common/persist_conn.h"
 #include "src/common/port_mgr.h"
 #include "src/common/probes.h"
 #include "src/common/proc_args.h"
@@ -87,6 +89,7 @@
 #include "src/common/track_script.h"
 #include "src/common/uid.h"
 #include "src/common/util-net.h"
+#include "src/common/workerpool.h"
 #include "src/common/xstring.h"
 #include "src/common/xsystemd.h"
 
@@ -124,6 +127,7 @@
 #include "src/slurmctld/gang.h"
 #include "src/slurmctld/heartbeat.h"
 #include "src/slurmctld/http.h"
+#include "src/slurmctld/job_resilience.h"
 #include "src/slurmctld/job_scheduler.h"
 #include "src/slurmctld/licenses.h"
 #include "src/slurmctld/locks.h"
@@ -217,7 +221,6 @@ int	sched_interval = 60;
 slurmctld_config_t slurmctld_config = {0};
 diag_stats_t slurmctld_diag_stats;
 bool slurmctld_primary = true;
-bool	want_nodes_reboot = true;
 int   slurmctld_tres_cnt = 0;
 slurmdb_cluster_rec_t *response_cluster_rec = NULL;
 uint16_t running_cache = RUNNING_CACHE_STATE_NOTRUNNING;
@@ -257,7 +260,6 @@ static int reconfig_rc = SLURM_SUCCESS;
 static bool reconfig = false;
 static list_t *reconfig_reqs = NULL;
 static bool under_systemd = false;
-static bool reply_async = false;
 
 /* Array of listening sockets */
 static struct {
@@ -275,6 +277,7 @@ static struct {
 static int _accounting_cluster_ready(void);
 static int          _accounting_mark_all_nodes_down(char *reason);
 static void *       _assoc_cache_mgr(void *no_data);
+static void _assoc_mgr_post_update_all(void);
 static int          _controller_index(void);
 static void         _create_clustername_file(void);
 static void _flush_rpcs(void);
@@ -499,8 +502,7 @@ static void _on_sigprof(conmgr_callback_args_t conmgr_args, void *arg)
 	(void) probe_run(true, NULL, NULL, __func__);
 }
 
-static void _register_signal_handlers(conmgr_callback_args_t conmgr_args,
-				      void *arg)
+static void _register_signal_handlers(void)
 {
 	conmgr_add_work_signal(SIGINT, _on_sigint, NULL);
 	conmgr_add_work_signal(SIGTERM, _on_sigterm, NULL);
@@ -604,12 +606,26 @@ static void _retry_init_db_conn(assoc_init_args_t *args)
 		error("Retrying initial connection to slurmdbd");
 		_init_db_conn();
 		if (!slurm_conf.cluster_id) {
-			error("Still don't know my ClusterID");
+			error("Still don't know my ClusterID: %m");
 			continue;
 		}
 		if (!assoc_mgr_init(acct_db_conn, args, errno))
 			break;
 	}
+}
+
+/* Close the slurmctld -> slurmdbd persistent connection. */
+static void _close_acct_storage_conn(void)
+{
+	if (acct_db_conn)
+		acct_storage_g_close_connection(&acct_db_conn);
+}
+
+/* Unload the accounting_storage plugin. */
+static void _fini_acct_storage(void)
+{
+	acct_storage_g_fini();
+	slurm_persist_conn_recv_server_fini();
 }
 
 /* main - slurmctld main function, start various threads and process RPCs */
@@ -637,15 +653,11 @@ int main(int argc, char **argv)
 	char *conf_file;
 	stepmgr_ops_t stepmgr_ops = { 0 };
 
-	probe_init();
-	probe_register("rpc-listeners", _probe_listeners, NULL);
-	probe_register("primary", _probe_primary, NULL);
-	probe_register("reconfiguring", _probe_reconfig, NULL);
-
 	stepmgr_ops.agent_queue_request = agent_queue_request;
 	stepmgr_ops.find_job = find_job;
 	stepmgr_ops.find_job_array_rec = find_job_array_rec;
 	stepmgr_ops.find_job_record = find_job_record;
+	stepmgr_ops.get_het_step_id = get_het_step_id;
 	stepmgr_ops.job_config_fini = job_config_fini;
 	stepmgr_ops.last_job_update = &last_job_update;
 	stepmgr_init(&stepmgr_ops);
@@ -657,6 +669,8 @@ int main(int argc, char **argv)
 		original = false;
 	if (getenv(SLURMSCRIPTD_MODE_ENV))
 		slurmscriptd_mode = true;
+
+	closeall_init();
 
 	/*
 	 * Make sure we have no extra open files which
@@ -698,6 +712,16 @@ int main(int argc, char **argv)
 		become_slurm_user();
 		slurmscriptd_run_slurmscriptd(argc, argv, binary);
 	}
+
+	/*
+	 * Register slurmctld-only probes. Their callbacks read state
+	 * (reconfig_reqs, listeners) that is not initialized on the
+	 * slurmscriptd code path, so they must not be registered there.
+	 */
+	probe_init();
+	probe_register("rpc-listeners", _probe_listeners, NULL);
+	probe_register("primary", _probe_primary, NULL);
+	probe_register("reconfiguring", _probe_reconfig, NULL);
 
 	if (original && under_systemd &&
 	    (slurm_conf.slurm_user_id != getuid())) {
@@ -749,15 +773,14 @@ int main(int argc, char **argv)
 
 	threadpool_init(SLURMCTLD_THREADPOOL_PREALLOCATE,
 			slurm_conf.slurmctld_params);
+	workerpool_init(0, 0, slurm_conf.slurmctld_params);
 
 	if (slurm_conf.slurmctld_params)
 		conmgr_set_params(slurm_conf.slurmctld_params);
 
-	conmgr_init(0, 0, SLURMCTLD_CONMGR_DEFAULT_MAX_CONNECTIONS);
+	conmgr_init(SLURMCTLD_CONMGR_DEFAULT_MAX_CONNECTIONS);
 
-	conmgr_add_work_fifo(_register_signal_handlers, NULL);
-
-	conmgr_run(false);
+	_register_signal_handlers();
 
 	if (auth_g_init() != SLURM_SUCCESS)
 		fatal("failed to initialize auth plugin");
@@ -769,6 +792,10 @@ int main(int argc, char **argv)
 		fatal("Failed to initialize certmgr plugin");
 	if (serializer_g_init() != SLURM_SUCCESS)
 		fatal("Failed to initialize serialization plugins.");
+
+	forward_init();
+
+	conmgr_run(false);
 
 	if (original && !under_systemd) {
 		/*
@@ -797,12 +824,6 @@ int main(int argc, char **argv)
 	http_switch_init();
 	if (http_switch_http_enabled())
 		http_init();
-
-	/* Check if asynchronous reples are enabled */
-	if (xstrcasestr(slurm_conf.slurmctld_params, "enable_async_reply")) {
-		reply_async = true;
-		log_flag(NET, "Asynchronous replies are enabled");
-	}
 
 	/* open ports must happen after become_slurm_user() */
 	_open_ports();
@@ -931,8 +952,7 @@ int main(int argc, char **argv)
 		fatal("Failed to initialize switch plugin");
 
 	/* Initialize licenses - serializer required to be initialized */
-	if (license_init(slurm_conf.licenses) != SLURM_SUCCESS)
-		fatal("Invalid Licenses value: %s", slurm_conf.licenses);
+	license_init();
 
 	if (original && under_systemd)
 		xsystemd_change_mainpid(getpid());
@@ -983,7 +1003,8 @@ int main(int argc, char **argv)
 			 */
 			if (bb_g_init() != SLURM_SUCCESS)
 				fatal("failed to initialize burst_buffer plugin");
-			ctld_assoc_mgr_init();
+			/* If reconfiguring job_list/part_list already inited */
+			ctld_assoc_mgr_init(reconfiguring);
 			/* Now recover the remaining state information */
 			lock_slurmctld(config_write_lock);
 			if (switch_g_restore(recover))
@@ -1021,6 +1042,15 @@ int main(int argc, char **argv)
 			select_g_select_nodeinfo_set_all();
 			unlock_slurmctld(config_write_lock);
 
+			/*
+			 * read_slurm_conf has populated job_list/job_hash; the
+			 * accounting agent (slurmdbd) was held off so it
+			 * wouldn't process DBD_ID_RC responses against an empty
+			 * job_hash. Release it now so any dbd.messages loaded
+			 * at startup can be drained against live job state.
+			 */
+			clusteracct_storage_g_ctld_recovered();
+
 			if (recover == 0) {
 				slurmctld_init_db = 1;
 				_accounting_mark_all_nodes_down("cold-start");
@@ -1054,6 +1084,9 @@ int main(int argc, char **argv)
 		_restore_job_dependencies();
 
 		sync_job_priorities();
+
+		if (recover && !reconfiguring)
+			relaunch_unsent_batch_jobs();
 
 		if (mcs_g_init() != SLURM_SUCCESS)
 			fatal("failed to initialize mcs plugin");
@@ -1108,6 +1141,9 @@ int main(int argc, char **argv)
 
 		controller_fini_scheduling(); /* Stop all scheduling */
 		agent_fini();
+		/* kill all scripts running by the slurmctld */
+		track_script_flush();
+		slurmscriptd_flush();
 
 		/* termination of controller */
 		switch_g_save();
@@ -1123,9 +1159,6 @@ int main(int argc, char **argv)
 		slurm_mutex_unlock(&slurmctld_config.acct_update_lock);
 		slurm_thread_join(slurmctld_config.thread_id_acct_update);
 
-		/* kill all scripts running by the slurmctld */
-		track_script_flush();
-		slurmscriptd_flush();
 		run_command_shutdown();
 
 		bb_g_fini();
@@ -1135,10 +1168,8 @@ int main(int argc, char **argv)
 		ctld_assoc_mgr_fini();
 
 		/* Save any pending state save RPCs */
-		acct_storage_g_close_connection(&acct_db_conn);
-		acct_storage_g_fini();
-
-		slurm_persist_conn_recv_server_fini();
+		_close_acct_storage_conn();
+		_fini_acct_storage();
 		power_save_fini();
 
 		/* attempt reconfig here */
@@ -1194,6 +1225,9 @@ int main(int argc, char **argv)
 			slurm_conf.slurmctld_pidfile);
 	}
 
+	conmgr_request_shutdown();
+	forward_fini();
+	conmgr_fini();
 
 #ifdef MEMORY_LEAK_DEBUG
 {
@@ -1253,10 +1287,10 @@ int main(int argc, char **argv)
 }
 #endif
 
-	conmgr_request_shutdown();
-	conmgr_fini();
-	http_fini();
+	if (http_switch_http_enabled())
+		http_fini();
 	http_switch_fini();
+	workerpool_fini();
 	/* Multiple threads never exit naturally during shutdown */
 	threadpool_fini();
 	rate_limit_shutdown();
@@ -1441,7 +1475,8 @@ static int _try_to_reconfig(void)
 		xfree(ports);
 	}
 	slurm_mutex_unlock(&listeners.mutex);
-	if ((auth_fd = auth_g_get_reconfig_fd(AUTH_PLUGIN_SLURM)) >= 0)
+	if ((auth_fd = auth_g_prepare_reconfig_fd(AUTH_PLUGIN_SLURM,
+						  &child_env)) >= 0)
 		skip_close[skip_index++] = auth_fd;
 	for (int i = 0; i < 3; i++)
 		fd_set_noclose_on_exec(i);
@@ -1692,7 +1727,7 @@ static int _on_primary_msg(conmgr_callback_args_t conmgr_args, slurm_msg_t *msg,
 		rc = slurm_send_rc_msg(msg, EINVAL);
 		FREE_NULL_MSG(msg);
 		return rc;
-	} else if (reply_async && !this_rpc->keep_msg) {
+	} else if (!this_rpc->keep_msg) {
 		rc = _service_connection(this_rpc, msg);
 	} else {
 		/*
@@ -1758,9 +1793,9 @@ static int _on_msg(conmgr_callback_args_t conmgr_args, slurm_msg_t *msg,
 		 * failure to give the sender a hint to fix their authentication
 		 * issue with authentication disabled.
 		 */
-		msg->flags |= SLURM_NO_AUTH_CRED;
 		slurm_send_rc_msg(msg, SLURM_PROTOCOL_AUTHENTICATION_ERROR);
 		FREE_NULL_MSG(msg);
+		conmgr_queue_close_fd(con);
 		return SLURM_SUCCESS;
 	} else if (unpack_rc) {
 		error("%s: [%s] rejecting malformed RPC and closing connection: %s",
@@ -1834,6 +1869,22 @@ extern void listeners_unquiesce(void)
 	listeners.quiesced = false;
 
 	slurm_mutex_unlock(&listeners.mutex);
+}
+
+/*
+ * Return true when listeners.standby_mode is set (in run_backup() standby),
+ * false when the main loop is on the primary controller path
+ * (slurmctld_primary || backup_has_control) in normal steady state.
+ */
+extern bool slurmctld_listeners_in_standby(void)
+{
+	bool standby;
+
+	slurm_mutex_lock(&listeners.mutex);
+	standby = listeners.standby_mode;
+	slurm_mutex_unlock(&listeners.mutex);
+
+	return standby;
 }
 
 static probe_status_t _probe_listeners(probe_log_t *log, void *arg)
@@ -1913,17 +1964,14 @@ static void _open_ports(void)
 
 	for (uint64_t i = 0; i < listeners.count; i++) {
 		static const conmgr_con_flags_t flags =
-			(CON_FLAG_RPC_KEEP_BUFFER | CON_FLAG_QUIESCE |
-			 CON_FLAG_WATCH_WRITE_TIMEOUT |
-			 CON_FLAG_WATCH_READ_TIMEOUT |
-			 CON_FLAG_WATCH_CONNECT_TIMEOUT);
+			(CON_FLAG_RPC_KEEP_BUFFER | CON_FLAG_QUIESCE);
 		int rc, *index_ptr;
 
 		index_ptr = xmalloc(sizeof(*index_ptr));
 		*index_ptr = i;
 
 		if ((rc = conmgr_process_fd_listen(listeners.fd[i],
-						   http_switch_con_type(),
+						   http_switch_con_type(), NULL,
 						   &events,
 						   (flags |
 						    http_switch_con_flags()),
@@ -2166,16 +2214,58 @@ static int _foreach_part_remove_qos(void *x, void *arg)
 	return 0;
 }
 
+static int _foreach_resv_remove_qos(void *x, void *arg)
+{
+	slurmctld_resv_t *resv_ptr = x;
+	slurmdb_qos_rec_t *rec = arg;
+
+	/*
+	 * resv_ptr->qos_list has a NULL destructor and caches bare
+	 * slurmdb_qos_rec_t pointers into assoc_mgr_qos_list. Drop the
+	 * pointer being removed and strip the corresponding name from the
+	 * canonical resv_ptr->qos string so a later rebuild stays in sync.
+	 */
+	if (resv_ptr->qos_list &&
+	    list_remove_first(resv_ptr->qos_list, slurm_find_ptr_in_list,
+			      rec)) {
+		char *remove_name = NULL;
+		bool denied = (resv_ptr->qos[0] == '-');
+
+		info("Reservation %s's QOS %s was just removed; dropping from reservation QOS %s list",
+		     resv_ptr->name, rec->name,
+		     (denied ? "denied" : "allowed"));
+
+		if (denied)
+			xstrfmtcat(remove_name, "-%s", rec->name);
+		else
+			remove_name = rec->name;
+
+		_remove_csv_item(&resv_ptr->qos, remove_name);
+
+		if (denied)
+			xfree(remove_name);
+	}
+
+	return 0;
+}
+
 static void _remove_qos(slurmdb_qos_rec_t *rec)
 {
 	int cnt = 0;
-	slurmctld_lock_t part_write_lock =
-		{ NO_LOCK, NO_LOCK, NO_LOCK, WRITE_LOCK, NO_LOCK };
+	slurmctld_lock_t job_part_write_lock = {
+		.conf = NO_LOCK,
+		.job = WRITE_LOCK, /* jobs reference resv pointer */
+		.node = NO_LOCK,
+		.part = WRITE_LOCK,
+		.fed = NO_LOCK,
+	};
 
-	lock_slurmctld(part_write_lock);
+	lock_slurmctld(job_part_write_lock);
 	if (part_list)
 		(void) list_for_each(part_list, _foreach_part_remove_qos, rec);
-	unlock_slurmctld(part_write_lock);
+	if (resv_list)
+		(void) list_for_each(resv_list, _foreach_resv_remove_qos, rec);
+	unlock_slurmctld(job_part_write_lock);
 
 	bb_g_reconfig();
 
@@ -2192,7 +2282,7 @@ static int _update_assoc_for_each(void *x, void *arg) {
 	job_record_t *job_ptr = x;
 
 	if ((rec == job_ptr->assoc_ptr) && (IS_JOB_PENDING(job_ptr)))
-		acct_policy_update_pending_job(job_ptr);
+		acct_policy_update_pending_job(job_ptr, true);
 
 	return 0;
 }
@@ -2242,7 +2332,7 @@ static int _update_qos_for_each(void *x, void *arg) {
 	job_record_t *job_ptr = x;
 
 	if ((rec == job_ptr->qos_ptr) && (IS_JOB_PENDING(job_ptr)))
-		acct_policy_update_pending_job(job_ptr);
+		acct_policy_update_pending_job(job_ptr, true);
 
 	return 0;
 }
@@ -2453,106 +2543,10 @@ static void _update_cluster_tres(void)
 	unlock_slurmctld(job_write_lock);
 }
 
-static void _update_parts_and_resvs()
+static void _update_parts_and_resvs(void)
 {
 	update_assocs_in_resvs();
 	part_list_update_assoc_lists();
-}
-
-static void _queue_reboot_msg(void)
-{
-	agent_arg_t *reboot_agent_args = NULL;
-	node_record_t *node_ptr;
-	char *host_str;
-	time_t now = time(NULL);
-	int i;
-	bool want_reboot;
-
-	want_nodes_reboot = false;
-	for (i = 0; (node_ptr = next_node(&i)); i++) {
-		/* Allow nodes in maintenance reservations to reboot
-		 * (they previously could not).
-		 */
-		if (!IS_NODE_REBOOT_REQUESTED(node_ptr))
-			continue;	/* No reboot needed */
-		else if (IS_NODE_REBOOT_ISSUED(node_ptr)) {
-			debug2("%s: Still waiting for boot of node %s",
-			       __func__, node_ptr->name);
-			continue;
-		}
-		if (IS_NODE_COMPLETING(node_ptr)) {
-			want_nodes_reboot = true;
-			continue;
-		}
-                /* only active idle nodes, don't reboot
-                 * nodes that are idle but have suspended
-                 * jobs on them
-                 */
-		if (IS_NODE_IDLE(node_ptr)
-                    && !IS_NODE_NO_RESPOND(node_ptr)
-                    && !IS_NODE_POWERING_UP(node_ptr)
-                    && node_ptr->sus_job_cnt == 0)
-			want_reboot = true;
-		else if (IS_NODE_FUTURE(node_ptr) &&
-			 (node_ptr->last_response == (time_t) 0))
-			want_reboot = true; /* system just restarted */
-		else if (IS_NODE_DOWN(node_ptr))
-			want_reboot = true;
-		else
-			want_reboot = false;
-		if (!want_reboot) {
-			want_nodes_reboot = true;	/* defer reboot */
-			continue;
-		}
-		if (reboot_agent_args == NULL) {
-			reboot_agent_args = xmalloc(sizeof(agent_arg_t));
-			reboot_agent_args->msg_type = REQUEST_REBOOT_NODES;
-			reboot_agent_args->retry = 0;
-			reboot_agent_args->hostlist = hostlist_create(NULL);
-			reboot_agent_args->protocol_version =
-				SLURM_PROTOCOL_VERSION;
-		}
-		if (reboot_agent_args->protocol_version
-		    > node_ptr->protocol_version)
-			reboot_agent_args->protocol_version =
-				node_ptr->protocol_version;
-		hostlist_push_host(reboot_agent_args->hostlist, node_ptr->name);
-		reboot_agent_args->node_count++;
-		/*
-		 * node_ptr->node_state &= ~NODE_STATE_MAINT;
-		 * The NODE_STATE_MAINT bit will just get set again as long
-		 * as the node remains in the maintenance reservation, so
-		 * don't clear it here because it won't do anything.
-		 */
-		node_ptr->node_state &=  NODE_STATE_FLAGS;
-		node_ptr->node_state |=  NODE_STATE_DOWN;
-		node_ptr->node_state &= ~NODE_STATE_REBOOT_REQUESTED;
-		node_ptr->node_state |= NODE_STATE_REBOOT_ISSUED;
-
-		bit_clear(avail_node_bitmap, node_ptr->index);
-		bit_clear(idle_node_bitmap, node_ptr->index);
-
-		/* Unset this as this node is not in reboot ASAP anymore. */
-		bit_clear(asap_node_bitmap, node_ptr->index);
-
-		node_ptr->boot_req_time = now;
-
-		set_node_reason(node_ptr, "reboot issued", now);
-
-		clusteracct_storage_g_node_down(acct_db_conn, node_ptr, now,
-		                                NULL, slurm_conf.slurm_user_id);
-	}
-	if (reboot_agent_args != NULL) {
-		hostlist_uniq(reboot_agent_args->hostlist);
-		host_str = hostlist_ranged_string_xmalloc(
-				reboot_agent_args->hostlist);
-		debug("Issuing reboot request for nodes %s", host_str);
-		xfree(host_str);
-		set_agent_arg_r_uid(reboot_agent_args, SLURM_AUTH_UID_ANY);
-		agent_queue_request(reboot_agent_args);
-		last_node_update = now;
-		schedule_node_save();
-	}
 }
 
 static void _flush_rpcs(void)
@@ -2603,6 +2597,7 @@ static void *_slurmctld_background(void *no_data)
 	static time_t last_acct_gather_node_time;
 	static time_t last_no_resp_msg_time;
 	static time_t last_ping_node_time = (time_t) 0;
+	static time_t last_resilience_time;
 	static time_t last_ping_srun_time;
 	static time_t last_purge_job_time;
 	static time_t last_resv_time;
@@ -2628,10 +2623,16 @@ static void *_slurmctld_background(void *no_data)
 	/* Locks: Write job */
 	slurmctld_lock_t job_write_lock2 = {
 		NO_LOCK, WRITE_LOCK, NO_LOCK, NO_LOCK, NO_LOCK };
-	/* Locks: Read config, write job, write node
-	 * (Might kill jobs on nodes set DOWN) */
+	/*
+	 * (Might kill jobs on nodes set DOWN; check_node_timers() may call
+	 * update_node() which requires job/node/part write locks)
+	 */
 	slurmctld_lock_t node_write_lock = {
-		READ_LOCK, WRITE_LOCK, WRITE_LOCK, NO_LOCK, NO_LOCK };
+		.conf = READ_LOCK,
+		.job = WRITE_LOCK,
+		.node = WRITE_LOCK,
+		.part = WRITE_LOCK,
+	};
 	/* Locks: Write node */
 	slurmctld_lock_t node_write_lock2 = {
 		NO_LOCK, NO_LOCK, WRITE_LOCK, NO_LOCK, NO_LOCK };
@@ -2641,16 +2642,6 @@ static void *_slurmctld_background(void *no_data)
 	/* Locks: Read job and node */
 	slurmctld_lock_t job_node_read_lock = {
 		NO_LOCK, READ_LOCK, READ_LOCK, NO_LOCK, NO_LOCK };
-	/*
-	 * purge_old_job modifies jobs and reads conf info. It can also
-	 * call re_kill_job(), which can modify nodes and reads fed info.
-	 */
-	slurmctld_lock_t purge_job_locks = {
-		.conf = READ_LOCK,
-		.job = WRITE_LOCK,
-		.node = WRITE_LOCK,
-		.fed = READ_LOCK,
-	};
 	/*
 	 * Creating the heath check agent reads node state and updates select
 	 * node stats
@@ -2667,6 +2658,7 @@ static void *_slurmctld_background(void *no_data)
 	last_checkpoint_time = last_group_time = now;
 	last_purge_job_time = last_trigger = last_health_check_time = now;
 	last_timelimit_time = last_assert_primary_time = now;
+	last_resilience_time = now;
 	last_no_resp_msg_time = last_resv_time = last_ctld_bu_ping = now;
 	last_uid_update = now;
 	last_acct_gather_node_time = now;
@@ -2728,7 +2720,60 @@ static void *_slurmctld_background(void *no_data)
 		}
 
 		if (slurmctld_config.shutdown_time) {
-			/* Always stop listening when shutdown requested */
+			/*
+			 * Wait for backfill to release locks. Release the
+			 * lock once bf_active is 0: the backfill thread has
+			 * exited its main loop (it checks shutdown_time and
+			 * won't re-enter) and holding this past here would
+			 * deadlock conmgr_quiesce() against any in-flight
+			 * RPC handler that wants check_bf_running_lock.
+			 */
+			slurm_mutex_lock(&check_bf_running_lock);
+			while (slurmctld_diag_stats.bf_active) {
+				slurm_cond_wait(&check_bf_running_cond,
+						&check_bf_running_lock);
+			}
+			slurm_mutex_unlock(&check_bf_running_lock);
+
+			/*
+			 * Wait for main sched to release locks. Same as
+			 * above: release sched_mutex once sched_alive is 0,
+			 * or an in-flight RPC handler that ends up in
+			 * schedule() (e.g. _slurm_rpc_epilog_complete) will
+			 * deadlock conmgr_quiesce() below.
+			 */
+			slurm_mutex_lock(&sched_mutex);
+			while (sched_alive) {
+				/*
+				 * Wake up _sched_agent() if it is sleeping
+				 * before waiting for it to change state
+				 */
+				slurm_cond_broadcast(&sched_cond);
+				slurm_cond_wait(&sched_cond, &sched_mutex);
+			}
+			slurm_mutex_unlock(&sched_mutex);
+
+			/* kill all scripts running by the slurmctld */
+			track_script_flush();
+			slurmscriptd_flush();
+
+			/*
+			 * Persistent connection to slurmdbd must be closed
+			 * before conmgr quiesce to avoid possible deadlocks
+			 * where slurmdbd is waiting on slurmctld but
+			 * slurmctld will wait until quiesce to finish before
+			 * responding. The plugin itself is unloaded later, in
+			 * main().
+			 *
+			 * Listeners can't be quiesced yet in case are still
+			 * processing RPCs from the DBD.
+			 */
+			_close_acct_storage_conn();
+
+			/*
+			 * Now that the ctld -> dbd conn is gone it is safe to
+			 * stop listening new connections.
+			 */
 			listeners_quiesce();
 
 			/*
@@ -2747,23 +2792,11 @@ static void *_slurmctld_background(void *no_data)
 			 */
 			_flush_rpcs();
 
-			/* Wait for backfill to release locks */
-			slurm_mutex_lock(&check_bf_running_lock);
-			while (slurmctld_diag_stats.bf_active) {
-				slurm_cond_wait(&check_bf_running_cond,
-						&check_bf_running_lock);
-			}
-
-			/* Wait for main sched to release locks */
-			slurm_mutex_lock(&sched_mutex);
-			while (sched_alive) {
-				/*
-				 * Wake up _sched_agent() if it is sleeping
-				 * before waiting for it to change state
-				 */
-				slurm_cond_broadcast(&sched_cond);
-				slurm_cond_wait(&sched_cond, &sched_mutex);
-			}
+			/*
+			 * Catch persistent connection to slurmdbd still
+			 * existing at this point
+			 */
+			xassert(!acct_db_conn);
 
 			if (!report_locks_set()) {
 				info("Saving all slurm state");
@@ -2771,11 +2804,6 @@ static void *_slurmctld_background(void *no_data)
 			} else {
 				error("Semaphores still set after flushing RPCs, and finish scheduling. Can not save state");
 			}
-
-			/* Unblock main sched thread, so that it can shutdown */
-			slurm_mutex_unlock(&sched_mutex);
-			/* Unblock backfill thread, so that it can shutdown */
-			slurm_mutex_unlock(&check_bf_running_lock);
 
 			/*
 			 * Allow other connections to start processing again as
@@ -2820,8 +2848,19 @@ static void *_slurmctld_background(void *no_data)
 			unlock_slurmctld(node_write_lock);
 		}
 
+		if (difftime(now, last_resilience_time) >=
+		    RESILIENCE_REGROW_PERIOD) {
+			lock_slurmctld(job_write_lock);
+			now = time(NULL);
+			last_resilience_time = now;
+			job_resilience_regrow_all();
+			unlock_slurmctld(job_write_lock);
+		}
+
 		if (!(slurm_conf.health_check_node_state &
 		      HEALTH_CHECK_START_ONLY) &&
+		    !(slurm_conf.health_check_node_state &
+		      HEALTH_CHECK_REBOOT_ONLY) &&
 		    slurm_conf.health_check_interval &&
 		    (difftime(now, last_health_check_time) >=
 		     slurm_conf.health_check_interval) &&
@@ -2870,12 +2909,6 @@ static void *_slurmctld_background(void *no_data)
 			unlock_slurmctld(job_read_lock);
 		}
 
-		if (want_nodes_reboot) {
-			lock_slurmctld(node_write_lock);
-			_queue_reboot_msg();
-			unlock_slurmctld(node_write_lock);
-		}
-
 		/* Process any pending agent work */
 		agent_trigger(RPC_RETRY_INTERVAL, true, true);
 
@@ -2901,12 +2934,15 @@ static void *_slurmctld_background(void *no_data)
 			 */
 			slurm_mutex_lock(&check_bf_running_lock);
 			if (!slurmctld_diag_stats.bf_active) {
-				lock_slurmctld(purge_job_locks);
+				/*
+				 * purge_old_job acquires its own locks
+				 * conf = READ_LOCK, job = WRITE_LOCK,
+				 * node = WRITE_LOCK, fed = READ_LOCK
+				 */
 				now = time(NULL);
 				last_purge_job_time = now;
 				debug2("Performing purge of old job records");
 				purge_old_job();
-				unlock_slurmctld(purge_job_locks);
 			}
 			slurm_mutex_unlock(&check_bf_running_lock);
 			free_old_jobs();
@@ -3051,22 +3087,15 @@ extern void save_all_state(void)
 }
 
 /* make sure the assoc_mgr is up and running with the most current state */
-extern void ctld_assoc_mgr_init(void)
+extern void ctld_assoc_mgr_init(bool update_now)
 {
 	assoc_init_args_t assoc_init_arg;
-	int num_jobs = 0;
-	slurmctld_lock_t job_write_lock = {
+	slurmctld_lock_t j_n_p_write_lock = {
 		.conf = NO_LOCK,
 		.job = WRITE_LOCK,
-		.node = NO_LOCK,
-		.part = NO_LOCK,
+		.node = WRITE_LOCK,
+		.part = WRITE_LOCK,
 		.fed = NO_LOCK,
-	};
-	assoc_mgr_lock_t locks = {
-		.assoc = WRITE_LOCK,
-		.qos = WRITE_LOCK,
-		.tres = WRITE_LOCK,
-		.user = WRITE_LOCK,
 	};
 
 	memset(&assoc_init_arg, 0, sizeof(assoc_init_args_t));
@@ -3120,31 +3149,28 @@ extern void ctld_assoc_mgr_init(void)
 	load_qos_usage();
 	_init_tres();
 
-	lock_slurmctld(job_write_lock);
-	if (job_list) {
-		num_jobs = list_count(job_list);
-		if (num_jobs) {
+	if (update_now) {
+		lock_slurmctld(j_n_p_write_lock);
+		_assoc_mgr_post_update_all();
+		if (job_list && list_count(job_list)) {
 			/*
 			 * This case (num_jobs > 0) should only happen on a
 			 * failed reconfiguration.
 			 */
-			assoc_mgr_lock(&locks);
-			(void) list_for_each(job_list,
-					     _foreach_cache_update_job, NULL);
-			assoc_mgr_unlock(&locks);
 			restore_job_accounting();
 		}
+		unlock_slurmctld(j_n_p_write_lock);
 	}
-	unlock_slurmctld(job_write_lock);
 
-	/* This thread is looking for when we get correct data from
-	   the database so we can update the assoc_ptr's in the jobs
-	*/
-	if ((running_cache != RUNNING_CACHE_STATE_NOTRUNNING) || num_jobs) {
+	/*
+	 * This thread is looking for when we get correct data from
+	 * the database so we can update the assoc_ptr's in the jobs,
+	 * partitions, and burst buffers.
+	 */
+	if ((running_cache != RUNNING_CACHE_STATE_NOTRUNNING)) {
 		slurm_thread_create(NULL, &assoc_cache_thread, _assoc_cache_mgr,
 				    NULL);
 	}
-
 }
 
 /* Make sure the assoc_mgr thread is terminated */
@@ -3397,8 +3423,8 @@ static void _parse_commandline(int argc, char **argv)
 	}
 
 	opterr = 0;
-	while ((c = getopt_long(argc, argv, "cdDf:hiL:n:rRsvV",
-	       long_options, NULL)) > 0) {
+	while ((c = getopt_long(argc, argv, "cDf:hiL:n:rRsvV", long_options,
+				NULL)) > 0) {
 		switch (c) {
 		case 'c':
 			recover = 0;
@@ -3694,7 +3720,7 @@ void update_logging(void)
 		slurm_conf.slurmctld_logfile = xstrdup(debug_logfile);
 	}
 
-	log_set_timefmt(slurm_conf.log_fmt);
+	log_set_timefmt(slurm_conf.log_fmt, slurm_conf.log_flags);
 
 	update_log_levels(slurm_conf.slurmctld_debug,
 			  slurm_conf.slurmctld_syslog_debug);
@@ -3927,6 +3953,8 @@ static int _foreach_cache_update_job(void *x, void *arg)
 		char *tmp_qos_req = xstrdup(job_ptr->details->qos_req);
 		slurmdb_qos_rec_t *qos_ptr = NULL;
 
+		job_ptr->qos_ptr = NULL; /* this is a stale pointer, set NULL */
+
 		token = strtok_r(tmp_qos_req, ",", &last);
 		while (token) {
 			slurmdb_qos_rec_t qos_rec = {
@@ -4023,6 +4051,52 @@ static int _foreach_cache_update_part(void *x, void *arg)
 	return 0;
 }
 
+/*
+ * This needs to be call after all assoc_mgr_*_list have been freed and reset.
+ * Jobs, partitions, and burst buffers all reference pointers from those list
+ * and need to be updated to not have stale pointers.
+ * Requires job, node, and part write locks. It will get its own assoc locks.
+ */
+static void _assoc_mgr_post_update_all(void)
+{
+	xassert(verify_lock(JOB_LOCK, WRITE_LOCK));
+	xassert(verify_lock(NODE_LOCK, WRITE_LOCK));
+	xassert(verify_lock(PART_LOCK, WRITE_LOCK));
+
+	assoc_mgr_lock_t locks = {
+		.assoc = READ_LOCK,
+		.qos = WRITE_LOCK,
+		.tres = WRITE_LOCK,
+		.user = READ_LOCK,
+	};
+
+	assoc_mgr_lock(&locks);
+	if (job_list) {
+		debug2("got real data from the database refreshing the association ptr's for %d jobs",
+		       list_count(job_list));
+		(void) list_for_each(job_list, _foreach_cache_update_job, NULL);
+	}
+
+	if (part_list) {
+		(void) list_for_each(part_list, _foreach_cache_update_part,
+				     NULL);
+	}
+
+	if (resv_list) {
+		(void) list_for_each(resv_list, resv_cache_update_qos_list,
+				     NULL);
+	}
+
+	set_cluster_tres(true);
+
+	assoc_mgr_unlock(&locks);
+	/*
+	 * issuing a reconfig will reset the pointers on the burst
+	 * buffers
+	 */
+	bb_g_reconfig();
+}
+
 /* _assoc_cache_mgr - hold out until we have real data from the
  * database so we can reset the job ptr's assoc ptr's */
 static void *_assoc_cache_mgr(void *no_data)
@@ -4030,9 +4104,6 @@ static void *_assoc_cache_mgr(void *no_data)
 	/* Write lock on jobs, nodes and partitions */
 	slurmctld_lock_t job_write_lock =
 		{ NO_LOCK, WRITE_LOCK, WRITE_LOCK, WRITE_LOCK, NO_LOCK };
-	assoc_mgr_lock_t locks =
-		{ .assoc = READ_LOCK, .qos = WRITE_LOCK, .tres = WRITE_LOCK,
-		  .user = READ_LOCK };
 
 	if (running_cache != RUNNING_CACHE_STATE_RUNNING)
 		lock_slurmctld(job_write_lock);
@@ -4061,8 +4132,17 @@ static void *_assoc_cache_mgr(void *no_data)
 		 * Make sure not to have the assoc_mgr or the
 		 * slurmdbd_lock locked when refresh_lists is called or you may
 		 * get deadlock.
+		 *
+		 * If the slurmdbd connection cuts out partially through
+		 * updating the assoc_mgr's lists, update the job, partition,
+		 * and burst_buffer pointer references to make sure no stale
+		 * points are left. But keep looping since not everything was
+		 * updated.
 		 */
-		assoc_mgr_refresh_lists(acct_db_conn, 0);
+		if (assoc_mgr_refresh_lists(acct_db_conn, 0) ==
+		    SLURM_COMMUNICATIONS_MISSING_SOCKET_ERROR)
+			_assoc_mgr_post_update_all();
+
 		if (g_tres_count != slurmctld_tres_cnt) {
 			info("TRES in database does not match cache "
 			     "(%u != %u).  Updating...",
@@ -4085,26 +4165,9 @@ static void *_assoc_cache_mgr(void *no_data)
 		slurm_mutex_unlock(&assoc_cache_mutex);
 	}
 
-	assoc_mgr_lock(&locks);
-	if (job_list) {
-		debug2("got real data from the database refreshing the association ptr's for %d jobs",
-		       list_count(job_list));
-		(void) list_for_each(job_list, _foreach_cache_update_job, NULL);
-	}
-
-	if (part_list) {
-		(void) list_for_each(part_list, _foreach_cache_update_part,
-				     NULL);
-	}
-
-	set_cluster_tres(true);
-
-	assoc_mgr_unlock(&locks);
-	/* issuing a reconfig will reset the pointers on the burst
-	   buffers */
-	bb_g_reconfig();
-
+	_assoc_mgr_post_update_all();
 	unlock_slurmctld(job_write_lock);
+
 	/* This needs to be after the lock and after we update the
 	   jobs so if we need to send them we are set. */
 	_accounting_cluster_ready();

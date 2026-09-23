@@ -1,3 +1,57 @@
+## Changes in 25.05.9
+
+* Fix potential crash when reconfiguring with auth/slurm.
+* Fix possible slurmstepd crash on invalid step socket requests. CVE-2026-65168.
+* Fix sbcast shared objects skipping credential verification. CVE-2026-65107.
+* Fix possible slurmd crash on invalid sbcast filenames. CVE-2026-65107.
+* Fix a slurmstepd stack overflow when a job environment contains an oversized SPANK option variable. CVE-2026-65108.
+* Fix slurmstepd removing files outside the container spool directory when cleaning up an OCI container. CVE-2026-65109.
+* Fix slurmstepd leaving OCI container spool directories behind when ContainerPath contains a task id pattern. CVE-2026-65109.
+* Fix heap over-read when unpacking a malformed forward data RPC in slurmd. CVE-2026-65138.
+* Fix a slurmd crash when handling a malformed forward data RPC with a missing socket address. CVE-2026-65138.
+* Reject cluster names containing characters that are unsafe to use in an accounting database query. CVE-2026-65139.
+* Reject unsafe cluster names on the accounting usage, add and runaway job paths. CVE-2026-65139.
+* Reject unsafe cluster names when opening a connection to the slurmdbd. CVE-2026-65139.
+* Reject non-numeric id values in accounting database queries. CVE-2026-65139.
+* Fix a privilege escalation where an operator could alter Administrator accounts through the accounting database. CVE-2026-65140.
+* Fix node count of a job step using arbitrary distribution. CVE-2026-65165.
+* Reject a hostlist function in the node list of a job step using arbitrary distribution. CVE-2026-65165.
+* Reject a job step whose arbitrary node list disagrees with its node count. CVE-2026-65165.
+
+## Changes in 25.05.8
+
+* slurmctld - Correct race condition during reconfigure and creating new cluster in slurmdbd that could cause both daemons to deadlock.
+* slurmctld - Reject all job submissions as reserved user or group nobody(99).
+* sbatch,srun,salloc - Reject arg --uid=99.
+* sbatch,srun,salloc - Reject arg --gid=99.
+* slurmctld - Avoid race condition during shutdown that could cause a crash due to tree forwarding.
+* slurmd - Avoid race condition during shutdown that could cause a crash due to tree forwarding.
+* slurmstepd - Avoid race condition during shutdown that could cause a crash due to tree forwarding.
+* srun - Avoid race condition during shutdown that could cause a crash due to tree forwarding.
+* slurmdbd - Avoid race condition during shutdown that could cause a crash due to tree forwarding.
+* slurmctld - Wait for forwarding threads to complete before shutdown to avoid crashing due to NULL dereferences or using unloaded plugins.
+* cons_tres - Prevent slurmctld SIGFPE during node selection.
+* slurmctld - Fix possible hang during reconfigure due to slow client I/O due to timeout not being enforced.
+* slurmctld - Fix possible hang during shutdown due to slow client I/O due to timeout not being enforced.
+* slurmctld - Avoid race condition during shutdown that could cause a crash while attempting to read from a connection.
+* slurmctld - Fix crash on startup due to race condition when I/O is processed before the connection (conn) plugin finishes initialization.
+* slurmdbd - Fix crash from race condition during shutdown when a persistent connection closes its database connection after the accounting_storage plugin has already unloaded.
+* Prevent deadlock when replacing nodes in reservations.
+* Fix gcc-16 build errors.
+* Fix build errors with recent versions of libcurl (8.16+).
+* Fix catching invalid gpu-freq numbered values.
+* Fix slurmd >= 25.05 crash on HetJob step launches from srun <= 24.11.
+
+## Changes in 25.05.7
+
+* Fix regression from af2c0bd which caused usercpu and systemcpu to be missing for job steps.
+* slurmd - Fix regression that could cause thread limits to not be enforced for handling incoming RPCs.
+* Fix "undefined symbol: gpu_common_underscorify_tolower" when gpu/nrt plugin in use.
+* Fix CLOUD nodes infrequently becoming FUTURE on slurmctld restart.
+* slurmrestd - Remove ExecReload from unit file since the daemon does not handle SIGHUP (reload would terminate the process).
+* Fix compile errors building against glibc-2.43
+* Fix race on reconfigure that caused slurmctld to crash.
+
 ## Changes in 25.05.6
 
 * Updating a job's qos will always replace the previous timelimit with the new qos' timelimit, unless another time limit is explicitly specified in the update command.

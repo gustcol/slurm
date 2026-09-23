@@ -1342,11 +1342,6 @@ extern int update_state_node(GtkDialog *dialog,
 				g_free(lower);
 				goto end_it;
 			}
-			if (uid_from_string(getlogin(),
-					    &node_msg->reason_uid) !=
-			    SLURM_SUCCESS)
-				node_msg->reason_uid = getuid();
-
 		}
 		if ((rc = slurm_update_node(node_msg)) == SLURM_SUCCESS) {
 			lower = g_strdup_printf(

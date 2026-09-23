@@ -68,10 +68,11 @@
 
 #define MAX_RETRIES 15
 #define MAX_WAIT_SLEEP_TIME 32
+#define DEF_ENV_EXCLUDE "^SLURM_JWT="
 
 static int   _fill_job_desc_from_opts(job_desc_msg_t *desc);
 static void *_get_script_buffer(const char *filename, int *size);
-static int   _job_wait(uint32_t job_id);
+static int _job_wait(uint32_t job_id);
 static char *_script_wrap(char *command_string);
 static void  _set_exit_code(void);
 static int   _set_rlimit_env(void);
@@ -129,10 +130,11 @@ int main(int argc, char **argv)
 		log_alter(logopt, 0, NULL);
 	}
 
-	if (sbopt.wrap != NULL) {
-		script_body = _script_wrap(sbopt.wrap);
-	} else if (opt.job_flags & EXTERNAL_JOB) {
+	/* Only the leader of a hetjob carries the script */
+	if (is_het_job ? het_leader_external : (opt.job_flags & EXTERNAL_JOB)) {
 		script_body = NULL;
+	} else if (sbopt.wrap) {
+		script_body = _script_wrap(sbopt.wrap);
 	} else {
 		script_body = _get_script_buffer(script_name, &script_size);
 		if (!script_body)
@@ -299,7 +301,7 @@ int main(int argc, char **argv)
 			rc = slurm_submit_batch_job(desc, &resp);
 		if (rc >= 0)
 			break;
-		if (errno == ESLURM_ERROR_ON_DESC_TO_RECORD_COPY) {
+		if (errno == ESLURM_MAX_JOB_COUNT) {
 			msg = "Slurm job queue full, sleeping and retrying";
 		} else if ((errno == ESLURM_NODES_BUSY) ||
 			   (errno == ESLURM_PORTS_BUSY)) {
@@ -337,7 +339,7 @@ int main(int argc, char **argv)
 		cli_filter_g_post_submit(i, resp->step_id.job_id, NO_VAL);
 
 	if (!quiet) {
-		if (!sbopt.parsable) {
+		if (!opt.parsable) {
 			printf("Submitted batch job %u", resp->step_id.job_id);
 			if (working_cluster_rec)
 				printf(" on cluster %s",
@@ -373,6 +375,8 @@ static int _job_wait(uint32_t job_id)
 	int ec = 0, ec2, i, rc;
 	int sleep_time = 2;
 	bool complete = false;
+	slurm_step_id_t step_id = SLURM_STEP_ID_INITIALIZER;
+	step_id.job_id = job_id;
 
 	while (!complete) {
 		complete = true;
@@ -386,7 +390,7 @@ static int _job_wait(uint32_t job_id)
 		    (sleep_time < MAX_WAIT_SLEEP_TIME))
 			sleep_time *= 4;
 
-		rc = slurm_load_job(&resp, job_id, SHOW_ALL);
+		rc = slurm_load_job(&resp, step_id, SHOW_ALL);
 		if (rc == SLURM_SUCCESS) {
 			for (i = 0, job_ptr = resp->job_array;
 			     (i < resp->record_count); i++, job_ptr++) {
@@ -404,7 +408,7 @@ static int _job_wait(uint32_t job_id)
 			slurm_free_job_info_msg(resp);
 		} else if (rc == ESLURM_INVALID_JOB_ID) {
 			error("Job %u no longer found and exit code not found",
-			      job_id);
+			      step_id.job_id);
 		} else {
 			complete = false;
 			error("Currently unable to load job state information, retrying: %m");
@@ -451,7 +455,19 @@ static int _fill_job_desc_from_opts(job_desc_msg_t *desc)
 			exit(1);
 	}
 	if (opt.export_env == NULL) {
-		env_array_merge(&desc->environment, (const char **) environ);
+		regex_t exclude = { 0 };
+		char **env = NULL;
+
+		if (regcomp(&exclude, DEF_ENV_EXCLUDE, REG_EXTENDED))
+			fatal_abort("regex compile failed");
+
+		env_array_merge(&env, (const char **) environ);
+
+		desc->environment =
+			env_array_exclude((const char **) env, &exclude);
+
+		regfree(&exclude);
+		env_array_free(env);
 	} else if (!xstrcasecmp(opt.export_env, "ALL")) {
 		env_array_merge(&desc->environment, (const char **) environ);
 	} else if (!xstrcasecmp(opt.export_env, "NIL")) {
@@ -506,12 +522,12 @@ static void _set_exit_code(void)
 /* Propagate SPANK environment via SLURM_SPANK_ environment variables */
 static void _set_spank_env(void)
 {
-	int i;
+	int i, rc = EINVAL;
 
 	for (i = 0; i < opt.spank_job_env_size; i++) {
-		if (setenvfs("SLURM_SPANK_%s", opt.spank_job_env[i]) < 0) {
-			error("unable to set %s in environment",
-			      opt.spank_job_env[i]);
+		if ((rc = setenvfs("SLURM_SPANK_%s", opt.spank_job_env[i]))) {
+			error("unable to set %s in environment: %s",
+			      opt.spank_job_env[i], slurm_strerror(rc));
 		}
 	}
 }
@@ -521,6 +537,7 @@ static int _set_umask_env(void)
 {
 	char mask_char[5];
 	mode_t mask;
+	int rc = EINVAL;
 
 	if (getenv("SLURM_UMASK"))	/* use this value */
 		return SLURM_SUCCESS;
@@ -534,8 +551,9 @@ static int _set_umask_env(void)
 
 	sprintf(mask_char, "0%d%d%d",
 		((mask>>6)&07), ((mask>>3)&07), mask&07);
-	if (setenvf(NULL, "SLURM_UMASK", "%s", mask_char) < 0) {
-		error ("unable to set SLURM_UMASK in environment");
+	if ((rc = setenvf(NULL, "SLURM_UMASK", "%s", mask_char))) {
+		error("unable to set SLURM_UMASK in environment: %s",
+		      slurm_strerror(rc));
 		return SLURM_ERROR;
 	}
 	debug ("propagating UMASK=%s", mask_char);
@@ -719,6 +737,7 @@ static int _set_rlimit_env(void)
 	unsigned long        cur;
 	char                 name[64], *format;
 	slurm_rlimits_info_t *rli;
+	int env_rc = EINVAL;
 
 	/* Load default limits to be propagated from slurm.conf */
 	slurm_conf_lock();
@@ -751,8 +770,9 @@ static int _set_rlimit_env(void)
 		else
 			format = "%lu";
 
-		if (setenvf (NULL, name, format, cur) < 0) {
-			error ("unable to set %s in environment", name);
+		if ((env_rc = setenvf(NULL, name, format, cur))) {
+			error("unable to set %s in environment: %s", name,
+			      slurm_strerror(env_rc));
 			rc = SLURM_ERROR;
 			continue;
 		}

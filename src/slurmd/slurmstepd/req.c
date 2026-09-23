@@ -70,6 +70,7 @@
 #include "src/interfaces/acct_gather.h"
 #include "src/interfaces/auth.h"
 #include "src/interfaces/cgroup.h"
+#include "src/interfaces/hash.h"
 #include "src/interfaces/jobacct_gather.h"
 #include "src/interfaces/namespace.h"
 #include "src/interfaces/proctrack.h"
@@ -90,12 +91,22 @@
 #include "src/stepmgr/srun_comm.h"
 #include "src/stepmgr/stepmgr.h"
 
+#define MAX_SUBSCRIBERS 64
+
+/*
+ * Upper bound on the string lengths accepted on the step socket. Every sender
+ * derives these from strlen() of a name or a short message, so this is far
+ * more than any legitimate request needs.
+ */
+#define MAX_STEPD_REQ_STR_LEN (64 * 1024)
+
 static void *_handle_accept(void *arg);
 static int _handle_request(int fd, uid_t uid, pid_t remote_pid);
 static void *_wait_extern_pid(void *args);
 static int _handle_add_extern_pid_internal(pid_t pid);
 static bool _msg_socket_readable(eio_obj_t *obj);
 static int _msg_socket_accept(eio_obj_t *obj, list_t *objs);
+static void _wait_for_connections(void);
 
 struct io_operations msg_socket_ops = {
 	.readable = &_msg_socket_readable,
@@ -112,6 +123,7 @@ static pthread_mutex_t extern_thread_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t extern_thread_cond = PTHREAD_COND_INITIALIZER;
 
 pthread_mutex_t stepmgr_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t resize_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static pthread_mutex_t message_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t message_cond = PTHREAD_COND_INITIALIZER;
@@ -136,7 +148,7 @@ static int
 _create_socket(const char *name)
 {
 	int fd;
-	int len;
+	socklen_t len;
 	struct sockaddr_un addr;
 
 	/*
@@ -157,7 +169,8 @@ _create_socket(const char *name)
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
 	strlcpy(addr.sun_path, name, sizeof(addr.sun_path));
-	len = strlen(addr.sun_path)+1 + sizeof(addr.sun_family);
+	len = sockaddr_fixlen((struct sockaddr *) &addr,
+			      (socklen_t) sizeof(addr));
 
 	/* bind the name to the descriptor */
 	if (bind(fd, (struct sockaddr *) &addr, len) < 0) {
@@ -274,6 +287,7 @@ static void *_msg_thr_internal(void *ignored)
 	eio_handle_mainloop(step->msg_handle);
 	debug("Message thread exited");
 
+	_wait_for_connections();
 	return NULL;
 }
 
@@ -310,8 +324,17 @@ static void _wait_for_connections(void)
 
 	slurm_mutex_lock(&message_lock);
 	ts.tv_sec = time(NULL) + STEPD_MESSAGE_COMP_WAIT;
-	while (message_connections > 0 && rc == 0)
+	while (message_connections > 0 && rc == 0) {
+		log_flag(NET, "Waiting on %d connections to finish",
+			 message_connections);
 		rc = pthread_cond_timedwait(&message_cond, &message_lock, &ts);
+	}
+	if (message_connections > 0) {
+		error("Timed out waiting for %d connections to finish, abandoning them now.",
+		      message_connections);
+	} else {
+		log_flag(NET, "All connections finished.");
+	}
 
 	slurm_mutex_unlock(&message_lock);
 }
@@ -336,7 +359,6 @@ _msg_socket_readable(eio_obj_t *obj)
 			/* slurmd considers the job step done now that
 			 * the domain name socket is destroyed */
 			obj->fd = -1;
-			_wait_for_connections();
 		} else {
 			debug2("  false");
 		}
@@ -349,12 +371,12 @@ static int _msg_socket_accept(eio_obj_t *obj, list_t *objs)
 {
 	int fd, *param = NULL;
 	struct sockaddr_un addr;
-	int len = sizeof(addr);
+	socklen_t len = sizeof(addr);
 
 	debug3("Called _msg_socket_accept");
 
-	while ((fd = accept4(obj->fd, (struct sockaddr *) &addr,
-			    (socklen_t *) &len, SOCK_CLOEXEC)) < 0) {
+	while ((fd = accept4(obj->fd, (struct sockaddr *) &addr, &len,
+			     SOCK_CLOEXEC)) < 0) {
 		if (errno == EINTR)
 			continue;
 		if ((errno == EAGAIN) ||
@@ -520,6 +542,17 @@ done:
 	return SLURM_ERROR;
 }
 
+static int _pack_job_steps(void *x, void *arg)
+{
+	step_record_t *step_ptr = (step_record_t *) x;
+	pack_step_args_t *args = (pack_step_args_t *) arg;
+
+	if (!verify_step_id(&step_ptr->step_id, args->step_id))
+		return 0;
+
+	return pack_ctld_job_step_info(step_ptr, args);
+}
+
 static int _handle_job_step_get_info(int fd, uid_t uid, pid_t remote_pid)
 {
 	int rc;
@@ -537,18 +570,21 @@ static int _handle_job_step_get_info(int fd, uid_t uid, pid_t remote_pid)
 	buffer = init_buf(BUF_SIZE);
 
 	slurm_mutex_lock(&stepmgr_mutex);
-	args.step_id = &request->step_id,
-	args.steps_packed = 0,
-	args.buffer = buffer,
-	args.proto_version = msg.protocol_version,
-	args.job_step_list = job_step_ptr->step_list,
-	args.pack_job_step_list_func = pack_ctld_job_step_info,
+	args.step_id = &request->step_id;
+	args.steps_packed = 0;
+	args.buffer = buffer;
+	args.proto_version = msg.protocol_version;
+	args.job_step_list = job_step_ptr->step_list;
+	args.pack_job_step_list_func = _pack_job_steps;
 
 	pack_job_step_info_response_msg(&args);
 	slurm_mutex_unlock(&stepmgr_mutex);
 
-	(void) stepd_proxy_send_resp_to_slurmd(fd, &msg, RESPONSE_JOB_STEP_INFO,
-					       buffer);
+	if ((rc = stepd_proxy_send_resp_to_slurmd(fd, &msg,
+						  RESPONSE_JOB_STEP_INFO,
+						  buffer)))
+		error("%s: [fd:%d] Unable to send %s", __func__, fd,
+		      rpc_num2string(RESPONSE_JOB_STEP_INFO));
 	FREE_NULL_BUFFER(buffer);
 	slurm_free_msg_members(&msg);
 
@@ -579,6 +615,100 @@ static int _handle_cancel_job_step(int fd, uid_t uid, pid_t remote_pid)
 	slurm_free_msg_members(&msg);
 
 done:
+	return rc;
+}
+
+static int _handle_stepmgr_resize_kill_steps(int fd, uid_t uid,
+					     pid_t remote_pid)
+{
+	int rc;
+	slurm_msg_t msg;
+	resize_msg_t *request;
+	return_code_msg_t rc_msg = { 0 };
+
+	if ((rc = _handle_stepmgr_relay_msg(fd, uid, &msg,
+					    REQUEST_STEPMGR_RESIZE_KILL_STEPS,
+					    true)))
+		goto done;
+
+	request = msg.data;
+
+	slurm_mutex_lock(&stepmgr_mutex);
+	rc = stepmgr_kill_steps_on_resize(job_step_ptr, request->nodelist);
+	slurm_mutex_unlock(&stepmgr_mutex);
+
+	rc_msg.return_code = rc;
+	stepd_proxy_send_resp_to_slurmd(fd, &msg, RESPONSE_SLURM_RC, &rc_msg);
+	slurm_free_msg_members(&msg);
+
+done:
+	return rc;
+}
+
+static int _handle_steps_drained_subscribe(int fd, uid_t uid, pid_t remote_pid)
+{
+	int rc = SLURM_SUCCESS;
+	slurm_msg_t msg;
+	steps_drained_sub_msg_t *request = NULL;
+	return_code_msg_t rc_msg = { 0 };
+	steps_drained_sub_t *sub = NULL;
+
+	if ((rc = _handle_stepmgr_relay_msg(fd, uid, &msg,
+					    REQUEST_STEPS_DRAINED_SUBSCRIBE,
+					    true)))
+		return rc;
+
+	request = msg.data;
+
+	if (!request->host || !request->host[0] || !request->port) {
+		rc_msg.return_code = ESLURM_INVALID_NODE_NAME;
+		goto reply;
+	}
+
+	sub = xmalloc(sizeof(*sub));
+	sub->host = xstrdup(request->host);
+	sub->port = request->port;
+	sub->tls_cert = xstrdup(request->tls_cert);
+	sub->protocol_version = msg.protocol_version;
+	slurm_set_addr(&sub->addr, sub->port, sub->host);
+
+	if (sub->addr.ss_family == AF_UNSPEC) {
+		error("REQUEST_STEPS_DRAINED_SUBSCRIBE: cannot resolve %s:%u",
+		      sub->host, sub->port);
+		destroy_steps_drained_sub(sub);
+		rc_msg.return_code = ESLURM_INVALID_NODE_NAME;
+		goto reply;
+	}
+
+	slurm_mutex_lock(&stepmgr_mutex);
+
+	if (!job_has_running_step(job_step_ptr) &&
+	    !job_step_ptr->pending_async_steps) {
+		slurm_mutex_unlock(&stepmgr_mutex);
+		destroy_steps_drained_sub(sub);
+		rc_msg.return_code = ESLURM_STEPS_DRAINED;
+		goto reply;
+	}
+
+	if (job_step_ptr->steps_drained_subs &&
+	    (list_count(job_step_ptr->steps_drained_subs) >= MAX_SUBSCRIBERS)) {
+		slurm_mutex_unlock(&stepmgr_mutex);
+		destroy_steps_drained_sub(sub);
+		rc_msg.return_code = EAGAIN;
+		goto reply;
+	}
+
+	if (!job_step_ptr->steps_drained_subs)
+		job_step_ptr->steps_drained_subs =
+			list_create(destroy_steps_drained_sub);
+
+	list_append(job_step_ptr->steps_drained_subs, sub);
+
+	slurm_mutex_unlock(&stepmgr_mutex);
+
+reply:
+	stepd_proxy_send_resp_to_slurmd(fd, &msg, RESPONSE_SLURM_RC, &rc_msg);
+	slurm_free_msg_members(&msg);
 	return rc;
 }
 
@@ -692,9 +822,11 @@ static int _handle_step_layout(int fd, uid_t uid, pid_t remote_pid)
 	rc = stepmgr_get_step_layouts(job_step_ptr, request, &step_layout);
 	slurm_mutex_unlock(&stepmgr_mutex);
 	if (!rc) {
-		(void) stepd_proxy_send_resp_to_slurmd(fd, &msg,
-						       RESPONSE_STEP_LAYOUT,
-						       step_layout);
+		if ((rc = stepd_proxy_send_resp_to_slurmd(fd, &msg,
+							  RESPONSE_STEP_LAYOUT,
+							  step_layout)))
+			error("%s: [fd:%d] Unable to send %s", __func__, fd,
+			      rpc_num2string(RESPONSE_STEP_LAYOUT));
 		slurm_step_layout_destroy(step_layout);
 	} else {
 		rc_msg.return_code = rc;
@@ -730,9 +862,11 @@ static int _handle_job_sbcast_cred(int fd, uid_t uid, pid_t remote_pid)
 	if (rc)
 		goto resp;
 
-	(void) stepd_proxy_send_resp_to_slurmd(fd, &msg,
-					       RESPONSE_JOB_SBCAST_CRED,
-					       job_info_resp_msg);
+	if ((rc = stepd_proxy_send_resp_to_slurmd(fd, &msg,
+						  RESPONSE_JOB_SBCAST_CRED,
+						  job_info_resp_msg)))
+		error("%s: [fd:%d] Unable to send %s", __func__, fd,
+		      rpc_num2string(RESPONSE_JOB_SBCAST_CRED));
 
 	slurm_free_sbcast_cred_msg(job_info_resp_msg);
 	slurm_free_msg_members(&msg);
@@ -784,11 +918,61 @@ static int _handle_het_job_alloc_info(int fd, uid_t uid, pid_t remote_pid)
 
 	slurm_mutex_unlock(&stepmgr_mutex);
 
-	(void) stepd_proxy_send_resp_to_slurmd(fd, &msg,
-					       RESPONSE_HET_JOB_ALLOCATION,
-					       resp_list);
+	if ((rc = stepd_proxy_send_resp_to_slurmd(fd, &msg,
+						  RESPONSE_HET_JOB_ALLOCATION,
+						  resp_list)))
+		error("%s: [fd:%d] Unable to send %s", __func__, fd,
+		      rpc_num2string(RESPONSE_HET_JOB_ALLOCATION));
 
 	FREE_NULL_LIST(resp_list);
+	slurm_free_msg_members(&msg);
+	return rc;
+
+resp:
+	rc_msg.return_code = rc;
+	stepd_proxy_send_resp_to_slurmd(fd, &msg, RESPONSE_SLURM_RC, &rc_msg);
+	slurm_free_msg_members(&msg);
+
+done:
+	return rc;
+}
+
+/*
+ * _handle_het_step_id - serve REQUEST_HET_STEP_ID on the het leader stepmgr.
+ */
+static int _handle_het_step_id(int fd, uid_t uid, pid_t remote_pid)
+{
+	slurm_msg_t msg;
+	int rc;
+	return_code_msg_t rc_msg = { 0 };
+	het_step_id_msg_t *request;
+	het_step_id_msg_t response = { .step_id = SLURM_STEP_ID_INITIALIZER };
+
+	if ((rc = _handle_stepmgr_relay_msg(fd, uid, &msg, REQUEST_HET_STEP_ID,
+					    true)))
+		goto done;
+
+	request = msg.data;
+
+	slurm_mutex_lock(&stepmgr_mutex);
+
+	if (!job_step_ptr->het_job_id ||
+	    (request->step_id.job_id != job_step_ptr->job_id)) {
+		error("REQUEST_HET_STEP_ID for %pI misrouted to stepmgr jobid %u (het_job_id=%u) from uid=%u",
+		      &request->step_id, job_step_ptr->job_id,
+		      job_step_ptr->het_job_id, uid);
+		rc = ESLURM_INVALID_JOB_ID;
+		slurm_mutex_unlock(&stepmgr_mutex);
+		goto resp;
+	}
+
+	response.step_id = request->step_id;
+	response.step_id.step_id = job_step_ptr->next_step_id++;
+	slurm_mutex_unlock(&stepmgr_mutex);
+
+	(void) stepd_proxy_send_resp_to_slurmd(fd, &msg, RESPONSE_HET_STEP_ID,
+					       &response);
+
 	slurm_free_msg_members(&msg);
 	return rc;
 
@@ -828,6 +1012,83 @@ rwfail:
 	return SLURM_ERROR;
 }
 
+static int _cap_step_mem(void *x, void *arg)
+{
+	step_record_t *step_ptr = x;
+	uint64_t new_job_mem = *(uint64_t *) arg;
+	job_resources_t *resrcs = job_step_ptr->job_resrcs;
+	int job_node_inx = -1, step_node_inx = -1;
+
+	if (step_ptr->pn_min_memory && !(step_ptr->pn_min_memory & MEM_PER_CPU))
+		step_ptr->pn_min_memory =
+			MIN(step_ptr->pn_min_memory, new_job_mem);
+
+	if (!step_ptr->memory_allocated)
+		return SLURM_SUCCESS;
+
+	for (int i = 0; next_node_bitmap(resrcs->node_bitmap, &i); i++) {
+		job_node_inx++;
+		if (!bit_test(step_ptr->step_node_bitmap, i))
+			continue;
+		step_node_inx++;
+		step_ptr->memory_allocated[step_node_inx] =
+			MIN(step_ptr->memory_allocated[step_node_inx],
+			    new_job_mem);
+		if (!(step_ptr->flags & SSF_MEM_ZERO) &&
+		    !(step_ptr->flags & SSF_OVERLAP_FORCE))
+			resrcs->memory_used[job_node_inx] +=
+				step_ptr->memory_allocated[step_node_inx];
+	}
+
+	return SLURM_SUCCESS;
+}
+
+static int _handle_update_mem_limits(int fd, uid_t uid, pid_t remote_pid)
+{
+	uint64_t new_job_mem;
+	uint64_t new_step_mem;
+	int rc;
+
+	safe_read(fd, &new_job_mem, sizeof(uint64_t));
+
+	slurm_mutex_lock(&resize_mutex);
+	/*
+	 * Cap the step memory at the new job memory if it exceeds it.
+	 * Otherwise keep the step's existing limit.
+	 */
+	new_step_mem = MIN(step->step_mem, new_job_mem);
+
+	rc = task_g_update_mem_limit(step, new_job_mem, new_step_mem);
+
+	if (rc == SLURM_SUCCESS) {
+		step->job_mem = new_job_mem;
+		step->step_mem = new_step_mem;
+
+		if (job_step_ptr) {
+			job_resources_t *resrcs;
+
+			slurm_mutex_lock(&stepmgr_mutex);
+			job_step_ptr->details->pn_min_memory = new_job_mem;
+			resrcs = job_step_ptr->job_resrcs;
+			for (int i = 0; i < resrcs->nhosts; i++) {
+				resrcs->memory_allocated[i] =
+					MIN(resrcs->memory_allocated[i],
+					    new_job_mem);
+				resrcs->memory_used[i] = 0;
+			}
+			list_for_each(job_step_ptr->step_list, _cap_step_mem,
+				      &new_job_mem);
+			slurm_mutex_unlock(&stepmgr_mutex);
+		}
+	}
+	slurm_mutex_unlock(&resize_mutex);
+
+	safe_write(fd, &rc, sizeof(int));
+	return SLURM_SUCCESS;
+rwfail:
+	return SLURM_ERROR;
+}
+
 static int _handle_uid(int fd, uid_t uid, pid_t remote_pid)
 {
 	safe_write(fd, &step->uid, sizeof(uid_t));
@@ -860,6 +1121,11 @@ static int _handle_signal_container(int fd, uid_t uid, pid_t remote_pid)
 	safe_read(fd, &sig, sizeof(int));
 	safe_read(fd, &flag, sizeof(int));
 	safe_read(fd, &details_len, sizeof(int));
+	if ((details_len < 0) || (details_len > MAX_STEPD_REQ_STR_LEN)) {
+		error("%s: rejecting invalid details length %d",
+		      __func__, details_len);
+		goto rwfail;
+	}
 	if (details_len)
 		details = xmalloc(details_len + 1);
 	safe_read(fd, details, details_len);
@@ -1053,6 +1319,10 @@ static int _handle_notify_job(int fd, uid_t uid, pid_t remote_pid)
 	debug3("_handle_notify_job for %ps", &step->step_id);
 
 	safe_read(fd, &len, sizeof(int));
+	if ((len < 0) || (len > MAX_STEPD_REQ_STR_LEN)) {
+		error("%s: rejecting invalid message length %d", __func__, len);
+		goto rwfail;
+	}
 	if (len) {
 		message = xmalloc(len + 1);
 		safe_read(fd, message, len);
@@ -1079,7 +1349,9 @@ static int _handle_terminate(int fd, uid_t uid, pid_t remote_pid)
 	uint32_t i;
 
 	debug("_handle_terminate for %ps uid=%u", &step->step_id, uid);
-	step_terminate_monitor_start();
+
+	if (get_job_state() < SLURMSTEPD_STEP_CANCELLED)
+		step_terminate_monitor_start();
 
 	/*
 	 * Sanity checks
@@ -1152,6 +1424,11 @@ static int _handle_attach(int fd, uid_t uid, pid_t remote_pid)
 	srun       = xmalloc(sizeof(srun_info_t));
 
 	safe_read(fd, &cert_len, sizeof(uint32_t));
+	if (cert_len > MAX_STEPD_REQ_STR_LEN) {
+		error("%s: rejecting invalid cert length %u",
+		      __func__, cert_len);
+		goto rwfail;
+	}
 	if (cert_len) {
 		srun->tls_cert = xmalloc(cert_len);
 		safe_read(fd, srun->tls_cert, cert_len);
@@ -1159,13 +1436,19 @@ static int _handle_attach(int fd, uid_t uid, pid_t remote_pid)
 	safe_read(fd, &srun->ioaddr, sizeof(slurm_addr_t));
 	safe_read(fd, &srun->resp_addr, sizeof(slurm_addr_t));
 	safe_read(fd, &key_len, sizeof(uint32_t));
-	srun->key = xmalloc(key_len);
+	if (key_len > MAX_STEPD_REQ_STR_LEN) {
+		error("%s: rejecting invalid key length %u", __func__, key_len);
+		goto rwfail;
+	}
+	srun->key = xmalloc(key_len + 1);
 	safe_read(fd, srun->key, key_len);
+	srun->key[key_len] = '\0';
+	srun->key_hash = hash_g_compute_hex(srun->key);
 	safe_read(fd, &srun->uid, sizeof(uid_t));
 	safe_read(fd, &srun->protocol_version, sizeof(uint16_t));
 
-	if (!srun->protocol_version)
-		srun->protocol_version = NO_VAL16;
+	xassert(srun->protocol_version);
+	srun->attached = true;
 
 	/*
 	 * Check if jobstep is actually running.
@@ -1222,6 +1505,8 @@ done:
 	}
 	if (srun) {
 		xfree(srun->key);
+		xfree(srun->key_hash);
+		xfree(srun->tls_cert);
 		xfree(srun);
 	}
 	return SLURM_SUCCESS;
@@ -1229,6 +1514,8 @@ done:
 rwfail:
 	if (srun) {
 		xfree(srun->key);
+		xfree(srun->key_hash);
+		xfree(srun->tls_cert);
 		xfree(srun);
 	}
 	xfree(pids);
@@ -1278,7 +1565,7 @@ rwfail:
 
 static int _handle_get_ns_fd(int fd, uid_t uid, pid_t remote_pid)
 {
-	list_t *ns_map = list_create(NULL);
+	list_t *ns_map = list_create(stepd_destroy_ns_fd_map);
 
 	debug("%s: for %pI %ps", __func__, &step->step_id, &step->step_id);
 
@@ -1313,7 +1600,7 @@ rwfail:
 
 static int _handle_get_ns_fds(int fd, uid_t uid, pid_t remote_pid)
 {
-	list_t *ns_map = list_create(NULL);
+	list_t *ns_map = list_create(stepd_destroy_ns_fd_map);
 	int ns_count = 0;
 
 	debug("%s: for %pI %ps", __func__, &step->step_id, &step->step_id);
@@ -1626,6 +1913,10 @@ static int _handle_getpw(int fd, uid_t socket_uid, pid_t remote_pid)
 	safe_read(fd, &mode, sizeof(int));
 	safe_read(fd, &uid, sizeof(uid_t));
 	safe_read(fd, &len, sizeof(int));
+	if ((len < 0) || (len > MAX_STEPD_REQ_STR_LEN)) {
+		error("%s: rejecting invalid name length %d", __func__, len);
+		goto rwfail;
+	}
 	if (len) {
 		name = xmalloc(len + 1); /* add room for NUL */
 		safe_read(fd, name, len);
@@ -1653,6 +1944,8 @@ static int _handle_getpw(int fd, uid_t socket_uid, pid_t remote_pid)
 		error("%s: incomplete data, ignoring request", __func__);
 		found = 0;
 	}
+
+	xfree(name);
 
 	safe_write(fd, &found, sizeof(int));
 
@@ -1728,6 +2021,10 @@ static int _handle_getgr(int fd, uid_t uid, pid_t remote_pid)
 	safe_read(fd, &mode, sizeof(int));
 	safe_read(fd, &gid, sizeof(gid_t));
 	safe_read(fd, &len, sizeof(int));
+	if ((len < 0) || (len > MAX_STEPD_REQ_STR_LEN)) {
+		error("%s: rejecting invalid name length %d", __func__, len);
+		goto rwfail;
+	}
 	if (len) {
 		name = xmalloc(len + 1); /* add room for NUL */
 		safe_read(fd, name, len);
@@ -1755,6 +2052,8 @@ static int _handle_getgr(int fd, uid_t uid, pid_t remote_pid)
 	} else if (mode == GETGR_MATCH_ALWAYS) {
 		found = step->ngids;
 	}
+
+	xfree(name);
 
 	safe_write(fd, &found, sizeof(int));
 
@@ -1788,13 +2087,18 @@ static int _handle_gethost(int fd, uid_t uid, pid_t remote_pid)
 	char *hostname = NULL;
 	bool pid_match;
 	int found = 0;
-	unsigned char address[sizeof(struct in6_addr)];
+	char address[INET6_ADDRSTRLEN];
 	char *address_str = NULL;
 	int af = AF_UNSPEC;
 	slurm_addr_t addr;
 
 	safe_read(fd, &mode, sizeof(int));
 	safe_read(fd, &len, sizeof(int));
+	if ((len < 0) || (len > MAX_STEPD_REQ_STR_LEN)) {
+		error("%s: rejecting invalid nodename length %d",
+		      __func__, len);
+		goto rwfail;
+	}
 	if (len) {
 		nodename = xmalloc(len + 1); /* add room for NULL */
 		safe_read(fd, nodename, len);
@@ -1819,8 +2123,8 @@ static int _handle_gethost(int fd, uid_t uid, pid_t remote_pid)
 		nodename_r = xstrdup(nodename);
 		hostname = xstrdup(nodename);
 
-		slurm_get_ip_str(&addr, (char *)address, INET6_ADDRSTRLEN);
-		tmp_str = xstrdup((char *)address);
+		slurm_get_ip_str(&addr, address, sizeof(address));
+		tmp_str = xstrdup(address);
 		inet_pton(af, tmp_str, &address);
 		xfree(tmp_str);
 	} else if (nodename &&
@@ -1844,6 +2148,7 @@ static int _handle_gethost(int fd, uid_t uid, pid_t remote_pid)
 		}
 	}
 	xfree(nodename);
+	xfree(address_str);
 
 	safe_write(fd, &found, sizeof(int));
 
@@ -1883,6 +2188,7 @@ static int _handle_gethost(int fd, uid_t uid, pid_t remote_pid)
 
 rwfail:
 	xfree(hostname);
+	xfree(nodename);
 	xfree(nodename_r);
 	return SLURM_ERROR;
 }
@@ -2060,6 +2366,10 @@ static int _handle_completion(int fd, uid_t uid, pid_t remote_pid)
 	 * slurmd and slurmstepd
 	 */
 	safe_read(fd, &len, sizeof(int));
+	if ((len < 0) || (len > MAX_MSG_SIZE)) {
+		error("%s: rejecting invalid jobacct length %d", __func__, len);
+		goto rwfail;
+	}
 	buf = xmalloc(len);
 	safe_read(fd, buf, len);
 	buffer = create_buf(buf, len);
@@ -2089,19 +2399,19 @@ static int _handle_completion(int fd, uid_t uid, pid_t remote_pid)
 			};
 
 			step_partial_comp(&req, uid, true, &rem, &max_rc);
-
-			safe_write(fd, &rc, sizeof(int));
-			safe_write(fd, &errnum, sizeof(int));
-
-			jobacctinfo_destroy(jobacct);
-
-			rc = SLURM_SUCCESS;
 		} else {
 			error("Asked to complete a stepmgr step but we don't have a job_step_ptr. This should never happen.");
 			rc = SLURM_ERROR;
 		}
 		slurm_mutex_unlock(&stepmgr_mutex);
-		return rc;
+		jobacctinfo_destroy(jobacct);
+
+		if (rc != SLURM_SUCCESS)
+			return rc;
+
+		safe_write(fd, &rc, sizeof(int));
+		safe_write(fd, &errnum, sizeof(int));
+		return SLURM_SUCCESS;
 	}
 
 	/*
@@ -2251,6 +2561,24 @@ rwfail:
 	return SLURM_ERROR;
 }
 
+static int _handle_job_usage(int fd, uid_t uid, pid_t remote_pid)
+{
+	jobacctinfo_t *jobacct = NULL;
+	int rc;
+
+	debug("%s for %ps", __func__, &step->step_id);
+
+	jobacct = jobacctinfo_create(NULL);
+	jobacct_gather_stat_job(jobacct);
+
+	rc = jobacctinfo_setinfo(jobacct, JOBACCT_DATA_PIPE, &fd,
+				 SLURM_PROTOCOL_VERSION);
+
+	jobacctinfo_destroy(jobacct);
+
+	return rc;
+}
+
 /* We don't check the uid in this function, anyone may list the task info. */
 static int _handle_task_info(int fd, uid_t uid, pid_t remote_pid)
 {
@@ -2309,6 +2637,10 @@ static int _handle_reconfig(int fd, uid_t uid, pid_t remote_pid)
 	 * len = 0 indicates we're just going for a log rotate.
 	 */
 	safe_read(fd, &len, sizeof(int));
+	if ((len < 0) || (len > MAX_MSG_SIZE)) {
+		error("%s: rejecting invalid config length %d", __func__, len);
+		goto rwfail;
+	}
 	if (len) {
 		buffer = init_buf(len);
 		safe_read(fd, buffer->head, len);
@@ -2409,6 +2741,11 @@ slurmstepd_rpc_t stepd_rpcs[] = {
 		.func = _handle_mem_limits,
 	},
 	{
+		.msg_type = REQUEST_STEP_UPDATE_MEM_LIMITS,
+		.from_slurmd = true,
+		.func = _handle_update_mem_limits,
+	},
+	{
 		.msg_type = REQUEST_STEP_UID,
 		.func = _handle_uid,
 	},
@@ -2462,6 +2799,11 @@ slurmstepd_rpc_t stepd_rpcs[] = {
 		.msg_type = REQUEST_STEP_STAT,
 		.from_job_owner = true,
 		.func = _handle_stat_jobacct,
+	},
+	{
+		.msg_type = REQUEST_JOB_USAGE,
+		.from_slurmd = true,
+		.func = _handle_job_usage,
 	},
 	{
 		.msg_type = REQUEST_STEP_LIST_PIDS,
@@ -2530,12 +2872,20 @@ slurmstepd_rpc_t stepd_proxy_rpcs[] = {
 		.func = _handle_cancel_job_step,
 	},
 	{
+		.msg_type = REQUEST_STEPS_DRAINED_SUBSCRIBE,
+		.func = _handle_steps_drained_subscribe,
+	},
+	{
 		.msg_type = SRUN_JOB_COMPLETE,
 		.func = _handle_srun_job_complete,
 	},
 	{
 		.msg_type = SRUN_NODE_FAIL,
 		.func = _handle_srun_node_fail,
+	},
+	{
+		.msg_type = REQUEST_STEPMGR_RESIZE_KILL_STEPS,
+		.func = _handle_stepmgr_resize_kill_steps,
 	},
 	{
 		.msg_type = SRUN_TIMEOUT,
@@ -2556,6 +2906,10 @@ slurmstepd_rpc_t stepd_proxy_rpcs[] = {
 	{
 		.msg_type = REQUEST_HET_JOB_ALLOC_INFO,
 		.func = _handle_het_job_alloc_info,
+	},
+	{
+		.msg_type = REQUEST_HET_STEP_ID,
+		.func = _handle_het_step_id,
 	},
 	{
 		/* terminate the array. this must be last. */

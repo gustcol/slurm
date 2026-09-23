@@ -91,6 +91,8 @@ bool     preempt_by_part      = false;
 bool     preempt_by_qos       = false;
 bool     spec_cores_first     = false;
 
+static time_t last_set_all = 0;
+
 /* Required Slurm plugin symbols: */
 const char plugin_name[] = "Trackable RESources (TRES) Selection plugin";
 const char plugin_type[] = "select/cons_tres";
@@ -185,6 +187,7 @@ extern void fini(void)
 	select_node_usage = NULL;
 	part_data_destroy_res(select_part_record);
 	select_part_record = NULL;
+	gang_exempt_fini();
 	cr_fini_global_core_data();
 }
 
@@ -290,6 +293,14 @@ extern int select_p_node_init(void)
 
 	part_data_create_array();
 	node_data_dump();
+
+	/*
+	 * node_record_count may have changed (dynamic node add/delete) since
+	 * gang_exempt_cores was built, so discard it rather than clear it. The
+	 * next read re-derives it at the new size, so the node-count-bounded
+	 * loops that consume it do not run off the end.
+	 */
+	gang_exempt_node_init();
 
 	return SLURM_SUCCESS;
 }
@@ -593,7 +604,40 @@ extern int select_p_job_expand(job_record_t *from_job_ptr,
 
 	(void) job_res_add_job(to_job_ptr, JOB_RES_ACTION_NORMAL);
 
+	/*
+	 * to_job_ptr absorbed from_job_ptr's cores. Neither job's exemption
+	 * changed, only the cores they hold, so re-deriving the union from the
+	 * tracked jobs is enough. Only mark it stale: the caller drops
+	 * from_job_ptr through deallocate_nodes() right after this, which
+	 * would discard an eager rebuild.
+	 */
+	gang_exempt_mark_stale();
+
 	return SLURM_SUCCESS;
+}
+
+extern void select_p_job_mem_reduce(job_record_t *job_ptr)
+{
+	job_resources_t *job_res = job_ptr->job_resrcs;
+	uint64_t new_mem = job_ptr->details->pn_min_memory;
+	int n = -1;
+
+	xassert(job_res);
+
+	for (int i = 0; next_node_bitmap(job_res->node_bitmap, &i); i++) {
+		uint64_t delta;
+		n++;
+		if (job_res->memory_allocated[n] <= new_mem)
+			continue;
+		delta = job_res->memory_allocated[n] - new_mem;
+		if (select_node_usage[i].alloc_memory >= delta) {
+			select_node_usage[i].alloc_memory -= delta;
+		} else {
+			error("%s: memory underflow on node %d for %pJ",
+			      __func__, i, job_ptr);
+			select_node_usage[i].alloc_memory = 0;
+		}
+	}
 }
 
 extern int select_p_job_resized(job_record_t *job_ptr, node_record_t *node_ptr)
@@ -658,6 +702,9 @@ extern int select_p_job_resized(job_record_t *job_ptr, node_record_t *node_ptr)
 					  slurm_find_ptr_in_list, job_ptr);
 
 		extract_job_resources_node(job, n);
+
+		/* The job no longer holds this node's cores. */
+		gang_exempt_mark_stale();
 
 		break;
 	}
@@ -734,6 +781,9 @@ extern int select_p_job_fini(job_record_t *job_ptr)
 
 	log_flag(SELECT_TYPE, "%pJ", job_ptr);
 
+	/* An ending job no longer needs its cores exempt. */
+	gang_exempt_remove_job(job_ptr);
+
 	job_res_rm_job(select_part_record, select_node_usage, NULL,
 		       job_ptr, JOB_RES_ACTION_NORMAL, NULL);
 
@@ -758,6 +808,12 @@ extern int select_p_job_suspend(job_record_t *job_ptr, bool indf_susp)
 	if (!indf_susp)
 		return SLURM_SUCCESS;
 
+	/*
+	 * An indefinitely suspended job releases its cores, so stop exempting
+	 * them. A gang suspend keeps its cores and returned above.
+	 */
+	gang_exempt_remove_job(job_ptr);
+
 	return job_res_rm_job(select_part_record, select_node_usage, NULL,
 			      job_ptr, JOB_RES_ACTION_RESUME, NULL);
 }
@@ -765,6 +821,8 @@ extern int select_p_job_suspend(job_record_t *job_ptr, bool indf_susp)
 /* See NOTE with select_p_job_suspend() above */
 extern int select_p_job_resume(job_record_t *job_ptr, bool indf_susp)
 {
+	int rc;
+
 	xassert(job_ptr);
 	xassert(job_ptr->magic == JOB_MAGIC);
 
@@ -778,13 +836,18 @@ extern int select_p_job_resume(job_record_t *job_ptr, bool indf_susp)
 	if (!indf_susp)
 		return SLURM_SUCCESS;
 
-	return job_res_add_job(job_ptr, JOB_RES_ACTION_RESUME);
+	rc = job_res_add_job(job_ptr, JOB_RES_ACTION_RESUME);
+
+	/* The job holds its cores again, so exempt them again. */
+	if (rc == SLURM_SUCCESS)
+		gang_exempt_add_job(job_ptr);
+
+	return rc;
 }
 
 /* Requires node READ_LOCK and select_node WRITE_LOCK */
 extern int select_p_select_nodeinfo_set_all(void)
 {
-	static time_t last_set_all = 0;
 	part_res_record_t *p_ptr;
 	node_record_t *node_ptr = NULL;
 	int i, n;
@@ -801,7 +864,7 @@ extern int select_p_select_nodeinfo_set_all(void)
 		       (long)last_set_all);
 		return SLURM_NO_CHANGE_IN_DATA;
 	}
-	last_set_all = last_node_update;
+	last_set_all = time(NULL);
 
 	/*
 	 * Build core bitmap array representing all cores allocated to all
@@ -895,15 +958,31 @@ extern int select_p_select_nodeinfo_set(job_record_t *job_ptr)
 	xassert(job_ptr);
 	xassert(job_ptr->magic == JOB_MAGIC);
 
-	if (IS_JOB_RUNNING(job_ptr))
+	if (IS_JOB_RUNNING(job_ptr)) {
 		rc = job_res_add_job(job_ptr, JOB_RES_ACTION_NORMAL);
-	else if (IS_JOB_SUSPENDED(job_ptr)) {
-		if (job_ptr->priority == 0)
+		/*
+		 * The job is now committed to running, so start tracking its
+		 * exempt cores. Removal happens in select_p_job_fini().
+		 */
+		if (rc == SLURM_SUCCESS)
+			gang_exempt_add_job(job_ptr);
+	} else if (IS_JOB_SUSPENDED(job_ptr)) {
+		if (job_ptr->priority == 0) {
+			/*
+			 * Indefinitely suspended. JOB_RES_ACTION_SUSPEND adds
+			 * memory and GRES but no cores, so the job holds none
+			 * to exempt. select_p_job_resume() tracks it again.
+			 */
 			rc = job_res_add_job(job_ptr, JOB_RES_ACTION_SUSPEND);
-		else	/* Gang schedule suspend */
+		} else {
+			/* Gang schedule suspend, so it still holds cores. */
 			rc = job_res_add_job(job_ptr, JOB_RES_ACTION_NORMAL);
-	} else
+			if (rc == SLURM_SUCCESS)
+				gang_exempt_add_job(job_ptr);
+		}
+	} else {
 		return SLURM_SUCCESS;
+	}
 
 	gres_job_state_log(job_ptr->gres_list_req, job_ptr->job_id);
 
@@ -923,6 +1002,8 @@ extern int select_p_reconfigure(void)
 	int rc = SLURM_SUCCESS;
 
 	info("%s: reconfigure", plugin_type);
+
+	last_set_all = 0;
 
 	def_cpu_per_gpu = 0;
 	def_mem_per_gpu = 0;
@@ -946,14 +1027,32 @@ extern int select_p_reconfigure(void)
 		if (IS_JOB_RUNNING(job_ptr)) {
 			/* add the job */
 			job_res_add_job(job_ptr, JOB_RES_ACTION_NORMAL);
+			/*
+			 * Re-offer the job's cores as exempt. Nothing else
+			 * re-offers a job that a rebuild dropped, so without
+			 * this a PreemptMode or PreemptExemptTime change this
+			 * reconfigure applies never takes effect for the jobs
+			 * already running under it.
+			 */
+			gang_exempt_add_job(job_ptr);
 		} else if (IS_JOB_SUSPENDED(job_ptr)) {
 			/* add the job in a suspended state */
-			if (job_ptr->priority == 0)
+			if (job_ptr->priority == 0) {
+				/*
+				 * Indefinitely suspended. Its cores were
+				 * released on suspend and JOB_RES_ACTION_SUSPEND
+				 * adds back only memory and GRES, so it holds
+				 * none to exempt and is not offered here.
+				 * select_p_job_resume() offers it again.
+				 */
 				(void) job_res_add_job(job_ptr,
 						       JOB_RES_ACTION_SUSPEND);
-			else	/* Gang schedule suspend */
+			} else {
+				/* Gang schedule suspend, so it holds cores. */
 				(void) job_res_add_job(job_ptr,
 						       JOB_RES_ACTION_NORMAL);
+				gang_exempt_add_job(job_ptr);
+			}
 		}
 
 		if ((IS_JOB_RUNNING(job_ptr) || IS_JOB_SUSPENDED(job_ptr)) &&

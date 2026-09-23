@@ -1,11 +1,14 @@
 ############################################################################
 # Copyright (C) SchedMD LLC.
 ############################################################################
-import os
 import logging
+import os
+
 import pytest
+
 import atf
 
+pytestmark = pytest.mark.slow
 
 # Globals
 user_name = atf.get_user_name()
@@ -31,7 +34,7 @@ def setup():
     atf.require_config_parameter("TrackWcKey", "yes")
     atf.require_config_parameter("TrackWcKey", "yes", source="slurmdbd")
     # Reducing bf_interval makes the test faster when using het jobs.
-    atf.add_config_parameter_value("SchedulerParameters", "bf_interval=2")
+    atf.require_config_parameter_includes("SchedulerParameters", ("bf_interval", 2))
     atf.require_slurm_running()
 
     # Basic account and user setup
@@ -58,14 +61,6 @@ def setup():
         f"sacctmgr -i del {sacctmgr_acct} ",
         user=atf.properties["slurm-user"],
     )
-
-
-# Cancel all jobs before and after the test
-@pytest.fixture(scope="function", autouse=True)
-def cancel_jobs():
-    atf.cancel_all_jobs()
-    yield
-    atf.cancel_all_jobs()
 
 
 #
@@ -139,11 +134,22 @@ def setup_reservations():
 
 @pytest.fixture
 def setup_wckeys():
-    atf.run_command(
+    result = atf.run_command(
         f"sacctmgr -i add user {user_name} set wckey={wckey}",
         user=atf.properties["slurm-user"],
-        fatal=True,
     )
+    if result["exit_code"] != 0:
+        known_xfail = (
+            "Ticket 20771: Setting and clearing default wckeys fixed in 25.05+"
+        )
+        if "Nothing added" in result["stdout"] + result["stderr"] and min(
+            atf.get_version("sbin/slurmdbd"),
+            atf.get_version("sbin/slurmctld"),
+        ) < (25, 5):
+            pytest.xfail(known_xfail)
+        pytest.fail(
+            f"Unable to add wckey to user: {result['stdout']}{result['stderr']}"
+        )
 
     yield
 
@@ -454,12 +460,6 @@ def test_filter_hetjobs(
     match_job_state,
     mismatch_job_state,
 ):
-    if atf.get_version("sbin/slurmdbd") < (25, 5):
-        if fixture == "setup_wckeys":
-            pytest.xfail(
-                "Ticket 20771: Setting/clearing default wckeys at submit time was fixed in 25.05"
-            )
-
     # Custom fixture may be necessary
     if fixture is not None:
         request.getfixturevalue(fixture)

@@ -48,7 +48,7 @@
 void _help_fields_msg(void);
 void _help_msg(void);
 void _usage(void);
-void _init_params();
+void _init_params(void);
 
 void _help_fields_msg(void)
 {
@@ -136,7 +136,7 @@ void _do_help(void)
 	}
 }
 
-void _init_params()
+void _init_params(void)
 {
 	memset(&params, 0, sizeof(sstat_parameters_t));
 	params.convert_flags = CONVERT_NUM_UNIT_EXACT;
@@ -305,8 +305,8 @@ void parse_command_line(int argc, char **argv)
 			if (selected_step->step_id.step_id != NO_VAL)
 				debug("\t: %ps\n", &selected_step->step_id);
 			else
-				debug("\t: All steps for job %u\n",
-				      selected_step->step_id.job_id);
+				debug("\t: All steps for %pI\n",
+				      &selected_step->step_id);
 		}
 		list_iterator_destroy(itr);
 	}

@@ -53,8 +53,10 @@
 
 #include "slurm/slurm.h"
 
+#include "src/common/daemonize.h"
 #include "src/common/data.h"
 #include "src/common/fd.h"
+#include "src/common/http_router.h"
 #include "src/common/log.h"
 #include "src/common/plugrack.h"
 #include "src/common/probes.h"
@@ -66,6 +68,7 @@
 #include "src/common/slurm_protocol_defs.h"
 #include "src/common/uid.h"
 #include "src/common/util-net.h"
+#include "src/common/workerpool.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
 
@@ -140,7 +143,7 @@ static data_parser_t **parsers = NULL;
 static bool unshare_sysv = true;
 static bool unshare_files = true;
 static bool check_user = true;
-static bool become_user = false;
+static bool become_user_mode = false;
 static http_status_code_t *response_status_codes = NULL;
 
 static void _plugrack_foreach_list(const char *full_type, const char *fq_path,
@@ -255,7 +258,7 @@ static void _parse_env(void)
 #endif /* NDEBUG */
 				check_user = false;
 			} else if (!xstrcasecmp(token, "become_user")) {
-				become_user = true;
+				become_user_mode = true;
 			} else {
 				fatal("Unexpected value in SLURMRESTD_SECURITY=%s",
 				      token);
@@ -377,6 +380,13 @@ static void _usage(void)
 	xfree(txt);
 }
 
+static int _req_not_found_stub(http_con_t *hcon, const char *name,
+			       const http_con_request_t *request, void *arg,
+			       void *path_arg)
+{
+	fatal_abort("should never be called");
+}
+
 /*
  * Load only required plugins to dump OpenAPI Specification to stdout
  */
@@ -390,6 +400,8 @@ static void dump_spec(int argc, char **argv)
 	size_t output_len = 0;
 
 	_setup_logging(argc, argv);
+
+	http_router_init(_req_not_found_stub);
 
 	(void) is_spec_generation_only(true);
 
@@ -536,59 +548,6 @@ static void _parse_commandline(int argc, char **argv)
 }
 
 /*
- * Check for supplementary group that could result in an unintended privilege
- * escalation
- */
-static void _check_gids(void)
-{
-	gid_t *gids = NULL;
-	bool need_drop = false;
-	int gid_count = getgroups(0, NULL);
-
-	if (gid_count < 0)
-		fatal("%s: getgroups(0, NULL) failed: %m", __func__);
-
-	if (!gid_count)
-		return;
-
-	gids = xcalloc(gid_count, sizeof(*gids));
-
-	if ((gid_count = getgroups(gid_count, gids)) < 0)
-		fatal("%s: getgroups() failed: %m", __func__);
-
-	for (int i = 0; i < gid_count; i++) {
-		/*
-		 * Ignore same gid being in supplementary groups
-		 * as it won't change permissions
-		 */
-		if (gids[i] == gid)
-			continue;
-
-		need_drop = true;
-		debug("%s: Supplementary group %d needs to be dropped",
-		      __func__, gids[i]);
-	}
-
-	xfree(gids);
-
-	if (!need_drop)
-		return;
-
-	debug("%s: Dropping all supplementary groups", __func__);
-
-	if (!setgroups(0, NULL))
-		return;
-
-#ifdef __linux__
-	if (errno == EPERM)
-		fatal("slurmrestd process lacks CAP_SETGID to drop supplementary groups. Supplementary groups must be removed from slurmrestd user (uid=%d,gid=%d) prior to starting slurmrestd.",
-		      uid, gid);
-#endif /* __linux__ */
-
-	fatal("Unable to drop supplementary groups: %m");
-}
-
-/*
  * slurmrestd is merely a translator from REST to Slurm.
  * Try to lock down any extra unneeded permissions.
  */
@@ -597,35 +556,23 @@ static void _lock_down(void)
 	if ((getuid() == SLURM_AUTH_NOBODY) || (getgid() == SLURM_AUTH_NOBODY))
 		fatal("slurmrestd must not be run as nobody");
 
-#if HAVE_SYS_PRCTL_H
-	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1)
-		fatal("Unable to disable new privileges: %m");
-#endif
+	if (become_user_mode) {
+		if (getuid())
+			fatal("slurmrestd must run as root in become_user mode");
 
-	if (unshare_sysv && unshare(CLONE_SYSVSEM))
-		fatal("Unable to unshare System V namespace: %m");
-	if (unshare_files && unshare(CLONE_FILES))
-		fatal("Unable to unshare file descriptors: %m");
+		if (getgid())
+			fatal("slurmrestd must run as root in become_user mode");
+	} else {
+		/* uid/gid default to 0 ("unset"); target the current user */
+		if (!uid)
+			uid = geteuid();
+		if (!gid)
+			gid = gid_from_uid(uid);
 
-	if (uid != 0 && (gid == 0))
-		gid = gid_from_uid(uid);
-	if (gid)
-		_check_gids();
-	if (gid != 0 && setgid(gid))
-		fatal("Unable to setgid: %m");
-	if (uid != 0 && setuid(uid))
-		fatal("Unable to setuid: %m");
-
-	if (become_user && getuid())
-		fatal("slurmrestd must run as root in become_user mode");
-
-	if (become_user && getgid())
-		fatal("slurmrestd must run as root in become_user mode");
-
-#ifdef PR_SET_DUMPABLE
-	if (prctl(PR_SET_DUMPABLE, 1) < 0)
-		error("%s: Unable to set process as dumpable: %m", __func__);
-#endif
+		if (become_user(uid, gid, NULL, 0, true, unshare_sysv,
+				unshare_files, true, false, false, true))
+			exit(1);
+	}
 }
 
 /*
@@ -650,9 +597,9 @@ static void _check_user(void)
 	if (gid_from_uid(slurm_conf.slurm_user_id) == getgid())
 		fatal("slurmrestd should not be run with SlurmUser's group.");
 
-	if (!getuid() && !become_user)
+	if (!getuid() && !become_user_mode)
 		fatal("slurmrestd should not be run as the root user.");
-	if (!getgid() && !become_user)
+	if (!getgid() && !become_user_mode)
 		fatal("slurmrestd should not be run with the root group.");
 
 	if ((gid_count = getgroups(0, NULL)) > 0) {
@@ -665,7 +612,7 @@ static void _check_user(void)
 			if (list[i] == slurm_conf.slurm_user_id)
 				fatal("slurmrestd should not be run with SlurmUser's group.");
 
-			if (!list[i] && !become_user)
+			if (!list[i] && !become_user_mode)
 				fatal("slurmrestd should not be run with the root group.");
 
 			if (list[i] == SLURM_AUTH_NOBODY)
@@ -728,7 +675,7 @@ static void _load_oas_specs(void)
 
 int main(int argc, char **argv)
 {
-	int rc = SLURM_SUCCESS, parse_rc = SLURM_SUCCESS;
+	int rc = SLURM_SUCCESS;
 	socket_listen = list_create(xfree_ptr);
 	conmgr_con_flags_t flags = CON_FLAG_NONE;
 
@@ -764,10 +711,22 @@ int main(int argc, char **argv)
 		fatal("Unable to load url_parser plugin: %s",
 		      slurm_strerror(rc));
 
-	/* This checks if slurmrestd is running in inetd mode */
-	conmgr_init(thread_count,
-		    (run_mode.listen ? 0 : CONMGR_THREAD_COUNT_MIN),
-		    max_connections);
+	if (slurm_conf.slurmrestd_params &&
+	    (rc = conmgr_set_params(slurm_conf.slurmrestd_params)))
+		fatal("Unable to apply SlurmrestdParameters: %s",
+		      slurm_strerror(rc));
+
+	/*
+	 * This checks if slurmrestd is running in inetd mode.
+	 *
+	 * Pass slurmrestd_params so a configured workerpool_threads/conmgr_threads
+	 * is honored when -t is not given; a non-zero -t thread_count still wins.
+	 */
+	workerpool_init(thread_count,
+			(run_mode.listen ? 0 : CONMGR_THREAD_COUNT_MIN),
+			slurm_conf.slurmrestd_params);
+
+	conmgr_init(max_connections);
 
 	/*
 	 * Attempt to load TLS plugin and then attempt to load the certificate
@@ -787,6 +746,8 @@ int main(int argc, char **argv)
 	conmgr_add_work_signal(SIGINT, _on_signal_interrupt, NULL);
 	conmgr_add_work_signal(SIGPIPE, _sigpipe_handler, NULL);
 	conmgr_add_work_signal(SIGPROF, _on_sigprof, NULL);
+
+	http_init();
 
 	auth_rack = plugrack_create("rest_auth");
 	plugrack_read_dir(auth_rack, slurm_conf.plugindir);
@@ -832,7 +793,8 @@ int main(int argc, char **argv)
 				      auth_plugin_types[i]);
 	}
 
-	if (init_rest_auth(become_user, auth_plugin_handles, auth_plugin_count))
+	if (init_rest_auth(become_user_mode, unshare_sysv, unshare_files,
+			   auth_plugin_handles, auth_plugin_count))
 		fatal("Unable to initialize rest authentication");
 
 	if (!(parsers = data_parser_g_new_array(NULL, NULL, NULL, NULL, NULL,
@@ -862,22 +824,21 @@ int main(int argc, char **argv)
 
 	if (!run_mode.listen) {
 		inetd_mode = true;
-		if ((rc = conmgr_process_fd(CON_TYPE_RAW, STDIN_FILENO,
-					    STDOUT_FILENO, http_events_get(),
-					    flags, NULL, 0, NULL,
-					    operations_router)))
+		if ((rc = conmgr_process_fd(CON_TYPE_RAW,
+					    &conmgr_timeouts_disabled,
+					    STDIN_FILENO, STDOUT_FILENO,
+					    http_events_get(), flags, NULL, 0,
+					    NULL, HTTP_CONNECTION_ARG_MAGIC)))
 			fatal("%s: unable to process stdin: %s",
 			      __func__, slurm_strerror(rc));
-
-		/* fail on first error if this is piped process */
-		conmgr_set_exit_on_error(true);
 	} else if (run_mode.listen) {
 		mode_t mask = umask(0);
 
-		if (conmgr_create_listen_sockets(CON_TYPE_RAW, flags,
+		if (conmgr_create_listen_sockets(&conmgr_timeouts_disabled,
+						 CON_TYPE_RAW, flags,
 						 socket_listen,
 						 http_events_get(),
-						 operations_router))
+						 HTTP_CONNECTION_ARG_MAGIC))
 			fatal("Unable to create sockets");
 
 		umask(mask);
@@ -893,14 +854,16 @@ int main(int argc, char **argv)
 	 * Inet mode expects connection errors to propagate upwards as
 	 * connection errors so they can be logged appropriately.
 	 */
-	if (conmgr_get_exit_on_error())
-		parse_rc = conmgr_get_error();
+	if (inetd_mode && !rc)
+		rc = http_events_get_last_status_code();
 
 	/* cleanup everything */
 	destroy_rest_auth();
 	destroy_operations();
 	destroy_openapi();
 	conmgr_fini();
+	http_fini();
+	workerpool_fini();
 	FREE_NULL_DATA_PARSER_ARRAY(parsers, false);
 	serializer_g_fini();
 	for (size_t i = 0; i < auth_plugin_count; i++) {
@@ -908,9 +871,8 @@ int main(int argc, char **argv)
 		xfree(auth_plugin_types[i]);
 	}
 	xfree(auth_plugin_types);
-	if ((rc = plugrack_destroy(auth_rack)))
-		fatal_abort("unable to clean up plugrack: %s",
-			    slurm_strerror(rc));
+	if (plugrack_destroy(auth_rack))
+		fatal_abort("unable to clean up plugrack");
 	auth_rack = NULL;
 
 	xfree(auth_plugin_handles);
@@ -927,5 +889,5 @@ int main(int argc, char **argv)
 	log_fini();
 
 	/* send parsing RC if there were no higher level errors */
-	return (rc ? rc : parse_rc);
+	return rc;
 }

@@ -1,10 +1,13 @@
 ############################################################################
 # Copyright (C) SchedMD LLC.
 ############################################################################
-import atf
 import pytest
 
+import atf
+
 # import re
+
+pytestmark = pytest.mark.slow
 
 dw_wlm_cli_client = f"{atf.properties['slurm-sbin-dir']}/dw_wlm_cli"
 dwstat_client = f"{atf.properties['slurm-sbin-dir']}/dwstat"

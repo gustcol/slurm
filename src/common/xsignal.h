@@ -49,9 +49,14 @@ typedef void SigFunc(int);
 SigFunc *xsignal(int signo, SigFunc *);
 
 /*
- * Set signal handler to default unless it is marked as ignore
+ * Set signal disposition to SIG_DFL
  */
 extern SigFunc *xsignal_default(int sig);
+
+/*
+ * Set signal disposition to SIG_IGN
+ */
+extern SigFunc *xsignal_ignore(int sig);
 
 /*
  * Save current set of blocked signals into `set'
@@ -85,5 +90,13 @@ int xsignal_unblock(int sigarray[]);
  *  Create a sigset_t from a sigarray
  */
 int xsignal_sigset_create(int sigarray[], sigset_t *setp);
+
+/*
+ * Reset the blocked signal mask and all signal dispositions to their defaults
+ * so an exec()ed process starts with a clean signal state (the mask and SIG_IGN
+ * dispositions are otherwise inherited across exec()). Unlike the other
+ * xsignal_* calls this is not gated by conmgr_enabled().
+ */
+extern void xsignal_reset_all(void);
 
 #endif /* !_XSIGNAL_H */

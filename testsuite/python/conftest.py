@@ -1,25 +1,147 @@
 ############################################################################
 # Copyright (C) SchedMD LLC.
 ############################################################################
-import _pytest
+import json
 
 # import inspect
 import logging
 import os
+import re
+import shutil
+import sys
+from pathlib import Path
+
+import _pytest
 
 # import pwd
 import pytest
-import re
-
-import shutil
-import sys
-
-from pathlib import Path
-
-import json
 
 sys.path.append(sys.path[0] + "/lib")
 import atf
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "xfail_teardown(reason, known_fail_msg, condition): "
+        "convert a matching module-teardown failure into xfail. "
+        "reason: human-readable explanation shown in the xfail report "
+        "known_fail_msg: substring matched against the teardown failure message. "
+        "condition: boolean gate; xfail only when condition is truthy ",
+    )
+
+
+def pytest_collection_modifyitems(session, config, items):
+    """
+    Create a json file from --collect-file with filenames and marks.
+    It can be used to order/filter/run tests in different ways based on
+    the custom marks we may create, like "slow".
+    """
+    if not config.option.collectonly:
+        return
+
+    collect_file = config.getoption("--collect-file")
+    if collect_file is None:
+        logging.info("Not saving collect info")
+        return
+
+    files = {}
+    for item in items:
+        file_path = item.nodeid.split("::")[0]
+
+        # Initialize entry if not present
+        if file_path not in files:
+            files[file_path] = {
+                "file": file_path,
+                "marks": [m.name for m in item.iter_markers()],
+            }
+        else:
+            files[file_path]["marks"].extend([m.name for m in item.iter_markers()])
+
+    logging.info(f"Saving callected info to {collect_file}")
+    with open(collect_file, "w") as f:
+        json.dump(list(files.values()), f, indent=2)
+
+
+def pytest_terminal_summary(terminalreporter):
+    """Callback/hook required to avoid duplicates and ensure that files are printed."""
+    terminalreporter.write_sep("=", "summary", cyan=True, bold=True)
+
+    passed = terminalreporter.stats.get("passed", [])
+    failed = terminalreporter.stats.get("failed", [])
+    errors = terminalreporter.stats.get("error", [])
+    skipped = terminalreporter.stats.get("skipped", [])
+    xfailed = terminalreporter.stats.get("xfailed", [])
+    xpassed = terminalreporter.stats.get("xpassed", [])
+
+    for rep in passed:
+        terminalreporter.write("PASSED", green=True, bold=True)
+        terminalreporter.write_line(f" {rep.nodeid}")
+
+    for rep in skipped:
+        terminalreporter.write("SKIPPED", yellow=True, bold=True)
+        terminalreporter.write(f" {rep.nodeid}")
+        terminalreporter.write_line(
+            f" - {rep.longrepr[2].removeprefix('Skipped: ')}", bold=True
+        )
+
+    for rep in xfailed:
+        terminalreporter.write("XFAIL", yellow=True, bold=True)
+        terminalreporter.write(f" {rep.nodeid}")
+        reason = getattr(rep, "wasxfail", "")
+        terminalreporter.write_line(f" - {reason}" if reason else "", bold=True)
+
+    for rep in xpassed:
+        terminalreporter.write("XPASS", yellow=True, bold=True)
+        terminalreporter.write(f" {rep.nodeid}")
+        reason = getattr(rep, "wasxfail", "")
+        terminalreporter.write_line(f" - {reason}" if reason else "", bold=True)
+
+    for rep in errors:
+        # In some corner cases there's no reprcrash
+        if hasattr(rep.longrepr, "reprcrash"):
+            reason = rep.longrepr.reprcrash.message
+        else:
+            reason = str(rep.longrepr)
+
+        terminalreporter.write("ERROR", red=True, bold=True)
+        terminalreporter.write(f" {rep.nodeid}")
+        terminalreporter.write_line(f" - {reason}", bold=True)
+
+    for rep in failed:
+        # In some corner cases there's no reprcrash
+        if hasattr(rep.longrepr, "reprcrash"):
+            reason = rep.longrepr.reprcrash.message
+        else:
+            reason = str(rep.longrepr)
+
+        terminalreporter.write("FAILED", red=True, bold=True)
+        terminalreporter.write(f" {rep.nodeid}")
+        terminalreporter.write_line(f" - {reason.removeprefix('Failed: ')}", bold=True)
+
+
+#
+# Hook to force printing separators between setup - test call (- teardown)
+#
+@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+def pytest_runtest_setup(item):
+    terminalreporter = item.config.pluginmanager.getplugin("terminalreporter")
+    terminalreporter.write_sep("-", "test fixture - setup", bold=True)
+    yield
+
+
+@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+def pytest_runtest_call(item):
+    terminalreporter = item.config.pluginmanager.getplugin("terminalreporter")
+    terminalreporter.write_sep("-", "test function", bold=True)
+    yield
+
+
+@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+def pytest_runtest_teardown(item):
+    terminalreporter = item.config.pluginmanager.getplugin("terminalreporter")
+    terminalreporter.write_sep("-", "test fixture - teardown", bold=True)
+    yield
 
 
 # Add test description (docstring) as a junit property
@@ -54,6 +176,12 @@ def pytest_addoption(parser):
         action="store_true",
         dest="allow_slurmdbd_modify",
         help="allow running in local-config even if require_accounting(modify=True)",
+    )
+    parser.addoption(
+        "--collect-file",
+        action="store",
+        default=None,
+        help="Path to write collected test metadata",
     )
 
 
@@ -118,7 +246,11 @@ def session_setup(request):
     atf.properties["allow-slurmdbd-modify"] = request.config.getoption(
         "--allow-slurmdbd-modify"
     )
-    if not request.config.getoption("--no-color"):
+    if request.config.getoption("--no-color"):
+        atf.properties["no-color"] = True
+    else:
+        atf.properties["no-color"] = False
+
         # Customize logging level colors
         color_log_level(logging.CRITICAL, red=True, bold=True)
         color_log_level(logging.ERROR, red=True)
@@ -202,6 +334,9 @@ def module_setup(request, tmp_path_factory):
     atf.properties["test_name"] = name
     atf.module_tmp_path = tmp_path_factory.mktemp(name, numbered=True)
     update_tmp_path_exec_permissions(atf.module_tmp_path)
+    atf.properties["sql-db-backup"] = str(
+        atf.module_tmp_path / "../../slurm_acct_db.sql.gz"
+    )
 
     # Module-level fixtures should run from within the module_tmp_path
     os.chdir(atf.module_tmp_path)
@@ -299,24 +434,56 @@ def module_setup(request, tmp_path_factory):
     os.chdir(request.config.invocation_dir)
 
     # Teardown
-    module_teardown()
+    module_teardown(request)
 
 
-def module_teardown():
+def module_teardown(request=None):
     failures = []
+    xfailures = []
+    module_node = request.node if request is not None else None
+
+    # Reading the xfail_teardown markers is pytest-specific, so it is done here;
+    # the classification of each teardown failure (failure vs xfail) lives in
+    # atf.classify_teardown_failure().
+    xfail_teardowns = (
+        [marker.kwargs for marker in module_node.iter_markers("xfail_teardown")]
+        if module_node is not None
+        else []
+    )
 
     if atf.properties["auto-config"]:
         if atf.properties["slurm-started"] is True:
             # Cancel all jobs
             if not atf.cancel_all_jobs(quiet=True):
-                failures.append("Not all jobs were successfully cancelled")
+                atf.classify_teardown_failure(
+                    "Not all jobs were successfully cancelled",
+                    xfail_teardowns,
+                    failures,
+                    xfailures,
+                )
+
+            # TODO: Remove once t23622 and t24793 are fixed
+            job_states = {}
+            jobs = atf.get_jobs(
+                quiet=True, use_json=True, user=atf.properties["slurm-user"]
+            )
+            for job_id in jobs.keys():
+                job_states[job_id] = jobs[job_id]["job_state"]
+            logging.debug(
+                f"Ticket 23622+24793: All the job states in the system before stopping Slurm: {job_states}"
+            )
 
             # Stop Slurm if we started it
             if not atf.stop_slurm(fatal=False, quiet=True):
-                failures.append("Not all Slurm daemons were successfully stopped")
+                atf.classify_teardown_failure(
+                    "Not all Slurm daemons were successfully stopped",
+                    xfail_teardowns,
+                    failures,
+                    xfailures,
+                )
 
         # Restore the Slurm database
-        atf.restore_accounting_database()
+        atf.restore_accounting_database(atf.properties["sql-db-backup"])
 
         # Restore StateSaveLocation for auto-config
         atf.run_command(
@@ -328,6 +495,106 @@ def module_teardown():
                 user="root",
                 quiet=True,
             )
+
+        # Check for coredump in the logs dir (daemons) and in the pytest
+        # tmp dir (clients), and save bt file form them.
+        # If any coredump is found, report an error.
+        for coredump in atf.get_coredumps():
+            logging.warning(f"Coredump detected: {coredump}")
+
+            # Ensure that the core is copied into the logs dir
+            if atf.properties["slurm-logs-dir"] not in coredump:
+                coredump_new = (
+                    f"{atf.properties['slurm-logs-dir']}/{os.path.basename(coredump)}"
+                )
+                logging.debug(f"Moving coredump from {coredump} to {coredump_new}")
+                atf.run_command(
+                    f"mv {coredump} {coredump_new}", user="root", quiet=True
+                )
+                coredump = coredump_new
+
+            # Get the binary that generated the coredump using gdb's
+            # "info auxv": AT_EXECFN is the kernel-recorded full path of the
+            # executable. Avoids 'file' command issues with cores having "too
+            # many program headers".
+            # debuginfod off: It may be too slow
+            # Use atf.resolve_core_binary() to avoid issue with upgraded
+            # components
+            gdb_res = atf.run_command(
+                f"gdb"
+                f" -batch"
+                f' -iex "set debuginfod enabled off"'
+                f" -c {coredump}"
+                f' -ex "info auxv"'
+                f' -ex "quit"',
+                user="root",
+                quiet=True,
+                timeout=300,
+            )
+            if gdb_res["exit_code"] != 0:
+                logging.warning(
+                    f"Error getting the binary from the coredump: {gdb_res['exit_code']}"
+                )
+            gdb_out = gdb_res["stdout"] + gdb_res["stderr"]
+            bin_match = re.search(r'AT_EXECFN.*?"([^"\n]+)"', gdb_out) or re.search(
+                r"Core was generated by [`']([^ '`\n]+)", gdb_out
+            )
+
+            execfn_path = bin_match.group(1) if bin_match else None
+            bin_path = (
+                atf.resolve_core_binary(coredump, execfn_path) if execfn_path else None
+            )
+
+            if not bin_path:
+                if not execfn_path:
+                    fail_msg = f"Coredump detected ({coredump}), but unable to get binary from gdb: {gdb_out}"
+                else:
+                    fail_msg = f"Coredump detected ({coredump}), but unable to resolve binary by build-id (AT_EXECFN={execfn_path})"
+                atf.classify_teardown_failure(
+                    fail_msg,
+                    xfail_teardowns,
+                    failures,
+                    xfailures,
+                )
+            else:
+                # Generate the .bt file if binary was found
+                bt_file = f"{coredump}.bt"
+                logging.debug(
+                    f"Saving the full backtrace of {coredump} from {bin_path} into {bt_file}"
+                )
+                # debuginfod off: It may be too slow
+                results = atf.run_command(
+                    f"gdb"
+                    f" -batch"
+                    f' -iex "set debuginfod enabled off"'
+                    f' -ex "info files"'
+                    f' -ex "set pagination off"'
+                    f' -ex "set confirm off"'
+                    f' -ex "set print pretty on"'
+                    f' -ex "set max-value-size unlimited"'
+                    f' -ex "set print array-indexes on"'
+                    f' -ex "set print array off"'
+                    f' -ex "thread apply all bt full"'
+                    f' -ex "quit"'
+                    f" {bin_path} {coredump}",
+                    user="root",
+                    quiet=True,
+                    timeout=300,
+                )
+                if results["exit_code"] != 0:
+                    logging.warning(
+                        f"Error generating the bt file: {results['exit_code']}"
+                    )
+                with open(bt_file, "w") as f:
+                    f.write(results["stdout"])
+                    f.write(results["stderr"])
+
+                # If coredump is not a known issue, reported as a failure.
+                # Otherwise a new reason will be appended to xfailures.
+                slurm_prefix = os.path.dirname(os.path.dirname(bin_path))
+                atf.classify_coredump(
+                    bin_path, bt_file, failures, xfailures, slurm_prefix=slurm_prefix
+                )
 
         # Save logs dir for the test and restore the orifinal
         atf.run_command(
@@ -415,6 +682,8 @@ def module_teardown():
 
     if failures:
         pytest.fail(failures[0])
+    if xfailures:
+        pytest.xfail(xfailures[0])
 
 
 @pytest.fixture(scope="function", autouse=True)
@@ -426,6 +695,14 @@ def function_setup(request, monkeypatch, tmp_path):
     # Start each test inside the tmp_path
     update_tmp_path_exec_permissions(tmp_path)
     monkeypatch.chdir(tmp_path)
+
+    yield
+
+    if atf.properties["auto-config"]:
+        if atf.properties["slurm-started"] is True:
+            atf.cancel_all_jobs(quiet=True)
+    else:
+        atf.cancel_jobs(atf.properties["submitted-jobs"])
 
 
 @pytest.fixture(scope="class", autouse=True)
@@ -460,16 +737,21 @@ def taskget(module_setup):
 
 
 @pytest.fixture(scope="module")
-def mpi_program(module_setup):
-    """Create the MPI program from the mpi_program.c in scripts directory.
-    Returns the bin path of the mpi_program."""
+def mpi_program(request, module_setup):
+    """Create an MPI program from a .c file in the scripts directory.
+    Returns the bin path of the compiled program.
+
+    By default compiles mpi_program.c. Use indirect parametrize to select
+    a different source file:
+        @pytest.mark.parametrize("mpi_program", ["mpi_signal_test"], indirect=True)
+    """
 
     # Check for MPI setup
     atf.require_mpi("pmix", "mpicc")
 
-    # Use the external C source file
-    src_path = atf.properties["testsuite_scripts_dir"] + "/mpi_program.c"
-    bin_path = os.getcwd() + "/mpi_program"
+    name = getattr(request, "param", "mpi_program")
+    src_path = atf.properties["testsuite_scripts_dir"] + f"/{name}.c"
+    bin_path = os.getcwd() + f"/{name}"
 
     # Compile the MPI program
     atf.run_command(f"mpicc -o {bin_path} {src_path}", fatal=True)
@@ -520,14 +802,41 @@ def printenv(module_setup):
 
 
 @pytest.fixture(scope="module")
-def spank_fail_lib(module_setup):
+def spank_tmp(module_setup):
     """
-    Returns the bin path of the spank .so that will fail if configured.
+    Creates the temporary directory used by SPANK_HOOK_CREATE_FILE and returns
+    its path. Tests that need the path request this fixture directly; tests
+    that don't care get the directory as a side effect of spank_plugin.
     """
 
-    # The plugin uses ESPANK_NODE_FAILURE, so it needs to compile against 25.05+
+    tmp_spank = "/tmp/spank"
+    atf.run_command(f"mkdir -p {tmp_spank}", fatal=True)
+
+    yield tmp_spank
+
+    atf.run_command(f"rm -rf {tmp_spank}", fatal=True)
+
+
+@pytest.fixture(scope="module")
+def spank_plugin(module_setup, spank_tmp):
+    """
+    Compiles spank_plugin.so — a generic SPANK plugin for testing.
+
+    Capabilities are activated by environment variables:
+      SPANK_FAIL_TEST_FUNC / SPANK_FAIL_TEST_CTXT / SPANK_FAIL_TEST_MODE
+        -- failure injection (see test_147_2, test_147_3)
+      SPANK_HOOK_CREATE_FILE
+        -- create {SPANK_TMP_DIR}/{hookname}_log for each hook that runs (see test_147_1)
+      SPANK_HOOK_LOG_JOB_INFO
+        -- boolean; slurm_spank_task_init logs spank_get_item() and
+           slurm_load_job() output to SPANK_TMP_DIR/spank_job_info.log (see test_147_4)
+
+    Returns the bin path of the compiled .so.
+    """
+
+    # The plugin uses ESPANK_NODE_FAILURE, so it needs to compile against 25.05+.
     # It also needs to be built against the same version of slurmd and submit
-    # clients like sbatch
+    # clients like sbatch.
     new_prefixes = False
     if not atf.is_upgrade_setup():
         atf.require_version((25, 5), "config.h")
@@ -537,7 +846,8 @@ def spank_fail_lib(module_setup):
 
         if slurmd_version != sbatch_version:
             pytest.skip(
-                f"We need to build SPANK against Slurm version of submit clients as sbatch {sbatch_version} and slurmd {slurmd_version}, but they diffear."
+                f"We need to build SPANK against Slurm version of submit clients as "
+                f"sbatch {sbatch_version} and slurmd {slurmd_version}, but they differ."
             )
 
         if slurmd_version < (25, 5):
@@ -558,14 +868,19 @@ def spank_fail_lib(module_setup):
         ):
             # This should never happen, slurmd should be one of those versions
             pytest.fail(
-                "Unable to find build dir to match slurmd version {slurmd_version}"
+                f"Unable to find build dir to match slurmd version {slurmd_version}"
             )
 
-    src_path = atf.properties["testsuite_scripts_dir"] + "/spank_fail_test.c"
-    bin_path = os.getcwd() + "/spank_fail_test.so"
+    src_path = atf.properties["testsuite_scripts_dir"] + "/spank_plugin.c"
+    bin_path = os.getcwd() + "/spank_plugin.so"
 
     atf.compile_against_libslurm(
-        src_path, bin_path, full=True, shared=True, new_prefixes=new_prefixes
+        src_path,
+        bin_path,
+        build_args=f"-DSPANK_TMP_DIR='\"{spank_tmp}\"'",
+        full=True,
+        shared=True,
+        new_prefixes=new_prefixes,
     )
 
     yield bin_path
@@ -573,56 +888,20 @@ def spank_fail_lib(module_setup):
     atf.run_command(f"rm -f {bin_path}", fatal=True)
 
 
-@pytest.fixture(scope="module")
-def spank_tmp_lib(module_setup):
+@pytest.fixture(autouse=True)
+def spank_tmp_clean(request):
+    """Clear SPANK_TMP_DIR contents before/after each test that uses spank_tmp.
+
+    Autouse guard: no-op when spank_tmp is not active, so tests that don't use
+    the SPANK plugin don't pay the cost and don't need to opt in explicitly.
     """
-    Compiles a SPANK plugin that will write files in a /tmp directory.
-    Returns the tmp_spank dir and the bin path of the spank .so that will write
-    files in the tmp_spank dir if configured.
-    """
-
-    # The plugin uses ESPANK_NODE_FAILURE, so it needs to compile against 25.05+
-    # It also needs to be built against the same version of slurmd and submit
-    # clients like sbatch
-    new_prefixes = False
-    if atf.is_upgrade_setup():
-        slurmd_version = atf.get_version("sbin/slurmd")
-        sbatch_version = atf.get_version("bin/sbatch")
-
-        if slurmd_version != sbatch_version:
-            pytest.skip(
-                f"We need to build SPANK against Slurm version of submit clients as sbatch {sbatch_version} and slurmd {slurmd_version}, but they diffear."
-            )
-        if (
-            atf.get_version("config.h", slurm_prefix=atf.properties["new-build-prefix"])
-            == slurmd_version
-        ):
-            new_prefixes = True
-        elif (
-            not atf.get_version(
-                "config.h", slurm_prefix=atf.properties["old-build-prefix"]
-            )
-            == slurmd_version
-        ):
-            # This should never happen, slurmd should be one of those versions
-            pytest.fail(
-                "Unable to find build dir to match slurmd version {slurmd_version}"
-            )
-
-    src_path = atf.properties["testsuite_scripts_dir"] + "/spank_tmp_plugin.c"
-    bin_path = os.getcwd() + "/spank_tmp_plugin.so"
-
-    atf.compile_against_libslurm(
-        src_path, bin_path, full=True, shared=True, new_prefixes=new_prefixes
-    )
-
-    tmp_spank = "/tmp/spank"
-    atf.run_command(f"mkdir -p {tmp_spank}", fatal=True)
-
-    yield tmp_spank, bin_path
-
-    atf.run_command(f"rm -f {bin_path}", fatal=True)
-    atf.run_command(f"rm -rf {tmp_spank}", fatal=True)
+    if "spank_tmp" not in request.fixturenames:
+        yield
+        return
+    spank_tmp = request.getfixturevalue("spank_tmp")
+    atf.run_command(f"rm -rf {spank_tmp}/*", fatal=False)
+    yield
+    atf.run_command(f"rm -rf {spank_tmp}/*", fatal=False)
 
 
 @pytest.fixture(scope="module")
@@ -740,14 +1019,14 @@ def sql_statement_repeat(module_setup):
     statement_repeat_sql = """
         delimiter //
         drop procedure if exists statement_repeat //
-        create procedure statement_repeat(stmt_str varchar(500), seq_start bigint, seq_end bigint, step bigint, use_trans int)
+        create procedure statement_repeat(stmt_str text, seq_start bigint, seq_end bigint, step bigint, use_trans int)
         begin
           declare counter bigint;
           declare incr bigint;
           declare max bigint;
           declare multi int default 0;
           declare pos int;
-          declare rem_str varchar(500);
+          declare rem_str text;
 
           -- ensure sane values
           set seq_start = ifnull(seq_start, 1);
@@ -855,7 +1134,7 @@ def openapi_spec(request, module_setup):
     """
     openapi_specs = None
     version = request.param
-    json_file = f"{atf.properties['testsuite_data_dir']}/openapi_spec_v{version}.json"
+    json_file = f"{atf.properties['testsuite_data_dir']}/openapi_specs/openapi_spec_v{version}.json"
     with open(json_file, "r") as f:
         openapi_specs = json.load(f)
         f.close()

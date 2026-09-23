@@ -74,9 +74,12 @@ list_t *g_res_list = NULL;
 list_t *g_tres_list = NULL;
 const char *mime_type = NULL; /* mimetype if we are using data_parser */
 const char *data_parser = NULL; /* data_parser args */
+int orig_argc; /* used when dumping meta data */
+char **orig_argv = NULL;
 
-/* by default, normalize all usernames to lower case */
+/* by default, normalize all usernames and resource names to lower case */
 bool user_case_norm = true;
+bool resource_case_norm = true;
 bool tree_display = 0;
 bool have_db_conn = false;
 
@@ -120,6 +123,12 @@ int main(int argc, char **argv)
 		{"yaml", optional_argument, 0, OPT_LONG_YAML},
 		{NULL,       0, 0, 0}
 	};
+
+	/* Copy order of argv here since getopt_long() may reorder it */
+	orig_argc = argc;
+	orig_argv = xcalloc((argc + 1), sizeof(*orig_argv));
+	for (int i = 0; i < argc; i++)
+		orig_argv[i] = argv[i];
 
 	command_name      = argv[0];
 	rollback_flag     = 1;
@@ -239,7 +248,8 @@ int main(int argc, char **argv)
 
 	if (persist_conn_flags & PERSIST_FLAG_P_USER_CASE)
 		user_case_norm = false;
-
+	if (persist_conn_flags & PERSIST_FLAG_P_RESOURCE_CASE)
+		resource_case_norm = false;
 
 	/* We are only running a single command and exiting */
 	if (optind < argc) {
@@ -248,12 +258,16 @@ int main(int argc, char **argv)
 		   !xstrcmp(data_parser, "list")) {
 		/*
 		 * We are only listing the available data parser plugins.
-		 * Calling DATA_DUMP_CLI_SINGLE() with a dummy type to get to
-		 * "list".
-		 * TODO: After Bug 18109 is fixed, replace this logic:
+		 * data_parser_cli_load() prints the plugin list and
+		 * short-circuits with a NULL parser before any RPC would be
+		 * made.
 		 */
-		DATA_DUMP_CLI_SINGLE(OPENAPI_PING_ARRAY_RESP, NULL, argc, argv,
-				     NULL, mime_type, data_parser, exit_code);
+		data_parser_t *parser = NULL;
+
+		exit_code =
+			data_parser_cli_load(&parser, NULL, orig_argc,
+					     orig_argv, mime_type, data_parser);
+		data_parser_cli_free_ctxt(&parser);
 	} else {
 		/* We are running interactively multiple commands */
 		int input_field_count = 0;
@@ -297,6 +311,7 @@ int main(int argc, char **argv)
 	FREE_NULL_LIST(g_qos_list);
 	FREE_NULL_LIST(g_res_list);
 	FREE_NULL_LIST(g_tres_list);
+	xfree(orig_argv);
 #endif
 
 	exit(exit_code);
@@ -445,15 +460,24 @@ static int _ping(int argc, char **argv)
 {
 	int rc = SLURM_SUCCESS;
 	slurmdbd_ping_t *pings = NULL;
+	data_parser_t *parser = NULL;
+
+	if (mime_type) {
+		rc = data_parser_cli_load(&parser, db_conn, orig_argc,
+					  orig_argv, mime_type, data_parser);
+		if (rc || !parser)
+			goto cleanup;
+	}
 
 	if (!(pings = slurmdb_ping_all())) {
 		error("Failed to perform slurmdbd pings");
-		return SLURM_ERROR;
+		rc = SLURM_ERROR;
+		goto cleanup;
 	}
 
 	if (mime_type) {
-		DATA_DUMP_CLI_SINGLE(OPENAPI_SLURMDBD_PING_RESP, pings, argc,
-				     argv, db_conn, mime_type, data_parser, rc);
+		rc = data_parser_dump_cli_single(
+			DATA_PARSER_OPENAPI_SLURMDBD_PING_RESP, pings, parser);
 	} else  {
 		for (int i = 0; pings[i].hostname; i++) {
 			_print_db_ping(&pings[i]);
@@ -461,6 +485,9 @@ static int _ping(int argc, char **argv)
 		}
 	}
 
+cleanup:
+	if (mime_type)
+		data_parser_cli_free_ctxt(&parser);
 	xfree(pings);
 	return rc;
 }
@@ -616,8 +643,9 @@ static int _process_command (int argc, char **argv)
 			my_end = parse_time(argv[2], 1);
 		if (argc > 3)
 			archive_data = atoi(argv[3]);
-		if (slurmdb_usage_roll(db_conn, my_start, my_end, archive_data,
-				       NULL) == SLURM_SUCCESS) {
+		rc = slurmdb_usage_roll(db_conn, my_start, my_end,
+					archive_data, NULL);
+		if (rc == SLURM_SUCCESS) {
 			if (commit_check("Would you like to commit rollup?")) {
 				exit_code =
 					slurmdb_connection_commit(db_conn, 1);
@@ -632,6 +660,10 @@ static int _process_command (int argc, char **argv)
 					fprintf(stderr, " Error rolling back changes: %s\n",
 						slurm_strerror(exit_code));
 			}
+		} else {
+			fprintf(stderr, " Rollup failed: %s\n",
+				slurm_strerror(rc));
+			exit_code = 1;
 		}
 	} else if (xstrncasecmp(argv[0], "shutdown", MAX(command_len, 4)) ==
 		   0) {
@@ -806,6 +838,44 @@ static void _clear_it(int argc, char **argv)
 }
 
 /*
+ * _dump_it - dump the slurmdbd configuration in the format specified
+ * IN argc - count of arguments
+ * IN argv - list of arguments
+ */
+static void _dump_it(int argc, char **argv)
+{
+	int rc = SLURM_SUCCESS;
+	slurmdbd_conf_t *slurmdbd_conf = NULL;
+	data_parser_t *parser = NULL;
+
+	if (mime_type) {
+		rc = data_parser_cli_load(&parser, db_conn, orig_argc,
+					  orig_argv, mime_type, data_parser);
+		if (rc || !parser)
+			goto cleanup;
+	}
+
+	if (!(rc = slurmdb_config_get(db_conn, &slurmdbd_conf))) {
+		openapi_resp_slurmdbd_conf_t resp = {
+			.slurmdb_conf = slurmdbd_conf,
+		};
+
+		rc = data_parser_dump_cli_resp(
+			DATA_PARSER_OPENAPI_SLURMDBD_CONF_RESP, &resp,
+			sizeof(resp), parser);
+	}
+
+cleanup:
+	/*
+	 * Unlike the list_*()/_ping() cleanup paths, no "if (mime_type)"
+	 * guard is needed here: _dump_it() is only ever called with
+	 * mime_type set, so the guard would always be true.
+	 */
+	data_parser_cli_free_ctxt(&parser);
+	slurmdbd_free_conf(slurmdbd_conf);
+}
+
+/*
  * _show_it - list the slurm configuration per the supplied arguments
  * IN argc - count of arguments
  * IN argv - list of arguments
@@ -844,7 +914,10 @@ static void _show_it(int argc, char **argv)
 		error_code = sacctmgr_list_cluster((argc - 1), &argv[1]);
 	} else if (xstrncasecmp(argv[0], "Configuration",
 				MAX(command_len, 2)) == 0) {
-		error_code = sacctmgr_list_config();
+		if (mime_type)
+			_dump_it(argc, argv);
+		else
+			error_code = sacctmgr_list_config();
 	} else if (xstrncasecmp(argv[0], "Events",
 				MAX(command_len, 1)) == 0) {
 		error_code = sacctmgr_list_event((argc - 1), &argv[1]);

@@ -39,22 +39,27 @@
 
 #include "config.h"
 
+#include <ctype.h>
 #include <fcntl.h>
 #include <grp.h>
 #include <limits.h>
 #include <netdb.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include "src/common/bitstring.h"
 #include "src/common/cbuf.h"
 #include "src/common/fd.h"
+#include "src/common/file_bcast.h"
 #include "src/common/forward.h"
 #include "src/common/hostlist.h"
 #include "src/common/log.h"
@@ -82,7 +87,9 @@
 #include "src/srun/launch.h"
 #include "src/srun/multi_prog.h"
 #include "src/srun/opt.h"
+#include "src/srun/signals.h"
 #include "src/srun/srun_job.h"
+#include "src/srun/srun_pty.h"
 
 /*
  * allocation information structure used to store general information
@@ -113,22 +120,27 @@ typedef struct het_job_resp_struct {
 	uint32_t node_cnt;
 } het_job_resp_struct_t;
 
-
 static int shepherd_fd = -1;
-static pthread_t signal_thread = (pthread_t) 0;
-static int pty_sigarray[] = { SIGWINCH, 0 };
 
 extern char **environ;
+
+slurm_step_id_t pending_job_id = SLURM_STEP_ID_INITIALIZER;
+pthread_mutex_t pending_job_id_lock = PTHREAD_MUTEX_INITIALIZER;
+
+srun_job_t *srun_first_job = NULL;
+pthread_mutex_t srun_first_job_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static struct termios termdefaults;
+
+static mode_t prev_umask;
+static bool slurm_umask_set = false;
 
 /*
  * Prototypes:
  */
 
 static void _call_spank_fini(void);
-static int  _call_spank_local_user(srun_job_t *job, slurm_opt_t *opt_local);
-static long _diff_tv_str(struct timeval *tv1, struct timeval *tv2);
-static void _handle_intr(srun_job_t *job);
-static void _handle_pipe(void);
+static int _call_spank_local_user(srun_job_t *job, slurm_opt_t *opt_local);
 static srun_job_t *_job_create_structure(allocation_info_t *ainfo,
 					 slurm_opt_t *opt_local);
 static char *_normalize_hostlist(const char *hostlist);
@@ -146,7 +158,6 @@ static int  _set_umask_env(void);
 static void _shepherd_notify(int shepherd_fd);
 static int _shepherd_spawn(srun_job_t *job, list_t *srun_job_list,
 			   bool got_alloc);
-static void *_srun_signal_mgr(void *no_data);
 static void _srun_cli_filter_post_submit(uint32_t jobid, uint32_t stepid);
 static int  _validate_relative(resource_allocation_response_msg_t *resp,
 			       slurm_opt_t *opt_local);
@@ -674,8 +685,7 @@ static void _post_opts(list_t *opt_list)
 		list_sort(opt_list, _sort_by_offset);
 }
 
-extern void init_srun(int argc, char **argv, log_options_t *logopt,
-		      bool handle_signals)
+extern void init_srun(int argc, char **argv, log_options_t *logopt)
 {
 	bool het_job_fini = false;
 	int i, het_job_argc, het_job_argc_off;
@@ -685,11 +695,7 @@ extern void init_srun(int argc, char **argv, log_options_t *logopt,
 	 * This must happen before we spawn any threads
 	 * which are not designed to handle arbitrary signals
 	 */
-	if (handle_signals) {
-		if (xsignal_block(sig_array) < 0)
-			error("Unable to block signals");
-	}
-	xsignal_block(pty_sigarray);
+	srun_sig_init();
 
 	/*
 	 * Initialize plugin stack, read options from plugins, etc.
@@ -865,7 +871,7 @@ end_it:
 
 /*
  * Create the job step(s). For a heterogeneous job, each step is requested in
- * a separate RPC. create_job_step() references "opt", so we need to match up
+ * a separate RPC. launch_create_job_step() references "opt", so we need to match up
  * the job allocation request with its requested options.
  */
 static int _create_job_step(srun_job_t *job, bool use_all_cpus,
@@ -935,15 +941,15 @@ static int _create_job_step(srun_job_t *job, bool use_all_cpus,
 			    SLURM_SUCCESS)
 				break;
 
-			rc = create_job_step(job, use_all_cpus, opt_local);
+			rc = launch_create_job_step(job, use_all_cpus,
+						    opt_local);
 			if (rc < 0)
 				break;
 			if (step_id == NO_VAL)
 				step_id = job->step_id.step_id;
 			if (exclude_hl) {
 				slurm_step_layout_t *step_layout =
-					launch_common_get_slurm_step_layout(
-						job);
+					launch_get_slurm_step_layout(job);
 				hostlist_push(exclude_hl,
 					      step_layout->node_list);
 			}
@@ -1025,7 +1031,7 @@ static int _create_job_step(srun_job_t *job, bool use_all_cpus,
 			job->het_job_ntasks = job->ntasks;
 			job->het_job_task_offset = 0;
 		}
-		if ((rc = create_job_step(job, use_all_cpus, &opt)) < 0)
+		if ((rc = launch_create_job_step(job, use_all_cpus, &opt)) < 0)
 			return rc;
 
 		if (het_job_id) {
@@ -1246,7 +1252,7 @@ extern void create_srun_job(void **p_job, bool *got_alloc)
 			error("Job creation failure.");
 			exit(error_exit);
 		}
-		if (create_job_step(job, false, &opt) < 0)
+		if (launch_create_job_step(job, false, &opt) < 0)
 			exit(error_exit);
 	} else if ((job_resp_list = existing_allocation())) {
 		slurm_opt_t *opt_local;
@@ -1540,7 +1546,8 @@ extern void create_srun_job(void **p_job, bool *got_alloc)
 	 * Spawn process to ensure clean-up of job and/or step
 	 * on abnormal termination
 	 */
-	shepherd_fd = _shepherd_spawn(job, srun_job_list, *got_alloc);
+	if (!sropt.async)
+		shepherd_fd = _shepherd_spawn(job, srun_job_list, *got_alloc);
 
 	if (opt_list)
 		*p_job = (void *) srun_job_list;
@@ -1554,9 +1561,11 @@ extern void create_srun_job(void **p_job, bool *got_alloc)
 
 extern void pre_launch_srun_job(srun_job_t *job, slurm_opt_t *opt_local)
 {
-	if (!signal_thread)
-		slurm_thread_create(NULL, &signal_thread, _srun_signal_mgr,
-				    job);
+	slurm_mutex_lock(&srun_first_job_lock);
+	if (!srun_first_job) {
+		srun_first_job = job;
+	}
+	slurm_mutex_unlock(&srun_first_job_lock);
 
 	_run_srun_prolog(job);
 	if (_call_spank_local_user(job, opt_local)) {
@@ -1565,31 +1574,40 @@ extern void pre_launch_srun_job(srun_job_t *job, slurm_opt_t *opt_local)
 		exit(error_exit);
 	}
 
+	/*
+	 * Set here, after --prolog, so that script is unaffected. Restored
+	 * in fini_srun() before --epilog runs, for the same reason.
+	 */
+	char *slurm_umask = getenv("SLURM_UMASK");
+	if (slurm_umask) {
+		mode_t mask = strtol(slurm_umask, NULL, 8);
+		prev_umask = umask(mask);
+		slurm_umask_set = true;
+	}
+
 	env_array_merge(&job->env, (const char **)environ);
 }
 
 extern void fini_srun(srun_job_t *job, bool got_alloc, uint32_t *global_rc)
 {
-	if (got_alloc) {
-		cleanup_allocation();
+	pty_thread_fini();
 
+	if (got_alloc) {
 		/* Tell slurmctld that we were cancelled */
-		if (job->state >= SRUN_JOB_CANCELLED)
+		if (srun_job_state(job) >= SRUN_JOB_CANCELLED)
 			slurm_complete_job(&job->step_id, NO_VAL);
 		else
 			slurm_complete_job(&job->step_id, *global_rc);
 	}
 	_shepherd_notify(shepherd_fd);
 
-	if (signal_thread) {
-		srun_shutdown = true;
-		pthread_kill(signal_thread, SIGINT);
-		slurm_thread_join(signal_thread);
+	/* See pre_launch_srun_job(). */
+	if (slurm_umask_set) {
+		umask(prev_umask);
+		slurm_umask_set = false;
 	}
 
 	_run_srun_epilog(job);
-
-	step_ctx_destroy(job->step_ctx);
 
 	if (WIFEXITED(*global_rc))
 		*global_rc = WEXITSTATUS(*global_rc);
@@ -1612,8 +1630,7 @@ update_job_state(srun_job_t *job, srun_job_state_t state)
 	return;
 }
 
-srun_job_state_t
-job_state(srun_job_t *job)
+extern srun_job_state_t srun_job_state(srun_job_t *job)
 {
 	srun_job_state_t state;
 	slurm_mutex_lock(&job->state_mutex);
@@ -1633,7 +1650,7 @@ job_force_termination(srun_job_t *job)
 		info("forcing job termination");
 		/* Send SIGKILL to tasks directly */
 		update_job_state(job, SRUN_JOB_CANCELLED);
-		launch_g_fwd_signal(SIGKILL);
+		launch_fwd_signal(SIGKILL);
 	} else {
 		time_t now = time(NULL);
 		if (last_msg != now) {
@@ -1642,7 +1659,7 @@ job_force_termination(srun_job_t *job)
 		}
 		if (kill_sent == 1) {
 			/* Try sending SIGKILL through slurmctld */
-			slurm_kill_job_step(&job->step_id, SIGKILL, 0);
+			launch_step_terminate();
 		}
 	}
 	kill_sent++;
@@ -1784,56 +1801,11 @@ static int _call_spank_local_user(srun_job_t *job, slurm_opt_t *opt_local)
 	info->gid	= opt_local->gid;
 	info->jobid	= job->step_id.job_id;
 	info->stepid	= job->step_id.step_id;
-	info->step_layout = launch_common_get_slurm_step_layout(job);
+	info->step_layout = launch_get_slurm_step_layout(job);
 	info->uid	= opt_local->uid;
 
 	return spank_local_user(info);
 }
-
-/* Return the number of microseconds between tv1 and tv2 with a maximum
- * a maximum value of 10,000,000 to prevent overflows */
-static long _diff_tv_str(struct timeval *tv1, struct timeval *tv2)
-{
-	long delta_t;
-
-	delta_t  = MIN((tv2->tv_sec - tv1->tv_sec), 10);
-	delta_t *= USEC_IN_SEC;
-	delta_t +=  tv2->tv_usec - tv1->tv_usec;
-	return delta_t;
-}
-
-static void _handle_intr(srun_job_t *job)
-{
-	static struct timeval last_intr = { 0, 0 };
-	struct timeval now;
-
-	gettimeofday(&now, NULL);
-	if (sropt.quit_on_intr || _diff_tv_str(&last_intr, &now) < 1000000) {
-		info("sending Ctrl-C to %ps", &job->step_id);
-		launch_g_fwd_signal(SIGINT);
-		job_force_termination(job);
-	} else {
-		if (sropt.disable_status) {
-			info("sending Ctrl-C to %ps", &job->step_id);
-			launch_g_fwd_signal(SIGINT);
-		} else if (job->state < SRUN_JOB_CANCELLED) {
-			info("interrupt (one more within 1 sec to abort)");
-			launch_g_print_status();
-		}
-		last_intr = now;
-	}
-}
-
-static void _handle_pipe(void)
-{
-	static int ending = 0;
-
-	if (ending)
-		return;
-	ending = 1;
-	launch_g_fwd_signal(SIGKILL);
-}
-
 
 static void _print_job_information(resource_allocation_response_msg_t *resp)
 {
@@ -1863,8 +1835,9 @@ static void _run_srun_epilog (srun_job_t *job)
 	int rc;
 
 	if (sropt.epilog && xstrcasecmp(sropt.epilog, "none") != 0) {
-		if (setenvf(NULL, "SLURM_SCRIPT_CONTEXT", "epilog_srun") < 0)
-			error("unable to set SLURM_SCRIPT_CONTEXT in environment");
+		if ((rc = setenvf(NULL, "SLURM_SCRIPT_CONTEXT", "epilog_srun")))
+			error("unable to set SLURM_SCRIPT_CONTEXT in environment: %s",
+			      slurm_strerror(rc));
 		rc = _run_srun_script(job, sropt.epilog);
 		if (rc) {
 			error("srun epilog failed status=%d", rc);
@@ -1877,8 +1850,9 @@ static void _run_srun_prolog (srun_job_t *job)
 	int rc;
 
 	if (sropt.prolog && xstrcasecmp(sropt.prolog, "none") != 0) {
-		if (setenvf(NULL, "SLURM_SCRIPT_CONTEXT", "prolog_srun") < 0)
-			error("unable to set SLURM_SCRIPT_CONTEXT in environment");
+		if ((rc = setenvf(NULL, "SLURM_SCRIPT_CONTEXT", "prolog_srun")))
+			error("unable to set SLURM_SCRIPT_CONTEXT in environment: %s",
+			      slurm_strerror(rc));
 		rc = _run_srun_script(job, sropt.prolog);
 		if (rc) {
 			error("srun prolog failed rc = %d. Aborting step.", rc);
@@ -1945,17 +1919,49 @@ static int _run_srun_script (srun_job_t *job, char *script)
 	/* NOTREACHED */
 }
 
-static char *_build_key(char *base, int het_job_offset)
+static void _setenvf_key(const char *key, const char *fmt, va_list ap)
+{
+	va_list ap_copy;
+	int rc;
+
+	if (getenv(key))
+		return;
+
+	va_copy(ap_copy, ap);
+	if ((rc = vsetenvf(NULL, key, fmt, ap_copy)))
+		error("unable to set %s in environment: %s", key,
+		      slurm_strerror(rc));
+	va_end(ap_copy);
+}
+
+/*
+ * Set env var <base> if not part of a hetjob. For hetjob components emit
+ * both <base>_HET_GROUP_<N> and the legacy <base>_PACK_GROUP_<N>
+ * Skips a key when it is already set in the environment.
+ */
+__attribute__((format(printf, 3, 4))) static void _setenvf_het(
+	char *base, int het_job_offset, const char *fmt, ...)
 {
 	char *key = NULL;
+	va_list ap;
 
 	/* If we are a local_het_step we treat it like a normal step */
-	if (local_het_step || (het_job_offset == -1))
-		key = xstrdup(base);
-	else
-		xstrfmtcat(key, "%s_PACK_GROUP_%d", base, het_job_offset);
+	if (local_het_step || (het_job_offset == -1)) {
+		va_start(ap, fmt);
+		_setenvf_key(base, fmt, ap);
+		va_end(ap);
+		return;
+	}
 
-	return key;
+	va_start(ap, fmt);
+	xstrfmtcat(key, "%s_HET_GROUP_%d", base, het_job_offset);
+	_setenvf_key(key, fmt, ap);
+	xfree(key);
+
+	xstrfmtcat(key, "%s_PACK_GROUP_%d", base, het_job_offset);
+	_setenvf_key(key, fmt, ap);
+	xfree(key);
+	va_end(ap);
 }
 
 static void _set_env_vars(resource_allocation_response_msg_t *resp,
@@ -1964,16 +1970,15 @@ static void _set_env_vars(resource_allocation_response_msg_t *resp,
 	char *key, *value, *tmp;
 	int i;
 
-	key = _build_key("SLURM_JOB_CPUS_PER_NODE", het_job_offset);
-	if (!getenv(key)) {
-		tmp = uint32_compressed_to_str(resp->num_cpu_groups,
-					       resp->cpus_per_node,
-					       resp->cpu_count_reps);
-		if (setenvf(NULL, key, "%s", tmp) < 0)
-			error("unable to set %s in environment", key);
-		xfree(tmp);
-	}
-	xfree(key);
+	tmp = uint32_compressed_to_str(resp->num_cpu_groups,
+				       resp->cpus_per_node,
+				       resp->cpu_count_reps);
+	_setenvf_het("SLURM_JOB_CPUS_PER_NODE", het_job_offset, "%s", tmp);
+	xfree(tmp);
+
+	if (resp->stepmgr_host)
+		_setenvf_het("SLURM_STEPMGR", het_job_offset, "%s",
+			     resp->stepmgr_host);
 
 	if (resp->env_size) {	/* Used to set Burst Buffer environment */
 		for (i = 0; i < resp->env_size; i++) {
@@ -1991,30 +1996,17 @@ static void _set_env_vars(resource_allocation_response_msg_t *resp,
 
 	if (resp->pn_min_memory & MEM_PER_CPU) {
 		uint64_t tmp_mem = resp->pn_min_memory & (~MEM_PER_CPU);
-		key = _build_key("SLURM_MEM_PER_CPU", het_job_offset);
-		if (!getenv(key) &&
-		    (setenvf(NULL, key, "%"PRIu64, tmp_mem) < 0)) {
-			error("unable to set %s in environment", key);
-		}
-		xfree(key);
+		_setenvf_het("SLURM_MEM_PER_CPU", het_job_offset, "%" PRIu64,
+			     tmp_mem);
 	} else if (resp->pn_min_memory) {
 		uint64_t tmp_mem = resp->pn_min_memory;
-		key = _build_key("SLURM_MEM_PER_NODE", het_job_offset);
-		if (!getenv(key) &&
-		    (setenvf(NULL, key, "%"PRIu64, tmp_mem) < 0)) {
-			error("unable to set %s in environment", key);
-		}
-		xfree(key);
+		_setenvf_het("SLURM_MEM_PER_NODE", het_job_offset, "%" PRIu64,
+			     tmp_mem);
 	}
 
-	if (resp->segment_size) {
-		key = _build_key("SLURM_JOB_SEGMENT_SIZE", het_job_offset);
-		if (!getenv(key) &&
-		    (setenvf(NULL, key, "%u", resp->segment_size) < 0)) {
-			error("unable to set %s in environment", key);
-		}
-		xfree(key);
-	}
+	if (resp->segment_size)
+		_setenvf_het("SLURM_JOB_SEGMENT_SIZE", het_job_offset, "%u",
+			     resp->segment_size);
 
 	return;
 }
@@ -2025,55 +2017,25 @@ static void _set_env_vars(resource_allocation_response_msg_t *resp,
 static void _set_env_vars2(resource_allocation_response_msg_t *resp,
 			   int het_job_offset)
 {
-	char *key;
+	if (resp->account)
+		_setenvf_het("SLURM_JOB_ACCOUNT", het_job_offset, "%s",
+			     resp->account);
 
-	if (resp->account) {
-		key = _build_key("SLURM_JOB_ACCOUNT", het_job_offset);
-		if (!getenv(key) &&
-		    (setenvf(NULL, key, "%s", resp->account) < 0)) {
-			error("unable to set %s in environment", key);
-		}
-		xfree(key);
-	}
+	_setenvf_het("SLURM_JOB_ID", het_job_offset, "%u",
+		     resp->step_id.job_id);
 
-	key = _build_key("SLURM_JOB_ID", het_job_offset);
-	if (!getenv(key) &&
-	    (setenvf(NULL, key, "%u", resp->step_id.job_id) < 0)) {
-		error("unable to set %s in environment", key);
-	}
-	xfree(key);
+	_setenvf_het("SLURM_JOB_NODELIST", het_job_offset, "%s",
+		     resp->node_list);
 
-	key = _build_key("SLURM_JOB_NODELIST", het_job_offset);
-	if (!getenv(key) &&
-	    (setenvf(NULL, key, "%s", resp->node_list) < 0)) {
-		error("unable to set %s in environment", key);
-	}
-	xfree(key);
+	_setenvf_het("SLURM_JOB_PARTITION", het_job_offset, "%s",
+		     resp->partition);
 
-	key = _build_key("SLURM_JOB_PARTITION", het_job_offset);
-	if (!getenv(key) &&
-	    (setenvf(NULL, key, "%s", resp->partition) < 0)) {
-		error("unable to set %s in environment", key);
-	}
-	xfree(key);
+	if (resp->qos)
+		_setenvf_het("SLURM_JOB_QOS", het_job_offset, "%s", resp->qos);
 
-	if (resp->qos) {
-		key = _build_key("SLURM_JOB_QOS", het_job_offset);
-		if (!getenv(key) &&
-		    (setenvf(NULL, key, "%s", resp->qos) < 0)) {
-			error("unable to set %s in environment", key);
-		}
-		xfree(key);
-	}
-
-	if (resp->resv_name) {
-		key = _build_key("SLURM_JOB_RESERVATION", het_job_offset);
-		if (!getenv(key) &&
-		    (setenvf(NULL, key, "%s", resp->resv_name) < 0)) {
-			error("unable to set %s in environment", key);
-		}
-		xfree(key);
-	}
+	if (resp->resv_name)
+		_setenvf_het("SLURM_JOB_RESERVATION", het_job_offset, "%s",
+			     resp->resv_name);
 }
 
 /* Set SLURM_RLIMIT_* environment variables with current resource
@@ -2085,6 +2047,7 @@ static int _set_rlimit_env(void)
 	unsigned long        cur;
 	char                 name[64], *format;
 	slurm_rlimits_info_t *rli;
+	int env_rc = EINVAL;
 
 	/* Modify limits with any command-line options */
 	if (sropt.propagate
@@ -2114,8 +2077,9 @@ static int _set_rlimit_env(void)
 		else
 			format = "%lu";
 
-		if (setenvf (NULL, name, format, cur) < 0) {
-			error ("unable to set %s in environment", name);
+		if ((env_rc = setenvf(NULL, name, format, cur))) {
+			error("unable to set %s in environment: %s", name,
+			      slurm_strerror(env_rc));
 			rc = SLURM_ERROR;
 			continue;
 		}
@@ -2134,12 +2098,15 @@ static int _set_rlimit_env(void)
 /* Set some environment variables with current state */
 static int _set_umask_env(void)
 {
+	int rc = EINVAL;
+
 	if (!getenv("SRUN_DEBUG")) {	/* do not change current value */
 		/* NOTE: Default debug level is 3 (info) */
 		int log_level = LOG_LEVEL_INFO + opt.verbose - opt.quiet;
 
-		if (setenvf(NULL, "SRUN_DEBUG", "%d", log_level) < 0)
-			error ("unable to set SRUN_DEBUG in environment");
+		if ((rc = setenvf(NULL, "SRUN_DEBUG", "%d", log_level)))
+			error("unable to set SRUN_DEBUG in environment: %s",
+			      slurm_strerror(rc));
 	}
 
 	if (!getenv("SLURM_UMASK")) {	/* do not change current value */
@@ -2151,8 +2118,9 @@ static int _set_umask_env(void)
 
 		sprintf(mask_char, "0%d%d%d",
 			((mask>>6)&07), ((mask>>3)&07), mask&07);
-		if (setenvf(NULL, "SLURM_UMASK", "%s", mask_char) < 0) {
-			error ("unable to set SLURM_UMASK in environment");
+		if ((rc = setenvf(NULL, "SLURM_UMASK", "%s", mask_char))) {
+			error("unable to set SLURM_UMASK in environment: %s",
+			      slurm_strerror(rc));
 			return SLURM_ERROR;
 		}
 		debug ("propagating UMASK=%s", mask_char);
@@ -2183,23 +2151,43 @@ static int _shepherd_spawn(srun_job_t *job, list_t *srun_job_list,
 	int shepherd_pipe[2], rc;
 	pid_t shepherd_pid;
 	char buf[1];
+	sigset_t block_mask, old_mask;
 
 	if (pipe(shepherd_pipe)) {
 		error("pipe: %m");
 		return -1;
 	}
 
+	/*
+	 * Block all signals across the fork(). conmgr resets the child's signal
+	 * dispositions to their defaults on fork(), so without a blocked mask
+	 * the shepherd, which must outlive srun to clean up the job/step on
+	 * abnormal termination, could be killed by a signal and not give it a
+	 * chance to cleanup the job. The shepherd never needs to act on a
+	 * signal, so it inherits and keeps the fully blocked mask; the parent
+	 * restores its original mask below.
+	 */
+	sigfillset(&block_mask);
+	pthread_sigmask(SIG_BLOCK, &block_mask, &old_mask);
+
 	shepherd_pid = fork();
 	if (shepherd_pid == -1) {
 		error("fork: %m");
+		pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
 		return -1;
 	}
 	if (shepherd_pid != 0) {
+		pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
 		close(shepherd_pipe[0]);
 		return shepherd_pipe[1];
 	}
 
-	/* Wait for parent to notify of completion or I/O error on abort */
+	/*
+	 * Shepherd child: keep all signals blocked so teardown signals cannot
+	 * kill us before the cleanup below completes.
+	 *
+	 * Wait for parent to notify of completion or I/O error on abort.
+	 */
 	close(shepherd_pipe[1]);
 	while (1) {
 		rc = read(shepherd_pipe[0], buf, 1);
@@ -2231,59 +2219,6 @@ static int _shepherd_spawn(srun_job_t *job, list_t *srun_job_list,
 
 	_exit(0);
 	return -1;
-}
-
-/* _srun_signal_mgr - Process daemon-wide signals */
-static void *_srun_signal_mgr(void *job_ptr)
-{
-	int sig;
-	int i, rc;
-	sigset_t set;
-	srun_job_t *job = (srun_job_t *)job_ptr;
-
-	/* Make sure no required signals are ignored (possibly inherited) */
-	for (i = 0; sig_array[i]; i++)
-		xsignal_default(sig_array[i]);
-	while (!srun_shutdown) {
-		xsignal_sigset_create(sig_array, &set);
-		rc = sigwait(&set, &sig);
-		if (rc == EINTR)
-			continue;
-		switch (sig) {
-		case SIGINT:
-			if (!srun_shutdown)
-				_handle_intr(job);
-			break;
-		case SIGQUIT:
-			info("Quit");
-			/* continue with slurm_step_launch_abort */
-		case SIGTERM:
-		case SIGHUP:
-			/* No need to call job_force_termination here since we
-			 * are ending the job now and we don't need to update
-			 * the state. */
-			info("forcing job termination");
-			launch_g_fwd_signal(SIGKILL);
-			break;
-		case SIGCONT:
-			info("got SIGCONT");
-			break;
-		case SIGPIPE:
-			_handle_pipe();
-			break;
-		case SIGALRM:
-			if (srun_max_timer) {
-				info("First task exited %ds ago", sropt.max_wait);
-				launch_g_print_status();
-				launch_g_step_terminate();
-			}
-			break;
-		default:
-			launch_g_fwd_signal(sig);
-			break;
-		}
-	}
-	return NULL;
 }
 
 static int _validate_relative(resource_allocation_response_msg_t *resp,
@@ -2338,4 +2273,253 @@ static void _srun_cli_filter_post_submit(uint32_t jobid, uint32_t stepid)
 		cli_filter_g_post_submit(idx, jobid, stepid);
 
 	post_submit_ran = true;
+}
+
+static void _file_bcast(slurm_opt_t *opt_local, srun_job_t *job)
+{
+	srun_opt_t *srun_opt = opt_local->srun_opt;
+	struct bcast_parameters *params;
+	char *tmp = NULL;
+	xassert(srun_opt);
+
+	if ((opt_local->argc == 0) || !opt_local->argv[0])
+		fatal("No command name to broadcast");
+
+	params = xmalloc(sizeof(struct bcast_parameters));
+	params->block_size = 8 * 1024 * 1024;
+	if (srun_opt->compress) {
+		params->compress = srun_opt->compress;
+	} else if ((tmp = conf_get_opt_str(slurm_conf.bcast_parameters,
+					   "Compression="))) {
+		params->compress = parse_compress_type(tmp);
+		xfree(tmp);
+	}
+	params->exclude = xstrdup(srun_opt->bcast_exclude);
+	if (srun_opt->bcast_file && (srun_opt->bcast_file[0] == '/')) {
+		params->dst_fname = xstrdup(srun_opt->bcast_file);
+	} else if ((params->dst_fname =
+			    conf_get_opt_str(slurm_conf.bcast_parameters,
+					     "DestDir="))) {
+		xstrcatchar(params->dst_fname, '/');
+	} else {
+		xstrfmtcat(params->dst_fname, "%s/", opt_local->chdir);
+	}
+	if (srun_opt->send_libs)
+		params->flags |= BCAST_FLAG_SEND_LIBS;
+	params->tree_width = 0;
+	params->selected_step = xmalloc(sizeof(*params->selected_step));
+	params->selected_step->array_task_id = NO_VAL;
+	memcpy(&params->selected_step->step_id, &job->step_id,
+	       sizeof(params->selected_step->step_id));
+	params->flags |= BCAST_FLAG_FORCE;
+	if (srun_opt->het_grp_bits)
+		params->selected_step->het_job_offset =
+			bit_ffs(srun_opt->het_grp_bits);
+	else
+		params->selected_step->het_job_offset = NO_VAL;
+	params->flags |= BCAST_FLAG_PRESERVE;
+	params->src_fname = xstrdup(opt_local->argv[0]);
+	params->timeout = 0;
+	params->verbose = opt_local->verbose;
+
+	if (bcast_file(params) != SLURM_SUCCESS)
+		fatal("Failed to broadcast '%s'. Step launch aborted.",
+		      params->src_fname);
+
+	/*
+	 * Defer setting argv[0] to dst_fname till later point in
+	 * _launch_one_app(). Use bcast_file member as value placeholder.
+	 */
+	xfree(srun_opt->bcast_file);
+	srun_opt->bcast_file = xstrdup(params->dst_fname);
+
+	slurm_destroy_selected_step(params->selected_step);
+	xfree(params->dst_fname);
+	xfree(params->exclude);
+	xfree(params->src_fname);
+	xfree(params);
+}
+
+/*
+ * Return a string representation of an array of uint32_t elements.
+ * Each value in the array is printed in decimal notation and elements
+ * are separated by a comma.  If sequential elements in the array
+ * contain the same value, the value is written out just once followed
+ * by "(xN)", where "N" is the number of times the value is repeated.
+ *
+ * Example:
+ *   The array "1, 2, 1, 1, 1, 3, 2" becomes the string "1,2,1(x3),3,2"
+ *
+ * Returns an xmalloc'ed string.  Free with xfree().
+ */
+static char *_uint16_array_to_str(int array_len, const uint16_t *array)
+{
+	int i;
+	int previous = 0;
+	char *sep = ","; /* separator */
+	char *str = xstrdup("");
+
+	if (!array)
+		return str;
+
+	for (i = 0; i < array_len; i++) {
+		if ((i + 1 < array_len) && (array[i] == array[i + 1])) {
+			previous++;
+			continue;
+		}
+
+		if (i == array_len - 1) /* last time through loop */
+			sep = "";
+		if (previous > 0) {
+			xstrfmtcat(str, "%u(x%u)%s", array[i], previous + 1,
+				   sep);
+		} else {
+			xstrfmtcat(str, "%u%s", array[i], sep);
+		}
+		previous = 0;
+	}
+
+	return str;
+}
+
+static void _pty_restore(void)
+{
+	/* STDIN is probably closed by now */
+	if (tcsetattr(STDOUT_FILENO, TCSANOW, &termdefaults) < 0)
+		fprintf(stderr, "tcsetattr: %s\n", strerror(errno));
+}
+
+extern void setup_one_job_env(slurm_opt_t *opt_local, srun_job_t *job,
+			      bool got_alloc)
+{
+	env_t *env = xmalloc(sizeof(env_t));
+	srun_opt_t *srun_opt = opt_local->srun_opt;
+	xassert(srun_opt);
+
+	xassert(job);
+
+	env->localid = -1;
+	env->nodeid = -1;
+	env->procid = -1;
+	env->step_id = SLURM_STEP_ID_INITIALIZER;
+
+	if (srun_opt->bcast_flag)
+		_file_bcast(opt_local, job);
+	if (opt_local->cpus_set)
+		env->cpus_per_task = opt_local->cpus_per_task;
+	if (opt_local->ntasks_per_node != NO_VAL)
+		env->ntasks_per_node = opt_local->ntasks_per_node;
+	if (opt_local->ntasks_per_socket != NO_VAL)
+		env->ntasks_per_socket = opt_local->ntasks_per_socket;
+	if (opt_local->ntasks_per_core != NO_VAL)
+		env->ntasks_per_core = opt_local->ntasks_per_core;
+	if (opt_local->ntasks_per_tres != NO_VAL)
+		env->ntasks_per_tres = opt_local->ntasks_per_tres;
+	else if (opt_local->ntasks_per_gpu != NO_VAL)
+		env->ntasks_per_tres = opt_local->ntasks_per_gpu;
+	if (opt_local->threads_per_core != NO_VAL)
+		env->threads_per_core = opt_local->threads_per_core;
+	env->distribution = opt_local->distribution;
+	if (opt_local->plane_size != NO_VAL)
+		env->plane_size = opt_local->plane_size;
+	env->cpu_bind_type = srun_opt->cpu_bind_type;
+	env->cpu_bind = srun_opt->cpu_bind;
+
+	env->cpu_freq_min = opt_local->cpu_freq_min;
+	env->cpu_freq_max = opt_local->cpu_freq_max;
+	env->cpu_freq_gov = opt_local->cpu_freq_gov;
+	env->mem_bind_type = opt_local->mem_bind_type;
+	env->mem_bind = opt_local->mem_bind;
+	env->overcommit = opt_local->overcommit;
+	env->slurmd_debug = srun_opt->slurmd_debug;
+	env->labelio = srun_opt->labelio;
+	if (opt_local->job_name)
+		env->job_name = opt_local->job_name;
+
+	if (job->het_job_node_list)
+		env->nodelist = job->het_job_node_list;
+	else
+		env->nodelist = job->nodelist;
+	env->partition = job->partition;
+	if (job->het_job_nnodes != NO_VAL)
+		env->nhosts = job->het_job_nnodes;
+	else if (got_alloc) /* Don't overwrite unless we got allocation */
+		env->nhosts = job->nhosts;
+	if (job->het_job_ntasks != NO_VAL)
+		env->ntasks = job->het_job_ntasks;
+	else
+		env->ntasks = job->ntasks;
+	if (job->step_ctx)
+		env->task_count =
+			_uint16_array_to_str(job->nhosts,
+					     job->step_ctx->step_resp
+						     ->step_layout->tasks);
+	env->step_id = job->step_id;
+	if (job->het_job_id != NO_VAL)
+		env->step_id.job_id = job->het_job_id;
+	env->account = job->account;
+	env->qos = job->qos;
+	env->resv_name = job->resv_name;
+	env->uid = job->uid;
+	env->user_name = xstrdup(job->user_name);
+	env->gid = job->gid;
+	env->group_name = xstrdup(job->group_name);
+	env->oom_kill_step = opt_local->oom_kill_step;
+
+	if (srun_opt->pty) {
+		job->input_fd = STDIN_FILENO;
+
+		if (srun_opt->pty[0]) {
+			/* srun passed FD to use for pty */
+			if (!isdigit(srun_opt->pty[0])) {
+				fatal("--pty=%s must be numeric file descriptor",
+				      srun_opt->pty);
+			}
+
+			job->input_fd = atoi(srun_opt->pty);
+		}
+
+		if (set_winsize(job->input_fd, job)) {
+			error("Not using a pseudo-terminal, disregarding --pty%s%s option",
+			      (srun_opt->pty[0] ? "=" : ""),
+			      (srun_opt->pty[0] ? srun_opt->pty : ""));
+			xfree(srun_opt->pty);
+		} else {
+			/* Save terminal settings for restore */
+			tcgetattr(job->input_fd, &termdefaults);
+			atexit(&_pty_restore);
+
+			pty_thread_create(job);
+			env->pty_port = job->pty_port;
+			env->ws_col = job->ws_col;
+			env->ws_row = job->ws_row;
+		}
+	}
+
+	setup_env(env, srun_opt->preserve_env);
+	/*
+	 * set_env_from_opts() could set job->env vars that are already set in
+	 * environ, but the values could be different (srun requests something
+	 * that is different from the job's environment) and we want the
+	 * job->env to take precedence.
+	 *
+	 * env_array_merge() overwrites anything in dest (the first argument)
+	 * with anything in source (the second argument). Thus, anything in
+	 * environ would overwrite anything already in job->env. The environ
+	 * vars could differ from vars in job->env, and at this point job->env
+	 * is the correct one.
+	 *
+	 * So, we need to first set the env vars from job->env to the environ,
+	 * then do the merge.
+	 */
+	set_env_from_opts(opt_local, &job->env,
+			  (job->het_job_offset == NO_VAL) ?
+				  -1 :
+				  job->het_job_offset);
+	env_array_set_environment(job->env);
+	env_array_merge(&job->env, (const char **) environ);
+
+	xfree(env->task_count);
+	xfree(env->user_name);
+	xfree(env);
 }

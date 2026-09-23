@@ -102,8 +102,8 @@ bool slurmctld_init_db = true;
 static void _build_bitmaps(void);
 static void _gres_reconfig(void);
 static void _init_all_slurm_conf(void);
-static int _preserve_select_type_param(slurm_conf_t *ctl_conf_ptr,
-                                       uint16_t old_select_type_p);
+static int _preserve_select_type_param(slurm_conf_t *conf,
+				       uint16_t old_select_type_p);
 static int  _reset_node_bitmaps(void *x, void *arg);
 
 static void _set_features(node_record_t **old_node_table_ptr,
@@ -894,10 +894,8 @@ static int _build_single_partitionline_info(slurm_conf_partition_t *part)
 	part_ptr->max_cpus_per_socket = part->max_cpus_per_socket;
 	part_ptr->max_share      = part->max_share;
 	part_ptr->max_mem_per_cpu = part->max_mem_per_cpu;
-	part_ptr->max_nodes      = part->max_nodes;
-	part_ptr->max_nodes_orig = part->max_nodes;
-	part_ptr->min_nodes      = part->min_nodes;
-	part_ptr->min_nodes_orig = part->min_nodes;
+	part_ptr->max_nodes = part->max_nodes;
+	part_ptr->min_nodes = part->min_nodes;
 	part_ptr->over_time_limit = part->over_time_limit;
 	part_ptr->preempt_mode   = part->preempt_mode;
 	part_ptr->priority_job_factor = part->priority_job_factor;
@@ -1321,7 +1319,7 @@ void _sync_jobs_to_conf(void)
 	bool part_missing = false;
 	time_t now = time(NULL);
 	bool gang_flag = false;
-	bool rebuild_part;
+	bool rebuild_part, clear_part_ptr;
 
 	xassert(job_list);
 
@@ -1334,6 +1332,7 @@ void _sync_jobs_to_conf(void)
 		job_fail = false;
 		part_missing = false;
 		rebuild_part = false;
+		clear_part_ptr = false;
 
 		/*
 		 * This resets the req/exc node bitmaps, so even if the job is
@@ -1365,35 +1364,42 @@ void _sync_jobs_to_conf(void)
 			part_missing = true;
 		} else {
 			char *err_part = NULL;
-			bool first_part_valid;
 
 			get_part_list(job_ptr->partition, &part_ptr_list,
-				      &part_ptr, &err_part, &first_part_valid);
+				      &part_ptr, &err_part);
 
-			if ((part_ptr == NULL) && !IS_JOB_RUNNING(job_ptr) &&
-			    !IS_JOB_SUSPENDED(job_ptr)) {
+			if (!IS_JOB_PENDING(job_ptr)) {
+				/*
+				 * get_part_list() set part_ptr to a partition
+				 * that need not be the allocated one. Recover
+				 * a non-pending job's allocated partition from
+				 * alloc_partition. If it was removed, kill a
+				 * running or suspended job; leave a completing
+				 * job to finish with a NULL part_ptr (it then
+				 * reports its surviving partitions).
+				 */
+				part_record_t *running_part_ptr;
+				char *defunct = NULL;
+
+				running_part_ptr =
+					find_alloc_part_record(job_ptr,
+							       &defunct);
+				if (running_part_ptr) {
+					part_ptr = running_part_ptr;
+				} else if (IS_JOB_RUNNING(job_ptr) ||
+					   IS_JOB_SUSPENDED(job_ptr)) {
+					error("Killing %pJ on defunct partition %s",
+					      job_ptr, defunct);
+					part_missing = true;
+				} else {
+					clear_part_ptr = true;
+				}
+				xfree(defunct);
+			} else if (!part_ptr) {
 				/* No valid partitions were found */
 				error("Invalid partition (%s) for %pJ",
 				      err_part, job_ptr);
 				part_missing = true;
-			} else if ((IS_JOB_RUNNING(job_ptr) ||
-				    IS_JOB_SUSPENDED(job_ptr)) &&
-				   (!first_part_valid || (part_ptr == NULL))) {
-				char sep = ',';
-				char *sep_pos = xstrchr(err_part, sep);
-				if (sep_pos)
-					*sep_pos = '\0';
-				/*
-				 * We removed the primary partition for a
-				 * running or suspended job. We need to
-				 * terminate the job.
-				 */
-				error("Killing %pJ on defunct partition %s",
-				      job_ptr, err_part);
-				part_missing = true;
-
-				if (sep_pos)
-					*sep_pos = sep;
 			}
 
 			if (err_part)
@@ -1412,11 +1418,22 @@ void _sync_jobs_to_conf(void)
 				part_ptr_list = NULL; /* clear for next job */
 			}
 			/*
-			 * Rebuild the partition string if it contains an
-			 * invalid partition.
+			 * Rebuild the partition string if it names an invalid
+			 * partition, in PriorityTier order. Skip a completing
+			 * job left with a NULL part_ptr (rebuild would
+			 * dereference it); rebuild before clearing part_ptr
+			 * below.
 			 */
-			if (rebuild_part)
+			if (rebuild_part && part_ptr)
 				rebuild_job_part_list(job_ptr);
+			/*
+			 * A completing job whose allocated partition was
+			 * removed keeps its surviving partitions but is no
+			 * longer pinned to one (as on a runtime delete). Clear
+			 * part_ptr now that the string is rebuilt.
+			 */
+			if (clear_part_ptr)
+				job_ptr->part_ptr = NULL;
 		} else {
 			job_ptr->details->requeue = false;
 			job_state_unset_flag(job_ptr, JOB_REQUEUE);
@@ -1454,6 +1471,14 @@ void _sync_jobs_to_conf(void)
 				     &job_ptr->node_bitmap_pr, NULL)) {
 			error("Invalid nodes_pr (%s) for %pJ",
 			      job_ptr->nodes_pr, job_ptr);
+			job_fail = true;
+		}
+		FREE_NULL_BITMAP(job_ptr->node_bitmap_rs);
+		if (job_ptr->nodes_rs &&
+		    node_name2bitmap(job_ptr->nodes_rs, false,
+				     &job_ptr->node_bitmap_rs, NULL)) {
+			error("Invalid nodes_rs (%s) for %pJ",
+			      job_ptr->nodes_rs, job_ptr);
 			job_fail = true;
 		}
 		if (reset_node_bitmap(job_ptr))
@@ -1494,7 +1519,7 @@ void _sync_jobs_to_conf(void)
 
 		_sync_steps_to_conf(job_ptr);
 
-		build_node_details(job_ptr, false); /* set node_addr */
+		build_node_details(job_ptr);
 
 		if (job_fail) {
 			bool was_running = false;
@@ -1801,17 +1826,33 @@ extern int read_slurm_conf(int recover)
 	set_cluster_tres(false);
 
 	_validate_het_jobs();
+
+	if ((slurm_conf.prolog_timeout != NO_VAL16) &&
+	    (slurm_conf.batch_start_timeout < slurm_conf.prolog_timeout))
+		warning("BatchStartTimeout (%u) is less than the prolog timeout (%u); a batch job whose prolog runs longer than BatchStartTimeout may be considered missing and requeued",
+			slurm_conf.batch_start_timeout,
+			slurm_conf.prolog_timeout);
+
 	(void) _sync_nodes_to_comp_job();/* must follow select_g_node_init() */
 	_requeue_job_node_failed();
 	load_part_uid_allow_list(true);
 
+	/*
+	 * Initialize HRES before restoring reservations which could have
+	 * reserved some HRES.
+	 */
+	hres_init();
+
 	/* NOTE: Run load_all_resv_state() before _restore_job_accounting */
 	load_all_resv_state(recover);
+	/* Free the old-to-new mapping after load_all_resv_state() */
+	xfree(node_old_to_new_map);
+	old_node_record_count = 0;
+	is_node_table_changed = false;
 	if (recover >= 1) {
 		trigger_state_restore();
 		controller_reconfig_scheduling();
 	}
-	hres_init();
 	restore_job_accounting();
 
 	/* sort config_list by weight for scheduling */
@@ -2151,15 +2192,15 @@ static void _set_features(node_record_t **old_node_table_ptr,
  *	select plugin value changes to take effect.
  * RET zero or error code
  */
-static int _preserve_select_type_param(slurm_conf_t *ctl_conf_ptr,
-                                       uint16_t old_select_type_p)
+static int _preserve_select_type_param(slurm_conf_t *conf,
+				       uint16_t old_select_type_p)
 {
 	int rc = SLURM_SUCCESS;
 
 	/* SelectTypeParameters cannot change */
 	if (old_select_type_p) {
-		if (old_select_type_p != ctl_conf_ptr->select_type_param) {
-			ctl_conf_ptr->select_type_param = old_select_type_p;
+		if (old_select_type_p != conf->select_type_param) {
+			conf->select_type_param = old_select_type_p;
 			rc = ESLURM_INVALID_SELECTTYPE_CHANGE;
 		}
 	}
@@ -2378,16 +2419,29 @@ static void _sync_nodes_to_suspended_job(job_record_t *job_ptr)
 	set_initial_job_alias_list(job_ptr);
 }
 
-static void _restore_job_licenses(job_record_t *job_ptr)
+extern void restore_job_licenses(job_record_t *job_ptr, bool validate)
 {
 	list_t *license_list = NULL, *license_list_alloc = NULL;
 	bool valid = true, alloc_valid = true;
 
-	license_list = license_validate(job_ptr->licenses, false, false, false,
-					job_ptr->tres_req_cnt, &valid);
+	validate = validate && IS_JOB_PENDING(job_ptr);
+
+	/*
+	 * If the job is pending, validate the license request against
+	 * configured licenses and hold the job if it is not valid.
+	 */
+	license_list = license_validate(job_ptr->licenses, validate, validate,
+					HRES_SYNTAX_NONE, job_ptr->tres_req_cnt,
+					&valid, NULL);
+	/*
+	 * HRES_SYNTAX_ANY is only needed for support jobs from Slurm version
+	 * <= 26.05, and then the syntax is automatically converted to the new
+	 * format. Replace HRES_SYNTAX_ANY with HRES_SYNTAX_LAYERS after
+	 * upgrading from SLURM_26_05_PROTOCOL_VERSION is no longer supported.
+	 */
 	license_list_alloc =
 		license_validate(job_ptr->licenses_allocated, false, false,
-				 true, NULL, &alloc_valid);
+				 HRES_SYNTAX_ANY, NULL, &alloc_valid, NULL);
 	FREE_NULL_LIST(job_ptr->license_list);
 
 	if (valid) {
@@ -2395,6 +2449,17 @@ static void _restore_job_licenses(job_record_t *job_ptr)
 		xfree(job_ptr->licenses);
 		job_ptr->licenses = license_list_to_string(license_list);
 		hres_create_select(job_ptr);
+	} else if (IS_JOB_PENDING(job_ptr) && job_ptr->priority) {
+		char *msg = xstrdup_printf(
+			"License request '%s' is no longer valid, holding job",
+			job_ptr->licenses);
+
+		info("%pJ %s", job_ptr, msg);
+		job_ptr->priority = 0;
+		job_ptr->state_reason = WAIT_HELD;
+		xfree(job_ptr->state_desc);
+		job_ptr->state_desc = msg;
+		msg = NULL;
 	}
 
 	/*
@@ -2477,7 +2542,7 @@ extern void restore_job_accounting(void)
 						save_accrue_time;
 			}
 		}
-		_restore_job_licenses(job_ptr);
+		restore_job_licenses(job_ptr, true);
 	}
 	list_iterator_destroy(job_iterator);
 }

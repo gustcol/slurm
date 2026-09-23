@@ -1,4 +1,4 @@
-.TH slurmctld "8" "Slurm Daemon" "Slurm 26.05" "Slurm Daemon"
+.TH slurmctld "8" "Slurm Daemon" "Slurm 26.11" "Slurm Daemon"
 
 .SH "NAME"
 slurmctld \- The central management daemon of Slurm.
@@ -15,11 +15,15 @@ the primary server fails.
 
 .TP
 \fB\-c\fR
-Clear all previous \fBslurmctld\fR state from its last checkpoint.
-With this option, all jobs, including both running and queued, and all
-node states, will be deleted. Without this option, previously running
-jobs will be preserved along with node \fIState\fR of DOWN, DRAINED
-and DRAINING nodes and the associated \fIReason\fR field for those nodes.
+Discard previous \fBslurmctld\fR state from its last checkpoint.  All
+running and queued jobs will be killed and all node states reset, including
+the \fIState\fR and \fIReason\fR fields of DOWN, DRAINED, and DRAINING nodes.
+The last job ID, reservation state, and association/QOS usage are
+unaffected by this option.  Dynamically created nodes are not recreated, and
+reservations naming them lose those nodes and may be deleted.
+If the state is unreadable due to a version mismatch, \fBslurmctld\fR will
+still refuse to start unless \fB\-i\fR is also given.
+
 \fBNOTE\fR: It is rare you would ever want to use this in production as all
 jobs will be killed.
 .IP
@@ -180,6 +184,14 @@ Return scheduler metrics.
 \fBGET /metrics/jobs-users-accts\fR
 Return user and account job metrics.
 .IP
+
+.PP
+When multiple \fBSlurmctldHost\fR entries are configured, a daemon in standby
+mode will answer \fBGET /metrics*\fR with HTTP 303 "See Other" with the
+\fBLocation\fR header pointing to the same path and query on the first listed
+controller. If no such address is available, the response will be HTTP 503
+"Service Unavailable" instead of a redirect. See \fBSlurmctldHost\fR in
+\fBslurm.conf\fR(5).
 
 .SH "CORE FILE LOCATION"
 If slurmctld is started with the \fB\-D\fR option then the core file will be

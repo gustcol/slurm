@@ -38,6 +38,8 @@
 
 #include "config.h"
 
+#include "slurm/slurmdb.h"
+
 #include "src/common/list.h"
 #include "src/common/read_config.h"
 #include "src/common/sercli.h"
@@ -57,7 +59,15 @@ static list_t *dbd_config_list = NULL;
 
 static void _load_dbd_config(void)
 {
-	dbd_config_list = slurmdb_config_get(db_conn);
+	int rc = EINVAL;
+	slurmdbd_conf_t *slurmdbd_conf = NULL;
+
+	if ((rc = slurmdb_config_get(db_conn, &slurmdbd_conf)))
+		fatal("Unable to query slurmdbd.conf: %s", slurm_strerror(rc));
+
+	dbd_config_list = slurmdb_config_get_keypairs(slurmdbd_conf);
+
+	slurmdbd_free_conf(slurmdbd_conf);
 }
 
 static void _print_dbd_config(void)
@@ -242,23 +252,31 @@ extern int sacctmgr_list_stats(int argc, char **argv)
 {
 	slurmdb_stats_rec_t *stats_rec = NULL;
 	slurmdb_rollup_stats_t *rollup_stats = NULL;
-	int error_code, i;
+	int error_code = SLURM_SUCCESS, i;
 	bool sort_by_ave_time = false, sort_by_total_time = false;
 	time_t now = time(NULL);
 	int type;
+	data_parser_t *parser = NULL;
+
+	if (mime_type) {
+		error_code =
+			data_parser_cli_load(&parser, db_conn, orig_argc,
+					     orig_argv, mime_type, data_parser);
+		if (error_code || !parser)
+			goto cleanup;
+	}
 
 	notice_thread_init();
 	error_code = slurmdb_get_stats(db_conn, &stats_rec);
 	notice_thread_fini();
 	if (error_code != SLURM_SUCCESS)
-		return error_code;
+		goto cleanup;
 
 	if (mime_type) {
-		int rc;
-		DATA_DUMP_CLI_SINGLE(OPENAPI_SLURMDBD_STATS_RESP, stats_rec, argc, argv,
-				     db_conn, mime_type, data_parser, rc);
-		slurmdb_destroy_stats_rec(stats_rec);
-		return rc;
+		error_code = data_parser_dump_cli_single(
+			DATA_PARSER_OPENAPI_SLURMDBD_STATS_RESP, stats_rec,
+			parser);
+		goto cleanup;
 	}
 
 	rollup_stats = stats_rec->dbd_rollup_stats;
@@ -332,6 +350,9 @@ extern int sacctmgr_list_stats(int argc, char **argv)
 	type = 1;
 	list_for_each(stats_rec->user_list, _print_rpc_obj, &type);
 
+cleanup:
+	if (mime_type)
+		data_parser_cli_free_ctxt(&parser);
 	slurmdb_destroy_stats_rec(stats_rec);
 
 	return error_code;

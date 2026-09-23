@@ -339,7 +339,7 @@ static int _compute_plane_dist(job_record_t *job_ptr, uint32_t *gres_task_limit,
 			       uint32_t *gres_min_cpus)
 {
 	bool do_gres_min_cpus = false;
-	uint32_t n, i, p, tid, maxtasks, l;
+	uint32_t n, p, tid, maxtasks, l;
 	uint16_t *avail_cpus, plane_size = 1;
 	job_resources_t *job_res = job_ptr->job_resrcs;
 	bool test_tres_tasks = true;
@@ -363,7 +363,8 @@ static int _compute_plane_dist(job_record_t *job_ptr, uint32_t *gres_task_limit,
 
 	job_res->cpus = xcalloc(job_res->nhosts, sizeof(uint16_t));
 	job_res->tasks_per_node = xcalloc(job_res->nhosts, sizeof(uint16_t));
-	for (tid = 0, i = 0; (tid < maxtasks); i++) { /* cycle counter */
+	tid = 0;
+	while (tid < maxtasks) {
 		bool space_remaining = false;
 		for (n = 0; ((n < job_res->nhosts) && (tid < maxtasks)); n++) {
 			bool more_tres_tasks = false;
@@ -1266,7 +1267,7 @@ static int _dist_tasks_compute_c_b(job_record_t *job_ptr,
 	 * tasks on node 0, 7 tasks on node 1, and 6 tasks on node 2.  It should
 	 * launch 8 tasks on node, 8 tasks on node 1, and 4 tasks on node 2.
 	 */
-	if (job_ptr->details->overcommit && !job_ptr->tres_per_task)
+	if (job_ptr->bit_flags & ALLOW_OVERCOMMIT_TRES_PER_TASK)
 		maxtasks = 0;	/* Allocate have one_task_per_node */
 	while (tid < maxtasks) {
 		bool space_remaining = false;
@@ -1403,7 +1404,7 @@ extern int dist_tasks(job_record_t *job_ptr, const uint16_t cr_type,
 		return SLURM_SUCCESS;
 	}
 
-	if (job_ptr->details->overcommit && !job_ptr->tres_per_task)
+	if (job_ptr->bit_flags & ALLOW_OVERCOMMIT_TRES_PER_TASK)
 		one_task_per_node = true;
 	_log_select_maps("cr_dist/start", job_ptr);
 	if (((job_ptr->details->task_dist & SLURM_DIST_STATE_BASE) ==

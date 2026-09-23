@@ -62,6 +62,14 @@ static ns_conf_t slurm_ns_conf;
 static buf_t *slurm_ns_conf_buf = NULL;
 static bool slurm_ns_conf_inited = false;
 
+static int _dump_ns_dir(void *x, void *arg)
+{
+	ns_dir_t *dir = x;
+	log_flag(NAMESPACE, "DirConf path=%s base_path=%s opts=%s tmpfs=%d",
+		 dir->path, dir->base_path, dir->opts_str, dir->tmpfs);
+	return 0;
+}
+
 static void _dump_ns_conf(void)
 {
 	if (!(slurm_conf.debug_flags & DEBUG_FLAG_NAMESPACE))
@@ -77,6 +85,8 @@ static void _dump_ns_conf(void)
 	log_flag(NAMESPACE, "CloneNSScript_Wait=%u",
 		 slurm_ns_conf.clonensscript_wait);
 	log_flag(NAMESPACE, "Dirs=%s", slurm_ns_conf.dirs);
+	if (slurm_ns_conf.dir_confs)
+		list_for_each(slurm_ns_conf.dir_confs, _dump_ns_dir, NULL);
 	log_flag(NAMESPACE, "disable_bpf_token=%d",
 		 slurm_ns_conf.disable_bpf_token);
 	log_flag(NAMESPACE, "InitScript=%s", slurm_ns_conf.initscript);
@@ -84,8 +94,21 @@ static void _dump_ns_conf(void)
 	log_flag(NAMESPACE, "UserNSScript=%s", slurm_ns_conf.usernsscript);
 }
 
+static int _pack_ns_dir(void *x, void *arg)
+{
+	ns_dir_t *dir = x;
+	buf_t *buf = arg;
+	packstr(dir->path, buf);
+	packstr(dir->base_path, buf);
+	packstr(dir->opts_str, buf);
+	packbool(dir->tmpfs, buf);
+	return 0;
+}
+
 static void _pack_slurm_ns_conf_buf(void)
 {
+	uint32_t count;
+
 	if (slurm_ns_conf_buf)
 		FREE_NULL_BUFFER(slurm_ns_conf_buf);
 
@@ -97,11 +120,18 @@ static void _pack_slurm_ns_conf_buf(void)
 	packstr(slurm_ns_conf.clonensscript, slurm_ns_conf_buf);
 	pack32(slurm_ns_conf.clonensepilog_wait, slurm_ns_conf_buf);
 	pack32(slurm_ns_conf.clonensscript_wait, slurm_ns_conf_buf);
-	packstr(slurm_ns_conf.dirs, slurm_ns_conf_buf);
+	/* Omit slurm_ns_conf.dirs as it is unused in the slurmstepd */
 	packbool(slurm_ns_conf.disable_bpf_token, slurm_ns_conf_buf);
 	packstr(slurm_ns_conf.initscript, slurm_ns_conf_buf);
 	packbool(slurm_ns_conf.shared, slurm_ns_conf_buf);
 	packstr(slurm_ns_conf.usernsscript, slurm_ns_conf_buf);
+
+	count = slurm_ns_conf.dir_confs ? list_count(slurm_ns_conf.dir_confs) :
+					  0;
+	pack32(count, slurm_ns_conf_buf);
+	if (slurm_ns_conf.dir_confs)
+		list_for_each(slurm_ns_conf.dir_confs, _pack_ns_dir,
+			      slurm_ns_conf_buf);
 }
 
 static void _swap_slurm_ns_conf(ns_node_conf_t *ns_node_conf)
@@ -127,6 +157,12 @@ static void _swap_slurm_ns_conf(ns_node_conf_t *ns_node_conf)
 	SWAP_IF_SET(slurm_ns_conf.clonensflags_str, ns_conf->clonensflags_str);
 	SWAP_IF_SET(slurm_ns_conf.clonensscript, ns_conf->clonensscript);
 	SWAP_IF_SET(slurm_ns_conf.dirs, ns_conf->dirs);
+	if (ns_conf->dir_confs) {
+		FREE_NULL_LIST(slurm_ns_conf.dir_confs);
+		SWAP(slurm_ns_conf.dir_confs, ns_conf->dir_confs);
+		/* dirs no longer drives mount setup; clear to avoid confusion */
+		xfree(slurm_ns_conf.dirs);
+	}
 	SWAP_IF_SET(slurm_ns_conf.initscript, ns_conf->initscript);
 	SWAP_IF_SET(slurm_ns_conf.usernsscript, ns_conf->usernsscript);
 }
@@ -143,61 +179,138 @@ static int _find_node_conf(void *x, void *key)
 	return false;
 }
 
+static int _expand_dir_base_path(void *x, void *arg)
+{
+	ns_dir_t *dir = x;
+	char *tmp;
+
+	if (!dir->base_path)
+		return 0;
+
+	tmp = dir->base_path;
+	dir->base_path =
+		slurm_conf_expand_slurmd_path(tmp, conf->node_name, NULL);
+	xfree(tmp);
+#ifdef MULTIPLE_SLURMD
+	xstrfmtcat(dir->base_path, "/%s", conf->node_name);
+#endif
+	return 0;
+}
+
 static void _set_clonensflags(void)
 {
-	/* Always set CLONE_NEWNS */
+	/* CLONE_NEWNS is mandatory; the user list only adds optional flags. */
 	slurm_ns_conf.clonensflags = CLONE_NEWNS;
 
-	if (xstrcasestr(slurm_ns_conf.clonensflags_str, "CLONE_NEWNS"))
-		slurm_ns_conf.clonensflags |= CLONE_NEWNS;
 	if (xstrcasestr(slurm_ns_conf.clonensflags_str, "CLONE_NEWPID"))
 		slurm_ns_conf.clonensflags |= CLONE_NEWPID;
 	if (xstrcasestr(slurm_ns_conf.clonensflags_str, "CLONE_NEWUSER"))
 		slurm_ns_conf.clonensflags |= CLONE_NEWUSER;
 }
 
-static void _set_slurm_ns_conf_defaults()
+/* Build dir_confs from the legacy dirs CSV string. */
+static void _dirs_to_dir_confs(void)
 {
-	if (!slurm_ns_conf.dirs)
-		slurm_ns_conf.dirs = xstrdup(SLURM_NEWNS_DEF_DIRS);
+	char *buf, *save_ptr = NULL, *token;
+
+	xassert(!slurm_ns_conf.dir_confs);
+	xassert(slurm_ns_conf.dirs);
+
+	slurm_ns_conf.dir_confs = list_create((ListDelF) slurm_free_ns_dir);
+	buf = xstrdup(slurm_ns_conf.dirs);
+	token = strtok_r(buf, ",", &save_ptr);
+	while (token) {
+		ns_dir_t *dir = xmalloc(sizeof(*dir));
+		dir->path = xstrdup(token);
+		list_append(slurm_ns_conf.dir_confs, dir);
+		token = strtok_r(NULL, ",", &save_ptr);
+	}
+	xfree(buf);
+}
+
+static int _check_dir_not_under_basepath(void *x, void *arg)
+{
+	ns_dir_t *dir = x;
+	char *basepath = arg;
+	size_t len = strlen(basepath);
+	if (!xstrncmp(dir->path, basepath, len) &&
+	    (dir->path[len] == '/' || dir->path[len] == '\0'))
+		fatal("DirConfs path(%s) cannot be at or under BasePath(%s).",
+		      dir->path, basepath);
+	return 0;
+}
+
+static int _find_dir_path(void *x, void *key)
+{
+	ns_dir_t *dir = x;
+	return !xstrcmp(dir->path, (char *) key);
+}
+
+static int _check_duplicate_path(void *x, void *arg)
+{
+	ns_dir_t *dir = x;
+	list_t *seen = arg;
+
+	if (list_find_first(seen, _find_dir_path, dir->path))
+		fatal("Duplicate path \"%s\" in dir_confs.", dir->path);
+
+	list_append(seen, dir);
+	return 0;
+}
+
+static int _force_devshm_tmpfs(void *x, void *arg)
+{
+	ns_dir_t *dir = x;
+
+	if (!xstrcmp(dir->path, "/dev/shm")) {
+		dir->tmpfs = true;
+		/* only one /dev/shm, so break out of the loop */
+		return -1;
+	}
+
+	return 0;
+}
+
+static void _set_slurm_ns_conf_defaults(void)
+{
+	list_t *seen = list_create(NULL);
+
+	if (!slurm_ns_conf.dir_confs) {
+		if (!slurm_ns_conf.dirs)
+			slurm_ns_conf.dirs = xstrdup(SLURM_NEWNS_DEF_DIRS);
+		_dirs_to_dir_confs();
+	}
+
+	list_for_each(slurm_ns_conf.dir_confs, _check_duplicate_path, seen);
+	list_for_each(slurm_ns_conf.dir_confs, _force_devshm_tmpfs, NULL);
+
 	if (!slurm_ns_conf.clonensepilog_wait)
 		slurm_ns_conf.clonensepilog_wait = SLURM_NS_WAIT_DEF;
 	if (!slurm_ns_conf.clonensscript_wait)
 		slurm_ns_conf.clonensscript_wait = SLURM_NS_WAIT_DEF;
+
+	FREE_NULL_LIST(seen);
 }
 
 static int _read_slurm_ns_conf(void)
 {
-	char *conf_path = NULL;
-	struct stat stat_buf;
-	buf_t *conf_buf = NULL;
 	int rc = SLURM_SUCCESS;
 	ns_full_conf_t *ns_full_conf = NULL;
 
 	xassert(conf->node_name);
 
-	conf_path = get_extra_conf_path(ns_conf_file);
+	debug("Reading %s", ns_conf_file);
 
-	if (stat(conf_path, &stat_buf) == -1) {
-		error("Could not find %s file", ns_conf_file);
-		rc = ENOENT;
-		goto end_it;
+	if ((rc = CONF_PARSE(NAMESPACE_FULL_CONF_PTR, ns_conf_file,
+			     ns_full_conf))) {
+		if (rc == ENOENT) {
+			error("Could not find %s file", ns_conf_file);
+			goto end_it;
+		}
+		fatal("Something wrong with reading %s: %s",
+		      ns_conf_file, slurm_strerror(rc));
 	}
 
-	debug("Reading %s file %s", ns_conf_file, conf_path);
-
-	serializer_required(MIME_TYPE_YAML);
-
-	if (!(conf_buf = create_mmap_buf(conf_path))) {
-		error("could not load %s, and thus cannot create namespace context",
-		      conf_path);
-		rc = SLURM_ERROR;
-		goto end_it;
-	}
-
-	DATA_PARSE_FROM_STR(NAMESPACE_FULL_CONF_PTR, conf_buf->head,
-			    conf_buf->size, ns_full_conf, NULL, MIME_TYPE_YAML,
-			    rc);
 	if (!ns_full_conf ||
 	    (!ns_full_conf->defaults && !ns_full_conf->node_confs))
 		goto end_it;
@@ -259,10 +372,9 @@ static int _read_slurm_ns_conf(void)
 
 	_set_clonensflags();
 	_set_slurm_ns_conf_defaults();
+	list_for_each(slurm_ns_conf.dir_confs, _expand_dir_base_path, NULL);
 
 end_it:
-	xfree(conf_path);
-	FREE_NULL_BUFFER(conf_buf);
 	slurm_free_ns_full_conf(ns_full_conf);
 	return rc;
 }
@@ -271,25 +383,18 @@ extern ns_conf_t *init_slurm_ns_conf(void)
 {
 	int rc;
 	if (!slurm_ns_conf_inited) {
-		char *save_ptr = NULL, *token, *buffer;
 		memset(&slurm_ns_conf, 0, sizeof(slurm_ns_conf));
 		rc = _read_slurm_ns_conf();
 		if (rc != SLURM_SUCCESS)
 			return NULL;
 
-		xassert(slurm_ns_conf.dirs);
+		xassert(slurm_ns_conf.dir_confs);
 
-		/* BasePath cannot be in "Dirs" */
-		buffer = xstrdup(slurm_ns_conf.dirs);
-		token = strtok_r(buffer, ",", &save_ptr);
-		while (token) {
-			char *found = xstrstr(token, slurm_ns_conf.basepath);
-			if (found == token)
-				fatal("BasePath(%s) cannot also be in Dirs.",
+		/* No DirConf path may be at or under BasePath */
+		if (slurm_ns_conf.basepath)
+			list_for_each(slurm_ns_conf.dir_confs,
+				      _check_dir_not_under_basepath,
 				      slurm_ns_conf.basepath);
-			token = strtok_r(NULL, ",", &save_ptr);
-		}
-		xfree(buffer);
 
 		_pack_slurm_ns_conf_buf();
 
@@ -303,6 +408,9 @@ extern ns_conf_t *init_slurm_ns_conf(void)
 
 extern ns_conf_t *set_slurm_ns_conf(buf_t *buf)
 {
+	uint32_t count;
+	ns_dir_t *dir = NULL;
+
 	xassert(buf);
 
 	safe_unpackbool(&slurm_ns_conf.auto_basepath, buf);
@@ -312,15 +420,30 @@ extern ns_conf_t *set_slurm_ns_conf(buf_t *buf)
 	safe_unpackstr(&slurm_ns_conf.clonensscript, buf);
 	safe_unpack32(&slurm_ns_conf.clonensepilog_wait, buf);
 	safe_unpack32(&slurm_ns_conf.clonensscript_wait, buf);
-	safe_unpackstr(&slurm_ns_conf.dirs, buf);
+	/* Omit slurm_ns_conf.dirs as it is unused in the slurmstepd */
+	slurm_ns_conf.dirs = NULL;
 	safe_unpackbool(&slurm_ns_conf.disable_bpf_token, buf);
 	safe_unpackstr(&slurm_ns_conf.initscript, buf);
 	safe_unpackbool(&slurm_ns_conf.shared, buf);
 	safe_unpackstr(&slurm_ns_conf.usernsscript, buf);
+	safe_unpack32(&count, buf);
+	slurm_ns_conf.dir_confs = list_create((ListDelF) slurm_free_ns_dir);
+	for (uint32_t i = 0; i < count; i++) {
+		dir = xmalloc(sizeof(*dir));
+		safe_unpackstr(&dir->path, buf);
+		safe_unpackstr(&dir->base_path, buf);
+		safe_unpackstr(&dir->opts_str, buf);
+		safe_unpackbool(&dir->tmpfs, buf);
+		list_append(slurm_ns_conf.dir_confs, dir);
+		dir = NULL;
+	}
+
 	slurm_ns_conf_inited = true;
 
 	return &slurm_ns_conf;
 unpack_error:
+	slurm_free_ns_dir(dir);
+	FREE_NULL_LIST(slurm_ns_conf.dir_confs);
 	return NULL;
 }
 

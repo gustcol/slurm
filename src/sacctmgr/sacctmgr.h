@@ -230,8 +230,11 @@ extern list_t *g_res_list;
 extern list_t *g_tres_list;
 extern const char *mime_type; /* user requested JSON or YAML */
 extern const char *data_parser; /* data_parser args */
+extern int orig_argc; /* used when dumping meta data */
+extern char **orig_argv;
 
 extern bool user_case_norm;
+extern bool resource_case_norm;
 extern bool tree_display;
 extern bool have_db_conn;
 
@@ -362,6 +365,8 @@ extern slurmdb_wckey_rec_t *sacctmgr_find_wckey_from_list(
 	list_t *wckey_list, char *user, char *name, char *cluster);
 
 extern void sacctmgr_initialize_g_tres_list(void);
+extern int sacctmgr_set_tres_rec_field(char **dest, char *value,
+				       uint32_t tres_flags);
 
 /* file_functions.c */
 extern int print_file_add_limits_to_line(char **line,

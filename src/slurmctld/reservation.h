@@ -47,8 +47,6 @@
 #include "src/slurmctld/licenses.h"
 #include "src/slurmctld/slurmctld.h"
 
-extern uint32_t validate_resv_cnt;
-
 /* Create a resource reservation */
 extern int create_resv(resv_desc_msg_t *resv_desc_ptr, char **err_msg);
 
@@ -119,6 +117,16 @@ extern int load_all_resv_state(int recover);
  *                 NOTE: Ignored if run_now==false
  */
 extern void validate_all_reservations(bool run_now, bool run_locked);
+
+/*
+ * Re-resolve a reservation's qos_list pointers from its canonical qos string.
+ * Used by the assoc_mgr cache-update path after the qos list has been replaced,
+ * which leaves the qos_rec pointers cached in resv_ptr->qos_list dangling.
+ * IN x   - reservation to update (slurmctld_resv_t *)
+ * IN arg - unused
+ * RET 0
+ */
+extern int resv_cache_update_qos_list(void *x, void *arg);
 
 /*
  * Determine if a job request can use the specified reservations

@@ -238,43 +238,38 @@ static void _gtk_print_config_plugin_params_list(list_t *l, char *title,
 }
 
 static void _layout_conf_ctl(GtkTreeStore *treestore,
-			     slurm_ctl_conf_info_msg_t *slurm_ctl_conf_ptr)
+			     slurm_conf_t *slurm_conf_ptr)
 {
 	char time_str[256], tmp_str[300];
 	GtkTreeIter iter;
 	list_t *ret_list = NULL;
-	char *select_title = "Select Plugin Configuration";
 	char *tmp_title = NULL;
 
-	if (!slurm_ctl_conf_ptr)
+	if (!slurm_conf_ptr)
 		return;
 
-	slurm_make_time_str((time_t *)&slurm_ctl_conf_ptr->last_update,
-			    time_str, sizeof(time_str));
+	slurm_make_time_str((time_t *) &slurm_conf_ptr->last_update, time_str,
+			    sizeof(time_str));
 	snprintf(tmp_str, sizeof(tmp_str), "Configuration data as of %s",
 		 time_str);
 
-	ret_list = slurm_ctl_conf_2_key_pairs(slurm_ctl_conf_ptr);
+	ret_list = slurm_ctl_conf_2_key_pairs(slurm_conf_ptr);
 	_gtk_print_key_pairs(ret_list, tmp_str, 1, treestore, &iter);
 	FREE_NULL_LIST(ret_list);
 
-	_gtk_print_key_pairs(slurm_ctl_conf_ptr->acct_gather_conf,
-			     "Account Gather", 0, treestore, &iter);
+	_gtk_print_key_pairs(slurm_conf_ptr->acct_gather_conf, "Account Gather",
+			     0, treestore, &iter);
 
-	_gtk_print_key_pairs(slurm_ctl_conf_ptr->cgroup_conf,
-			     "Cgroup Support", 0, treestore, &iter);
+	_gtk_print_key_pairs(slurm_conf_ptr->cgroup_conf, "Cgroup Support", 0,
+			     treestore, &iter);
 
-	_gtk_print_key_pairs(slurm_ctl_conf_ptr->mpi_conf,
+	_gtk_print_key_pairs(slurm_conf_ptr->mpi_conf,
 			     "MPI Plugins Configuration:", 0, treestore, &iter);
 
 	xstrcat(tmp_title, "Node Features:");
-	_gtk_print_config_plugin_params_list(
-		slurm_ctl_conf_ptr->node_features_conf,
-		tmp_title, 0, treestore, &iter);
+	_gtk_print_config_plugin_params_list(slurm_conf_ptr->node_features_conf,
+					     tmp_title, 0, treestore, &iter);
 	xfree(tmp_title);
-
-	_gtk_print_key_pairs(slurm_ctl_conf_ptr->select_conf_key_pairs,
-			     select_title, 0, treestore, &iter);
 }
 
 static void _layout_conf_dbd(GtkTreeStore *treestore)
@@ -287,6 +282,7 @@ static void _layout_conf_dbd(GtkTreeStore *treestore)
 	char tmp_str[256], *user_name = NULL;
 	list_t *dbd_config_list = NULL;
 	void *db_conn = NULL;
+	slurmdbd_conf_t *slurmdbd_conf = NULL;
 
 	/* first load accounting params from slurm.conf */
 	uint16_t track_wckey = slurm_get_track_wckey();
@@ -341,7 +337,14 @@ static void _layout_conf_dbd(GtkTreeStore *treestore)
 	/* second load slurmdbd.conf params */
 	if (!(db_conn = slurmdb_connection_get(NULL)))
 		return;
-	dbd_config_list = slurmdb_config_get(db_conn);
+	if (slurmdb_config_get(db_conn, &slurmdbd_conf)) {
+		slurmdb_connection_close(&db_conn);
+		return;
+	}
+
+	dbd_config_list = slurmdb_config_get_keypairs(slurmdbd_conf);
+
+	slurmdbd_free_conf(slurmdbd_conf);
 	slurmdb_connection_close(&db_conn);
 	if (!dbd_config_list)
 		return;
@@ -370,7 +373,7 @@ extern void create_config_popup(GtkAction *action, gpointer user_data)
 		NULL);
 	GtkTreeStore *treestore =
 		_local_create_treestore_2cols(popup, 600, 400);
-	static slurm_ctl_conf_info_msg_t  *slurm_ctl_conf_ptr = NULL;
+	static slurm_conf_t *slurm_conf_ptr = NULL;
 
 	gtk_window_set_type_hint(GTK_WINDOW(popup),
 				 GDK_WINDOW_TYPE_HINT_NORMAL);
@@ -379,8 +382,8 @@ extern void create_config_popup(GtkAction *action, gpointer user_data)
 	g_signal_connect(G_OBJECT(popup), "response",
 			 G_CALLBACK(_delete_popup), NULL);
 
-	(void) get_new_info_config(&slurm_ctl_conf_ptr);
-	_layout_conf_ctl(treestore, slurm_ctl_conf_ptr);
+	(void) get_new_info_config(&slurm_conf_ptr);
+	_layout_conf_ctl(treestore, slurm_conf_ptr);
 
 	gtk_widget_show_all(popup);
 
@@ -430,7 +433,7 @@ extern void create_create_popup(GtkAction *action, gpointer user_data)
 	GtkTreeIter iter;
 	const gchar *name = gtk_action_get_name(action);
 	sview_search_info_t sview_search_info;
-	update_part_msg_t *part_msg = NULL;
+	partition_info_t *part_msg = NULL;
 	resv_desc_msg_t *resv_msg = NULL;
 	char *res_name, *temp;
 
@@ -452,7 +455,7 @@ extern void create_create_popup(GtkAction *action, gpointer user_data)
 		label = gtk_label_new(
 			"Partition creation specifications\n\n"
 			"Specify Name. All other fields are optional.");
-		part_msg = xmalloc(sizeof(update_part_msg_t));
+		part_msg = xmalloc(sizeof(*part_msg));
 		slurm_init_part_desc_msg(part_msg);
 		entry = create_part_entry(part_msg, model, &iter);
 	} else if (!xstrcmp(name, "reservation")) {

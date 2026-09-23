@@ -58,6 +58,34 @@
 #include "src/interfaces/auth.h"
 #include "src/interfaces/select.h"
 
+#define T(fmt, str) { fmt, str }
+
+static const struct {
+	log_fmt_t fmt;
+	const char *str;
+} log_fmts[] = {
+	T(LOG_FMT_ISO8601_MS, "iso8601_ms"),
+	T(LOG_FMT_ISO8601, "iso8601"),
+	T(LOG_FMT_RFC5424_MS, "rfc5424_ms"),
+	T(LOG_FMT_RFC5424_US, "rfc5424_us"),
+	T(LOG_FMT_RFC5424, "rfc5424"),
+	T(LOG_FMT_RFC3339, "rfc3339"),
+	T(LOG_FMT_CLOCK, "clock"),
+	T(LOG_FMT_SHORT, "short"),
+	T(LOG_FMT_THREAD_ID, "thread_id"),
+	T(LOG_FMT_OMIT, "omit"),
+};
+
+/* LogTimeFormat options, which may accompany any timestamp format */
+static const struct {
+	log_flags_t flag;
+	const char *str;
+} log_opts[] = {
+	T(LOG_FLAG_THREAD_ID, "thread_id"),
+};
+
+#undef T
+
 /* Local functions */
 static void _write_group_header(FILE* out, char * header);
 static void _write_key_pairs(FILE* out, void *key_pairs);
@@ -99,13 +127,13 @@ _reset_period_str(uint16_t reset_period)
 
 /*
  * slurm_write_ctl_conf - write the contents of slurm control configuration
- * IN slurm_ctl_conf_ptr - slurm control configuration pointer
+ * IN slurm_conf_ptr - slurm control configuration pointer
  * IN node_info_ptr - pointer to node table of information
  * IN part_info_ptr - pointer to partition information
  */
-void slurm_write_ctl_conf ( slurm_ctl_conf_info_msg_t * slurm_ctl_conf_ptr,
-			    node_info_msg_t * node_info_ptr,
-			    partition_info_msg_t * part_info_ptr)
+void slurm_write_ctl_conf(slurm_conf_t *slurm_conf_ptr,
+			  node_info_msg_t *node_info_ptr,
+			  partition_info_msg_t *part_info_ptr)
 {
 	int i = 0;
 	char time_str[256];
@@ -123,11 +151,11 @@ void slurm_write_ctl_conf ( slurm_ctl_conf_info_msg_t * slurm_ctl_conf_ptr,
 	} *rp = NULL;
 	struct records *crp;
 
-	if ( slurm_ctl_conf_ptr == NULL )
+	if (slurm_conf_ptr == NULL)
 		return ;
 
-	slurm_make_time_str ((time_t *)&slurm_ctl_conf_ptr->last_update,
-			     time_str, sizeof(time_str));
+	slurm_make_time_str((time_t *) &slurm_conf_ptr->last_update, time_str,
+			    sizeof(time_str));
 
 	/* open new slurm.conf.<datetime> file for write. This file will
 	 * contain the currently running slurm configuration. */
@@ -156,7 +184,7 @@ void slurm_write_ctl_conf ( slurm_ctl_conf_info_msg_t * slurm_ctl_conf_ptr,
 		"########################################################\n");
 	fprintf(fp, "#\n#\n");
 
-	ret_list = slurm_ctl_conf_2_key_pairs(slurm_ctl_conf_ptr);
+	ret_list = slurm_ctl_conf_2_key_pairs(slurm_conf_ptr);
 	if (ret_list) {
 		_write_key_pairs(fp, ret_list);
 		FREE_NULL_LIST(ret_list);
@@ -218,9 +246,9 @@ void slurm_write_ctl_conf ( slurm_ctl_conf_info_msg_t * slurm_ctl_conf_ptr,
 				   node_info_ptr->node_array[i].features);
 
 		if (node_info_ptr->node_array[i].port &&
-		    node_info_ptr->node_array[i].port
-		    != slurm_ctl_conf_ptr->slurmd_port)
-		        xstrfmtcat(tmp_str, " Port=%u",
+		    node_info_ptr->node_array[i].port !=
+			    slurm_conf_ptr->slurmd_port)
+			xstrfmtcat(tmp_str, " Port=%u",
 				   node_info_ptr->node_array[i].port);
 
 		/* check for duplicate records */
@@ -319,11 +347,21 @@ void slurm_write_ctl_conf ( slurm_ctl_conf_info_msg_t * slurm_ctl_conf_ptr,
 		if (p[i].flags & PART_FLAG_NO_ROOT)
 			fprintf(fp, " DisableRootJobs=YES");
 
-		if (p[i].flags & PART_FLAG_EXCLUSIVE_USER)
-			fprintf(fp, " ExclusiveUser=YES");
+		force = p[i].max_share & SHARED_FORCE;
+		val = p[i].max_share & (~SHARED_FORCE);
 
+		/*
+		 * Exclusive= matches slurm_sprint_partition_info (partition_info.c).
+		 * Not legacy ExclusiveUser=/ExclusiveTopo= lines.
+		 */
 		if (p[i].flags & PART_FLAG_EXCLUSIVE_TOPO)
-			fprintf(fp, " ExclusiveTopo=YES");
+			fprintf(fp, " Exclusive=TOPO");
+		else if (val == 0)
+			fprintf(fp, " Exclusive=NODE");
+		else if (p[i].flags & PART_FLAG_EXCLUSIVE_USER)
+			fprintf(fp, " Exclusive=USER");
+		else
+			fprintf(fp, " Exclusive=NO");
 
 		if (p[i].grace_time)
 			fprintf(fp, " GraceTime=%u", p[i].grace_time);
@@ -395,14 +433,12 @@ void slurm_write_ctl_conf ( slurm_ctl_conf_info_msg_t * slurm_ctl_conf_ptr,
 		if (p[i].flags & PART_FLAG_PDOI)
 			fprintf(fp, " PowerDownOnIdle=YES");
 
-		force = p[i].max_share & SHARED_FORCE;
-		val = p[i].max_share & (~SHARED_FORCE);
 		if (val == 0)
-		        fprintf(fp, " OverSubscribe=EXCLUSIVE");
-		else if (force) {
-		        fprintf(fp, " OverSubscribe=FORCE:%u", val);
-		} else if (val != 1)
-		        fprintf(fp, " OverSubscribe=YES:%u", val);
+			fprintf(fp, " OverSubscribe=NO");
+		else if (force)
+			fprintf(fp, " OverSubscribe=FORCE:%u", val);
+		else if (val != 1)
+			fprintf(fp, " OverSubscribe=YES:%u", val);
 
 		if (p[i].state_up == PARTITION_UP)
 	                fprintf(fp, " State=UP");
@@ -470,47 +506,43 @@ static void _print_config_plugin_params_list(FILE *out, list_t *l, char *title)
  * slurm_print_ctl_conf - output the contents of slurm control configuration
  *	message as loaded using slurm_load_ctl_conf()
  * IN out - file to write to
- * IN slurm_ctl_conf_ptr - slurm control configuration pointer
+ * IN slurm_conf_ptr - slurm control configuration pointer
  */
-void slurm_print_ctl_conf ( FILE* out,
-			    slurm_ctl_conf_info_msg_t * slurm_ctl_conf_ptr )
+void slurm_print_ctl_conf(FILE *out, slurm_conf_t *slurm_conf_ptr)
 {
 	char time_str[32], tmp_str[256];
 	void *ret_list = NULL;
-	char *select_title = "Select Plugin Configuration";
 	char *tmp2_str = NULL;
 
-	if (slurm_ctl_conf_ptr == NULL)
+	if (slurm_conf_ptr == NULL)
 		return;
 
-	slurm_make_time_str((time_t *)&slurm_ctl_conf_ptr->last_update,
-			     time_str, sizeof(time_str));
+	slurm_make_time_str((time_t *) &slurm_conf_ptr->last_update, time_str,
+			    sizeof(time_str));
 	snprintf(tmp_str, sizeof(tmp_str), "Configuration data as of %s\n",
 		 time_str);
 
-	ret_list = slurm_ctl_conf_2_key_pairs(slurm_ctl_conf_ptr);
+	ret_list = slurm_ctl_conf_2_key_pairs(slurm_conf_ptr);
 	if (ret_list) {
 		slurm_print_key_pairs(out, ret_list, tmp_str);
 		FREE_NULL_LIST(ret_list);
 	}
 
-	slurm_print_key_pairs(out, slurm_ctl_conf_ptr->acct_gather_conf,
+	slurm_print_key_pairs(out, slurm_conf_ptr->acct_gather_conf,
 			      "\nAccount Gather Configuration:\n");
 
-	slurm_print_key_pairs(out, slurm_ctl_conf_ptr->cgroup_conf,
+	slurm_print_key_pairs(out, slurm_conf_ptr->cgroup_conf,
 			      "\nCgroup Support Configuration:\n");
 
-	slurm_print_key_pairs(out, slurm_ctl_conf_ptr->mpi_conf,
+	slurm_print_key_pairs(out, slurm_conf_ptr->mpi_conf,
 			      "\nMPI Plugins Configuration:\n");
 
 	xstrcat(tmp2_str, "\nNode Features Configuration:");
 	_print_config_plugin_params_list(out,
-		 (list_t *) slurm_ctl_conf_ptr->node_features_conf, tmp2_str);
+					 (list_t *) slurm_conf_ptr
+						 ->node_features_conf,
+					 tmp2_str);
 	xfree(tmp2_str);
-
-	slurm_print_key_pairs(out, slurm_ctl_conf_ptr->select_conf_key_pairs,
-			      select_title);
-
 }
 
 static char *_accountingstoreflags(uint32_t conf_flags)
@@ -531,28 +563,24 @@ static char *_accountingstoreflags(uint32_t conf_flags)
 	return str;
 }
 
-static char *_logfmtstr(uint16_t log_fmt)
+static char *_logfmtstr(const log_fmt_t log_fmt, const log_flags_t log_flags)
 {
-	char *logfmtstr = NULL;
+	char *str = NULL;
 
-	if (log_fmt == LOG_FMT_ISO8601_MS)
-		logfmtstr = xstrdup("iso8601_ms");
-	else if (log_fmt == LOG_FMT_ISO8601)
-		logfmtstr = xstrdup("iso8601");
-	else if (log_fmt == LOG_FMT_RFC5424_MS)
-		logfmtstr = xstrdup("rfc5424_ms");
-	else if (log_fmt == LOG_FMT_RFC5424)
-		logfmtstr = xstrdup("rfc5424");
-	else if (log_fmt == LOG_FMT_RFC3339)
-		logfmtstr = xstrdup("rfc3339");
-	else if (log_fmt == LOG_FMT_CLOCK)
-		logfmtstr = xstrdup("clock");
-	else if (log_fmt == LOG_FMT_SHORT)
-		logfmtstr = xstrdup("short");
-	else if (log_fmt == LOG_FMT_THREAD_ID)
-		logfmtstr = xstrdup("thread_id");
+	for (int i = 0; i < ARRAY_SIZE(log_fmts); i++) {
+		if (log_fmt == log_fmts[i].fmt) {
+			str = xstrdup(log_fmts[i].str);
+			break;
+		}
+	}
 
-	return logfmtstr;
+	for (int i = 0; i < ARRAY_SIZE(log_opts); i++) {
+		if (log_flags & log_opts[i].flag)
+			xstrfmtcat(str, "%s%s", (str ? "," : ""),
+				   log_opts[i].str);
+	}
+
+	return str;
 }
 
 static void _sprint_task_plugin_params(char *str,
@@ -713,6 +741,9 @@ extern void *slurm_ctl_conf_2_key_pairs(slurm_conf_t *conf)
 		add_key_pair(ret_list, "DefMemPerNode", "%s", "UNLIMITED");
 	}
 
+	add_key_pair(ret_list, "DefRuntimePlugin", "%s",
+		     conf->def_runtime_plugin);
+
 	add_key_pair(ret_list, "DependencyParameters", "%s",
 		     conf->dependency_params);
 
@@ -777,6 +808,10 @@ extern void *slurm_ctl_conf_2_key_pairs(slurm_conf_t *conf)
 
 	add_key_pair(ret_list, "HealthCheckProgram", "%s",
 		     conf->health_check_program);
+
+	add_key_pair(ret_list, "HealthCheckTimeout", "%u sec",
+		     conf->health_check_timeout);
+
 	add_key_pair(ret_list, "HttpParserType", "%s", conf->http_parser_type);
 
 	add_key_pair(ret_list, "InactiveLimit", "%u sec",
@@ -826,9 +861,12 @@ extern void *slurm_ctl_conf_2_key_pairs(slurm_conf_t *conf)
 
 	add_key_pair(ret_list, "LaunchParameters", "%s", conf->launch_params);
 
+	add_key_pair(ret_list, "LicenseParameters", "%s", conf->license_params);
+
 	add_key_pair(ret_list, "Licenses", "%s", conf->licenses);
 
-	add_key_pair_own(ret_list, "LogTimeFormat", _logfmtstr(conf->log_fmt));
+	add_key_pair_own(ret_list, "LogTimeFormat",
+			 _logfmtstr(conf->log_fmt, conf->log_flags));
 
 	add_key_pair(ret_list, "MailDomain", "%s", conf->mail_domain);
 
@@ -869,6 +907,11 @@ extern void *slurm_ctl_conf_2_key_pairs(slurm_conf_t *conf)
 	add_key_pair(ret_list, "MCSParameters", "%s", conf->mcs_plugin_params);
 
 	add_key_pair(ret_list, "MessageTimeout", "%u sec", conf->msg_timeout);
+
+	add_key_pair(ret_list, "MetricsAuthUsers", "%s",
+		     conf->metrics_auth_users);
+
+	add_key_pair(ret_list, "MetricsParameters", "%s", conf->metrics_params);
 
 	add_key_pair(ret_list, "MetricsType", "%s", conf->metrics_type);
 
@@ -1069,6 +1112,12 @@ extern void *slurm_ctl_conf_2_key_pairs(slurm_conf_t *conf)
 			     select_type_param_string(conf->select_type_param));
 	}
 
+	add_key_pair(ret_list, "SerializerParameters", "%s",
+		     conf->serializer_params);
+
+	add_key_pair(ret_list, "SerializerPlugins", "%s",
+		     conf->serializer_plugins);
+
 	add_key_pair(ret_list, "SlurmUser", "%s(%u)",
 		     conf->slurm_user_name, conf->slurm_user_id);
 
@@ -1090,6 +1139,9 @@ extern void *slurm_ctl_conf_2_key_pairs(slurm_conf_t *conf)
 		}
 		xfree(key);
 	}
+
+	add_key_pair(ret_list, "SlurmctldHttpAuthParameters", "%s",
+		     conf->slurmctld_http_auth_params);
 
 	add_key_pair(ret_list, "SlurmctldLogFile", "%s",
 		     conf->slurmctld_logfile);
@@ -1122,6 +1174,9 @@ extern void *slurm_ctl_conf_2_key_pairs(slurm_conf_t *conf)
 	add_key_pair(ret_list, "SlurmdDebug", "%s",
 		     log_num2string(conf->slurmd_debug));
 
+	add_key_pair(ret_list, "SlurmdHttpAuthParameters", "%s",
+		     conf->slurmd_http_auth_params);
+
 	add_key_pair(ret_list, "SlurmdLogFile", "%s", conf->slurmd_logfile);
 
 	add_key_pair(ret_list, "SlurmdParameters", "%s", conf->slurmd_params);
@@ -1140,10 +1195,19 @@ extern void *slurm_ctl_conf_2_key_pairs(slurm_conf_t *conf)
 	add_key_pair(ret_list, "SlurmdUser", "%s(%u)",
 		     conf->slurmd_user_name, conf->slurmd_user_id);
 
+	add_key_pair(ret_list, "SlurmrestdHttpAuthParameters", "%s",
+		     conf->slurmrestd_http_auth_params);
+
+	add_key_pair(ret_list, "SlurmrestdParameters", "%s",
+		     conf->slurmrestd_params);
+
 	add_key_pair(ret_list, "SlurmSchedLogFile", "%s", conf->sched_logfile);
 
 	add_key_pair(ret_list, "SlurmSchedLogLevel", "%u",
 		     conf->sched_log_level);
+
+	add_key_pair(ret_list, "SlurmstepdParameters", "%s",
+		     conf->slurmstepd_params);
 
 	add_key_pair(ret_list, "SlurmctldPidFile", "%s",
 		     conf->slurmctld_pidfile);
@@ -1251,10 +1315,10 @@ extern void *slurm_ctl_conf_2_key_pairs(slurm_conf_t *conf)
  * slurm_load_ctl_conf - issue RPC to get slurm control configuration
  *	information if changed since update_time
  * IN update_time - time of current configuration data
- * IN slurm_ctl_conf_ptr - place to store slurm control configuration
+ * IN slurm_conf_ptr - place to store slurm control configuration
  *	pointer
  * RET SLURM_SUCCESS on success, otherwise return SLURM_ERROR with errno set
- * NOTE: free the response using slurm_free_ctl_conf
+ * NOTE: free the response using slurm_free_conf
  */
 int slurm_load_ctl_conf(time_t update_time, slurm_conf_t **confp)
 {
@@ -1277,7 +1341,7 @@ int slurm_load_ctl_conf(time_t update_time, slurm_conf_t **confp)
 
 	switch (resp_msg.msg_type) {
 	case RESPONSE_BUILD_INFO:
-		*confp = (slurm_ctl_conf_info_msg_t *) resp_msg.data;
+		*confp = (slurm_conf_t *) resp_msg.data;
 		break;
 	case RESPONSE_SLURM_RC:
 		rc = ((return_code_msg_t *) resp_msg.data)->return_code;

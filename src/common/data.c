@@ -33,18 +33,40 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA.
 \*****************************************************************************/
 
-#define _ISOC99_SOURCE	/* needed for lrint */
+#define _ISOC99_SOURCE /* needed for llrint */
 
 #include <ctype.h>
+#include <errno.h>
 #include <math.h>
+#include <stdlib.h>
+
+#include "slurm/slurm.h"
 
 #include "src/common/data.h"
+#include "src/common/http.h"
 #include "src/common/list.h"
 #include "src/common/log.h"
+#include "src/common/macros.h"
 #include "src/common/read_config.h"
 #include "src/common/xassert.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
+
+strong_alias(_data_set_string_own, slurm__data_set_string_own);
+strong_alias(data_dict_for_each_const, slurm_data_dict_for_each_const);
+strong_alias(data_free, slurm_data_free);
+strong_alias(data_get_string, slurm_data_get_string);
+strong_alias(data_key_get, slurm_data_key_get);
+strong_alias(data_key_set, slurm_data_key_set);
+strong_alias(data_list_for_each_const, slurm_data_list_for_each_const);
+strong_alias(data_new, slurm_data_new);
+strong_alias(data_set_bool, slurm_data_set_bool);
+strong_alias(data_set_dict, slurm_data_set_dict);
+strong_alias(data_set_float, slurm_data_set_float);
+strong_alias(data_set_int, slurm_data_set_int);
+strong_alias(data_set_list, slurm_data_set_list);
+strong_alias(data_set_null, slurm_data_set_null);
+strong_alias(data_set_string, slurm_data_set_string);
 
 #define DATA_DEFINE_DICT_PATH_BUFFER_SIZE 1024
 #define DATA_MAGIC 0x1992189F
@@ -143,7 +165,7 @@ typedef struct {
 
 typedef struct {
 	size_t count;
-	type_t match;
+	data_type_t match;
 } convert_args_t;
 
 #define CONVERT_DATA_FOREACH_LIST_DICT_ARGS_MAGIC 0x139414ab
@@ -154,10 +176,31 @@ typedef struct {
 	int64_t index;
 } convert_data_foreach_list_dict_args_t;
 
+#define PARSE_DICT_PATH_ARGS_MAGIC 0x8aa834af
+
+typedef struct {
+	int magic; /* PARSE_DICT_PATH_ARGS_MAGIC */
+	data_t *found;
+} dict_path_args_t;
+
+#define PARSE_DICT_PATH_CONST_ARGS_MAGIC 0x802834af
+
+typedef struct {
+	int magic; /* PARSE_DICT_PATH_CONST_ARGS_MAGIC  */
+	const data_t *found;
+} dict_path_const_args_t;
+
+#define DEFINE_DICT_PATH_ARGS_MAGIC 0x02bbafff
+
+typedef struct {
+	int magic; /* DEFINE_DICT_PATH_ARGS_MAGIC */
+	data_t *found;
+} dict_path_define_args_t;
+
 static void _check_magic(const data_t *data);
 static void _release(data_t *data);
 static void _release_data_list_node(data_list_t *dl, data_list_node_t *dn);
-static size_t _convert_tree(data_t *data, const type_t match);
+static size_t _convert_tree(data_t *data, const data_type_t match);
 static char *_type_to_string(type_t type);
 
 static data_list_t *_data_list_new(void)
@@ -478,6 +521,7 @@ extern data_t *data_set_float(data_t *data, double value)
 	if (!data)
 		return NULL;
 
+	_release(data);
 	data->type = TYPE_FLOAT;
 	data->data.float_u = value;
 
@@ -1463,25 +1507,24 @@ static void _convert_data_string(data_t *data)
 {
 	_check_magic(data);
 
-	switch (data->type) {
-	case TYPE_STRING_INLINE:
-	case TYPE_STRING_PTR:
+	switch (data_get_type(data)) {
+	case DATA_TYPE_STRING:
 		break;
-	case TYPE_BOOL:
-		data_set_string(data, (data->data.bool_u ? "true" : "false"));
+	case DATA_TYPE_BOOL:
+		data_set_string(data, (data_get_bool(data) ? "true" : "false"));
 		break;
-	case TYPE_NULL:
+	case DATA_TYPE_NULL:
 		data_set_string(data, "");
 		break;
-	case TYPE_FLOAT:
+	case DATA_TYPE_FLOAT:
 	{
-		char *str = xstrdup_printf("%lf", data->data.float_u);
+		char *str = xstrdup_printf("%lf", data_get_float(data));
 		data_set_string_own(data, str);
 		break;
 	}
-	case TYPE_INT_64:
+	case DATA_TYPE_INT_64:
 	{
-		char *str = xstrdup_printf("%"PRId64, data->data.int_u);
+		char *str = xstrdup_printf("%"PRId64, data_get_int(data));
 		data_set_string_own(data, str);
 		break;
 	}
@@ -1497,22 +1540,21 @@ static void _convert_data_force_bool(data_t *data)
 	/* attempt to detect the type first */
 	(void) data_convert_type(data, DATA_TYPE_NONE);
 
-	switch (data->type) {
-	case TYPE_STRING_INLINE:
-	case TYPE_STRING_PTR:
+	switch (data_get_type(data)) {
+	case DATA_TYPE_STRING:
 		/* non-empty string but not recognized format */
 		data_set_bool(data, true);
 		break;
-	case TYPE_BOOL:
+	case DATA_TYPE_BOOL:
 		break;
-	case TYPE_NULL:
+	case DATA_TYPE_NULL:
 		data_set_bool(data, false);
 		break;
-	case TYPE_FLOAT:
-		data_set_bool(data, data->data.float_u != 0);
+	case DATA_TYPE_FLOAT:
+		data_set_bool(data, data_get_float(data) != 0);
 		break;
-	case TYPE_INT_64:
-		data_set_bool(data, data->data.int_u != 0);
+	case DATA_TYPE_INT_64:
+		data_set_bool(data, data_get_int(data) != 0);
 		break;
 	default:
 		break;
@@ -1523,9 +1565,8 @@ static int _convert_data_null(data_t *data)
 {
 	_check_magic(data);
 
-	switch (data->type) {
-	case TYPE_STRING_INLINE:
-	case TYPE_STRING_PTR:
+	switch (data_get_type(data)) {
+	case DATA_TYPE_STRING:
 	{
 		const char *str = data_get_string(data);
 
@@ -1540,7 +1581,7 @@ static int _convert_data_null(data_t *data)
 
 		goto fail;
 	}
-	case TYPE_NULL:
+	case DATA_TYPE_NULL:
 		return SLURM_SUCCESS;
 	default:
 		return ESLURM_DATA_CONV_FAILED;
@@ -1560,9 +1601,8 @@ static int _convert_data_bool(data_t *data)
 
 	_check_magic(data);
 
-	switch (data->type) {
-	case TYPE_STRING_INLINE:
-	case TYPE_STRING_PTR:
+	switch (data_get_type(data)) {
+	case DATA_TYPE_STRING:
 	{
 		str = data_get_string(data);
 
@@ -1615,7 +1655,7 @@ static int _convert_data_bool(data_t *data)
 
 		goto fail;
 	}
-	case TYPE_BOOL:
+	case DATA_TYPE_BOOL:
 		return SLURM_SUCCESS;
 	default:
 		goto fail;
@@ -1642,12 +1682,11 @@ static int _convert_data_int(data_t *data, bool force)
 {
 	_check_magic(data);
 
-	switch (data->type) {
-	case TYPE_STRING_INLINE:
-	case TYPE_STRING_PTR:
+	switch (data_get_type(data)) {
+	case DATA_TYPE_STRING:
 	{
-		int64_t x;
-		char end;
+		int64_t x = -1;
+		char *end_ptr = NULL;
 		const char *str = data_get_string(data);
 
 		if (!str[0]) {
@@ -1658,22 +1697,41 @@ static int _convert_data_int(data_t *data, bool force)
 		}
 
 		if ((str[0] == '0') && (tolower(str[1]) == 'x')) {
-			if (sscanf(str, "%"SCNx64"%c", &x, &end) == 1) {
+			uint64_t u = INFINITE64;
+
+			errno = 0;
+			u = strtoull(str, &end_ptr, 16);
+
+			if (errno) {
 				log_flag_hex(DATA, str, strlen(str),
-					     "%s: converted hex number %pD->%"PRId64,
-					 __func__, data, x);
-				data_set_int(data, x);
-				return SLURM_SUCCESS;
+					     "%s: conversion of hex string %pD to integer failed: %m",
+					     __func__, data);
+				return errno;
 			}
 
+			if ((end_ptr == str) || end_ptr[0]) {
+				log_flag_hex(DATA, str, strlen(str),
+					     "%s: conversion of hex string %pD to integer did not parse entire string",
+					     __func__, data);
+				return ESLURM_DATA_CONV_FAILED;
+			}
+
+			x = (int64_t) u;
 			log_flag_hex(DATA, str, strlen(str),
-				     "%s: conversion of hex string %pD to integer failed",
-				     __func__, data);
-			return ESLURM_DATA_CONV_FAILED;
+				     "%s: converted hex number %pD->%"PRId64,
+				     __func__, data, x);
+			data_set_int(data, x);
+			return SLURM_SUCCESS;
 		}
 
 		if (!force) {
-			for (const char *p = str; *p; p++) {
+			const char *p = str;
+
+			/* Allow explicitly positive and negative integers */
+			if ((p[0] == '-') || (p[0] == '+'))
+				p++;
+
+			for (; *p; p++) {
 				if ((*p < '0') || (*p > '9')) {
 					log_flag_hex(DATA, str, strlen(str),
 						     "%s: rejecting non-numeric conversion of %pD to integer failed",
@@ -1683,28 +1741,46 @@ static int _convert_data_int(data_t *data, bool force)
 			}
 		}
 
-		if (sscanf(str, "%"SCNd64"%c", &x, &end) == 1) {
-			log_flag_hex(DATA, str, strlen(str),
-				     "%s: converted %pD->%"PRId64,
-				     __func__, data, x);
-			data_set_int(data, x);
-			return SLURM_SUCCESS;
-		} else {
+		errno = 0;
+		x = strtoll(str, &end_ptr, 10);
+
+		if (errno || (end_ptr == str) || end_ptr[0]) {
 			log_flag_hex(DATA, str, strlen(str),
 				     "%s: conversion of %pD to integer failed",
 				     __func__, data);
 			return ESLURM_DATA_CONV_FAILED;
 		}
+
+		log_flag_hex(DATA, str, strlen(str),
+			     "%s: converted %pD->%"PRId64,
+			     __func__, data, x);
+		data_set_int(data, x);
+		return SLURM_SUCCESS;
 	}
-	case TYPE_FLOAT:
+	case DATA_TYPE_FLOAT:
 		if (force) {
-			data_set_int(data, lrint(data_get_float(data)));
+			const double f = data_get_float(data);
+
+			/*
+			 * llrint() is undefined for a value outside of the
+			 * range of its return type and returns INT64_MIN on
+			 * glibc. Refuse the conversion instead of storing a
+			 * different number than was given.
+			 */
+			if (!isfinite(f) || isless(f, (double) INT64_MIN) ||
+			    isgreater(f, nextafter((double) INT64_MAX, 0.0))) {
+				log_flag(DATA, "%s: conversion of %pD to integer failed",
+					 __func__, data);
+				return ESLURM_DATA_CONV_FAILED;
+			}
+
+			(void) data_set_int(data, llrint(f));
 			return SLURM_SUCCESS;
 		}
 		return ESLURM_DATA_CONV_FAILED;
-	case TYPE_INT_64:
+	case DATA_TYPE_INT_64:
 		return SLURM_SUCCESS;
-	case TYPE_NULL:
+	case DATA_TYPE_NULL:
 		if (force) {
 			/*
 			 * Conversion from NULL to integer is a loss of
@@ -1782,8 +1858,8 @@ static int _convert_data_float_from_string(data_t *data)
 	goto fail;
 
 converted:
-	log_flag(DATA, "%s: converted %pD to float: %s->%lf",
-		 __func__, data, str, data_get_float(data));
+	log_flag(DATA, "%s: converted %pD to float: %lf",
+		 __func__, data, data_get_float(data));
 	return SLURM_SUCCESS;
 
 fail:
@@ -1796,11 +1872,10 @@ static int _convert_data_float(data_t *data)
 {
 	_check_magic(data);
 
-	switch (data->type) {
-	case TYPE_STRING_INLINE:
-	case TYPE_STRING_PTR:
+	switch (data_get_type(data)) {
+	case DATA_TYPE_STRING:
 		return _convert_data_float_from_string(data);
-	case TYPE_INT_64:
+	case DATA_TYPE_INT_64:
 		if (data_get_int(data) == INFINITE64)
 			data_set_float(data, HUGE_VAL);
 		else if (data_get_int(data) == NO_VAL64)
@@ -1808,7 +1883,7 @@ static int _convert_data_float(data_t *data)
 		else /* attempt normal fp conversion */
 			data_set_float(data, data_get_int(data));
 		return SLURM_SUCCESS;
-	case TYPE_FLOAT:
+	case DATA_TYPE_FLOAT:
 		return SLURM_SUCCESS;
 	default:
 		return ESLURM_DATA_CONV_FAILED;
@@ -1910,18 +1985,18 @@ extern data_type_t data_convert_type(data_t *data, data_type_t match)
 
 		break;
 	case DATA_TYPE_DICT:
-		if (data->type == TYPE_DICT)
+		if (data_get_type(data) == DATA_TYPE_DICT)
 			return DATA_TYPE_DICT;
-		else if ((data->type == TYPE_LIST) &&
+		else if ((data_get_type(data) == DATA_TYPE_LIST) &&
 			 !_convert_data_list_dict(data))
 			return DATA_TYPE_DICT;
 
 		/* data_parser should be used for this conversion instead. */
 		break;
 	case DATA_TYPE_LIST:
-		if (data->type == TYPE_LIST)
+		if (data_get_type(data) == DATA_TYPE_LIST)
 			return DATA_TYPE_LIST;
-		else if ((data->type == TYPE_DICT) &&
+		else if ((data_get_type(data) == DATA_TYPE_DICT) &&
 			 !_convert_data_dict_list(data))
 			return DATA_TYPE_LIST;
 
@@ -1955,7 +2030,7 @@ static data_for_each_cmd_t _convert_dict_entry(const char *key, data_t *data,
 	return DATA_FOR_EACH_CONT;
 }
 
-static size_t _convert_tree(data_t *data, const type_t match)
+static size_t _convert_tree(data_t *data, const data_type_t match)
 {
 	convert_args_t args = {
 		.match = match,
@@ -1965,15 +2040,15 @@ static size_t _convert_tree(data_t *data, const type_t match)
 	if (!data)
 		return 0;
 
-	switch (data->type) {
-	case TYPE_DICT:
+	switch (data_get_type(data)) {
+	case DATA_TYPE_DICT:
 		(void)data_dict_for_each(data, _convert_dict_entry, &args);
 		break;
-	case TYPE_LIST:
+	case DATA_TYPE_LIST:
 		(void)data_list_for_each(data, _convert_list_entry, &args);
 		break;
 	default:
-		if (match == (int) data_convert_type(data, (int) match))
+		if (match == data_convert_type(data, match))
 			args.count++;
 		break;
 	}
@@ -1983,7 +2058,7 @@ static size_t _convert_tree(data_t *data, const type_t match)
 
 extern size_t data_convert_tree(data_t *data, const data_type_t match)
 {
-	return _convert_tree(data, (int) match);
+	return _convert_tree(data, match);
 }
 
 static data_for_each_cmd_t _find_dict_match(const char *key, const data_t *a,
@@ -2135,27 +2210,28 @@ extern bool data_check_match(const data_t *a, const data_t *b, bool mask)
 			 data_get_int(b));
 		return rc;
 	case TYPE_FLOAT:
-		if (!(rc = (data_get_float(a) == data_get_float(b))) ||
-		    !(rc = fuzzy_equal(data_get_float(a), data_get_float(b)))) {
-			if (isnan(data_get_float(a)) ==
-			    isnan(data_get_float(a)))
-				rc = true;
-			else if (signbit(data_get_float(a)) !=
-				 signbit(data_get_float(b)))
-				rc = false;
-			else if (isinf(data_get_float(a)) !=
-				 isinf(data_get_float(b)))
-				rc = false;
-			else
-				rc = false;
-		}
+	{
+		const double x = data_get_float(a), y = data_get_float(b);
+
+		/*
+		 * NaN never compares equal to itself, so it has to be matched
+		 * explicitly. Infinities only match when they share a sign.
+		 * Everything else matches exactly or within tolerance.
+		 */
+		if (isnan(x) || isnan(y))
+			rc = (isnan(x) && isnan(y));
+		else if (isinf(x) || isinf(y))
+			rc = (isinf(x) && isinf(y) &&
+			      (signbit(x) == signbit(y)));
+		else
+			rc = ((x == y) || fuzzy_equal(x, y));
 
 		log_flag(DATA, "compare: %s(0x%"PRIXPTR")=%e %s %s(0x%"PRIXPTR")=%e",
-			 _type_to_string(a->type), (uintptr_t) a,
-			 data_get_float(a), (rc ? "=" : "!="),
-			 _type_to_string(b->type), (uintptr_t) b,
-			 data_get_float(b));
+			 _type_to_string(a->type), (uintptr_t) a, x,
+			 (rc ? "=" : "!="),
+			 _type_to_string(b->type), (uintptr_t) b, y);
 		return rc;
+	}
 	case TYPE_DICT:
 		rc = _data_match_dict(a, b, mask);
 		log_flag(DATA, "compare dictionary: %s(0x%"PRIXPTR")[%zd] %s %s(0x%"PRIXPTR")[%zd]",
@@ -2183,149 +2259,136 @@ extern bool data_check_match(const data_t *a, const data_t *b, bool mask)
 	fatal_abort("%s: should never run", __func__);
 }
 
+static int _on_dict_path(const char *entry, bool template, void *arg)
+{
+	dict_path_args_t *args = arg;
+	data_t *src = args->found;
+
+	_check_magic(src);
+	xassert(args->magic == PARSE_DICT_PATH_ARGS_MAGIC);
+	xassert(!template);
+
+	if (args->found->type != TYPE_DICT)
+		return EINVAL;
+
+	if (!(args->found = data_key_get(src, entry)))
+		return EINVAL;
+
+	return SLURM_SUCCESS;
+}
+
 extern data_t *data_resolve_dict_path(data_t *data, const char *path)
 {
-	data_t *found = data;
-	char *save_ptr = NULL;
-	char *token = NULL;
-	char *str;
-	char local[DATA_DEFINE_DICT_PATH_BUFFER_SIZE];
-	size_t len = strlen(path);
+	dict_path_args_t args = {
+		.magic = PARSE_DICT_PATH_ARGS_MAGIC,
+		.found = data,
+	};
 
 	_check_magic(data);
 
-	if (!data)
+	if (!data || (data->type != TYPE_DICT))
 		return NULL;
 
-	if (len < sizeof(local))
-		str = memcpy(local, path, (len + 1));
-	else
-		str = xstrdup(path);
-
-	token = strtok_r(str, "/", &save_ptr);
-	while (token && found) {
-		/* walk forward any whitespace */
-		while (*token && isspace(*token))
-			token++;
-
-		/* zero any ending whitespace */
-		for (int i = strlen(token) - 1; i >= 0; i--) {
-			if (isspace(token[i]))
-				token[i] = '\0';
-			else
-				break;
-		}
-
-		if (!found || (found->type != TYPE_DICT)) {
-			found = NULL;
-			break;
-		}
-
-		if (!(found = data_key_get(found, token)))
-			break;
-
-		token = strtok_r(NULL, "/", &save_ptr);
-	}
-
-	if (str != local)
-		xfree(str);
-
-	if (found)
+	if (!url_path_walk(path, false, _on_dict_path, &args)) {
 		log_flag_hex(DATA, path, strlen(path),
 			     "%s: %pD resolved dictionary path to %pD",
-			     __func__, data, found);
-	else
+			     __func__, data, args.found);
+		return args.found;
+	} else {
 		log_flag_hex(DATA, path, strlen(path),
 			     "%s: %pD failed to resolve dictionary path",
 			     __func__, data);
-	return found;
+		return NULL;
+	}
+}
+
+static int _on_dict_path_const(const char *entry, bool template, void *arg)
+{
+	dict_path_const_args_t *args = arg;
+	const data_t *src = args->found;
+
+	_check_magic(src);
+	xassert(args->magic == PARSE_DICT_PATH_CONST_ARGS_MAGIC);
+	xassert(!template);
+
+	if (args->found->type != TYPE_DICT)
+		return EINVAL;
+
+	if (!(args->found = data_key_get_const(src, entry)))
+		return EINVAL;
+
+	return SLURM_SUCCESS;
 }
 
 extern const data_t *data_resolve_dict_path_const(const data_t *data,
 						  const char *path)
 {
-	const data_t *found = data;
-	char *save_ptr = NULL;
-	char *token = NULL;
-	char *str;
+	dict_path_const_args_t args = {
+		.magic = PARSE_DICT_PATH_CONST_ARGS_MAGIC,
+		.found = data,
+	};
 
 	_check_magic(data);
 
-	if (!data)
+	if (!data || (data->type != TYPE_DICT))
 		return NULL;
 
-	str = xstrdup(path);
-
-	token = strtok_r(str, "/", &save_ptr);
-	while (token && found) {
-		xstrtrim(token);
-
-		if (!found || (found->type != TYPE_DICT)) {
-			found = NULL;
-			break;
-		}
-
-		if (!(found = data_key_get_const(found, token)))
-			break;
-
-		token = strtok_r(NULL, "/", &save_ptr);
-	}
-	xfree(str);
-
-	if (found)
+	if (!url_path_walk(path, false, _on_dict_path_const, &args)) {
 		log_flag_hex(DATA, path, strlen(path),
-			     "%s: data %pD resolved dictionary path to %pD",
-			     __func__, data, found);
-	else
+			     "%s: %pD resolved dictionary path to %pD",
+			     __func__, data, args.found);
+		return args.found;
+	} else {
 		log_flag_hex(DATA, path, strlen(path),
-			     "%s: data %pD failed to resolve dictionary path",
+			     "%s: %pD failed to resolve dictionary path",
 			     __func__, data);
+		return NULL;
+	}
+}
 
-	return found;
+static int _on_dict_path_define(const char *entry, bool template, void *arg)
+{
+	dict_path_define_args_t *args = arg;
+	data_t *src = args->found;
+
+	_check_magic(src);
+	xassert(args->magic == PARSE_DICT_PATH_ARGS_MAGIC);
+	xassert(!template);
+
+	if (args->found->type == TYPE_NULL)
+		data_set_dict(src);
+	else if (args->found->type != TYPE_DICT)
+		return EINVAL;
+
+	if (!(args->found = data_key_set(src, entry)))
+		return EINVAL;
+
+	return SLURM_SUCCESS;
 }
 
 extern data_t *data_define_dict_path(data_t *data, const char *path)
 {
-	data_t *found = data;
-	char *save_ptr = NULL;
-	char *token = NULL;
-	char *str;
+	dict_path_define_args_t args = {
+		.magic = PARSE_DICT_PATH_ARGS_MAGIC,
+		.found = data,
+	};
 
 	_check_magic(data);
 
 	if (!data)
 		return NULL;
 
-	str = xstrdup(path);
-
-	token = strtok_r(str, "/", &save_ptr);
-	while (token && found) {
-		xstrtrim(token);
-
-		if (found->type == TYPE_NULL)
-			data_set_dict(found);
-		else if (found->type != TYPE_DICT) {
-			found = NULL;
-			break;
-		}
-
-		if (!(found = data_key_set(found, token)))
-			break;
-
-		token = strtok_r(NULL, "/", &save_ptr);
-	}
-	xfree(str);
-
-	if (found)
+	if (!url_path_walk(path, false, _on_dict_path_define, &args)) {
 		log_flag_hex(DATA, path, strlen(path),
 			     "%s: %pD defined dictionary path to %pD",
-			     __func__, data, found);
-	else
+			     __func__, data, args.found);
+		return args.found;
+	} else {
 		log_flag_hex(DATA, path, strlen(path),
 			     "%s: %pD failed to define dictionary path",
 			     __func__, data);
-
-	return found;
+		return NULL;
+	}
 }
 
 extern data_t *data_copy(data_t *dest, const data_t *src)
@@ -2390,16 +2453,20 @@ extern data_t *data_copy(data_t *dest, const data_t *src)
 
 extern data_t *data_move(data_t *dest, data_t *src)
 {
-	if (!src)
-		return NULL;
-
-	if (!dest)
-		dest = data_new();
-
+	xassert(src);
+	xassert(dest != src);
 	_check_magic(src);
-	_check_magic(dest);
 
-	log_flag(DATA, "%s: move data %pD to %pD", __func__, src, dest);
+	if (!dest) {
+		dest = data_new();
+		log_flag(DATA, "%s: move data %pD to new %pD",
+			 __func__, src, dest);
+	} else {
+		_check_magic(dest);
+		log_flag(DATA, "%s: move data %pD to existing %pD",
+			 __func__, src, dest);
+		_release(dest);
+	}
 
 	memmove(&dest->data, &src->data, sizeof(src->data));
 	dest->type = src->type;

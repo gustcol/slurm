@@ -40,9 +40,12 @@
 #include <stdint.h>
 
 #include "src/common/http.h"
+#include "src/common/http_con.h"
 #include "src/common/list.h"
 
 #include "src/conmgr/conmgr.h"
+
+#include "src/slurmrestd/openapi.h"
 
 /* Opaque structs */
 typedef struct http_context_s http_context_t;
@@ -65,7 +68,7 @@ typedef struct on_http_request_args_s {
 	const char *path; /* requested URL path (may be NULL) */
 	const char *query; /* requested URL query (may be NULL) */
 	http_context_t *context; /* calling context (do not xfree) */
-	conmgr_fd_ref_t *con; /* reference to connection */
+	http_con_t *hcon; /* HTTP connection */
 	const char *name; /* connection name */
 	uint16_t http_major; /* HTTP major version */
 	uint16_t http_minor; /* HTTP minor version */
@@ -74,6 +77,7 @@ typedef struct on_http_request_args_s {
 	const char *body; /* body sent by client or NULL (do not xfree) */
 	const size_t body_length; /* bytes in body to send or 0 */
 	const char *body_encoding; /* body encoding type or NULL */
+	bool rejected; /* an error response has already been sent */
 } on_http_request_args_t;
 
 /*
@@ -84,16 +88,38 @@ typedef struct on_http_request_args_s {
  */
 typedef http_context_t *(*on_http_connection_t)(int fd);
 
+/*
+ * Sentinel passed as the connection arg to conmgr_process_fd() /
+ * conmgr_create_listen_sockets() alongside http_events_get(). The on_connection
+ * callback xassert()s it to confirm conmgr delivers the arg unchanged.
+ */
+#define HTTP_CONNECTION_ARG_MAGIC ((void *) (uintptr_t) 0x636f6e6e)
+
 /* Get http events for conmgr connections */
 const conmgr_events_t *http_events_get(void);
 
+/*
+ * Return the latest non-success status_code captured from an HTTP conmgr
+ * connection's on_close callback. Used by inet mode to propagate a
+ * connection error up to the slurmrestd exit code. SLURM_SUCCESS if no
+ * error.
+ */
+extern slurm_err_t http_events_get_last_status_code(void);
+
+/* Initialize the HTTP router and bind slurmrestd's directly-served paths */
+extern void http_init(void);
+
+/* Tear down the HTTP router */
+extern void http_fini(void);
+
 typedef struct {
-	conmgr_fd_t *con; /* assigned connection */
+	http_con_t *hcon; /* HTTP connection */
 	uint16_t http_major; /* HTTP major version */
 	uint16_t http_minor; /* HTTP minor version */
 	http_status_code_t status_code; /* HTTP status code to send */
 	/* list of http_header_entry_t to send (can be empty) */
 	list_t *headers; /* list_t of http_header_t* from client */
+	bool close_header; /* send "Connection: Close" and close after */
 	const char *body; /* body to send or NULL */
 	size_t body_length; /* bytes in body to send or 0 */
 	const char *body_encoding; /* body encoding type or NULL */

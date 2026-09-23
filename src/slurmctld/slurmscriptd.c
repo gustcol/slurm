@@ -55,12 +55,14 @@
 #include "src/common/fetch_config.h"
 #include "src/common/log.h"
 #include "src/common/msg_type.h"
+#include "src/common/power_action.h"
 #include "src/common/probes.h"
 #include "src/common/run_command.h"
 #include "src/common/setproctitle.h"
 #include "src/common/slurm_protocol_pack.h"
 #include "src/common/threadpool.h"
 #include "src/common/track_script.h"
+#include "src/common/workerpool.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
 
@@ -151,7 +153,7 @@ static bool powersave_wait_called = false;
 /* Function definitions: */
 
 /* Fetch key from xhash_t item. Called from function ptr */
-static void _resp_map_key_id(void *item, const char **key, uint32_t *key_len)
+static void _resp_map_key_id(void *item, const void **key, uint32_t *key_len)
 {
 	script_response_t *lua_resp = (script_response_t *)item;
 
@@ -225,7 +227,7 @@ static void _wait_for_script_resp(script_response_t *script_resp,
 		*track_script_signalled = script_resp->track_script_signalled;
 }
 
-static void _wait_for_powersave_scripts()
+static void _wait_for_powersave_scripts(void)
 {
 	int cnt = 0;
 	struct timespec ts = {0, 0};
@@ -528,6 +530,7 @@ static void _send_bb_script_msg(int write_fd, void *cb_arg)
 		.job_id = script_msg->job_id,
 		.slurmctld_debug = slurm_conf.slurmctld_debug,
 		.slurmctld_logfile = slurm_conf.slurmctld_logfile,
+		.log_flags = slurm_conf.log_flags,
 		.log_fmt = slurm_conf.log_fmt,
 		.plugindir = slurm_conf.plugindir,
 		.slurm_user_name = slurm_conf.slurm_user_name,
@@ -1188,7 +1191,8 @@ static void _init_slurmscriptd_conmgr(void)
 	if (slurm_conf.slurmctld_params)
 		conmgr_set_params(slurm_conf.slurmctld_params);
 
-	conmgr_init(0, 0, 0);
+	workerpool_init(0, 0, NULL);
+	conmgr_init(0);
 
 	/*
 	 * Ignore signals. slurmscriptd should only handle requests directly
@@ -1221,6 +1225,8 @@ extern void slurmscriptd_run_slurmscriptd(int argc, char **argv,
 	slurmscriptd_readfd = SLURMSCRIPT_READ_FD;
 
 	_change_proc_name(argc, argv, "slurmscriptd");
+
+	probe_init();
 
 	/* Test communications with slurmctld. */
 	ack = SLURM_SUCCESS;
@@ -1268,6 +1274,9 @@ extern void slurmscriptd_run_slurmscriptd(int argc, char **argv,
 #ifdef MEMORY_LEAK_DEBUG
 	track_script_fini();
 	slurm_mutex_destroy(&powersave_script_count_mutex);
+	probe_fini();
+	conmgr_fini();
+	workerpool_fini();
 #endif
 
 	/* We never want to return from here, only exit. */
@@ -1422,6 +1431,7 @@ static void _init_bb_script_config(char **function, uint32_t *job_id,
 	slurm_conf.cluster_name = bb_msg->cluster_name;
 	slurm_conf.slurmctld_debug = bb_msg->slurmctld_debug;
 	slurm_conf.slurmctld_logfile = bb_msg->slurmctld_logfile;
+	slurm_conf.log_flags = bb_msg->log_flags;
 	slurm_conf.log_fmt = bb_msg->log_fmt;
 	slurm_conf.plugindir = bb_msg->plugindir;
 	slurm_conf.slurm_user_name = bb_msg->slurm_user_name;
@@ -1553,21 +1563,45 @@ extern int slurmscriptd_run_mail(char *script_path, uint32_t argc, char **argv,
 	return status;
 }
 
-extern void slurmscriptd_run_power(char *script_path, char *hosts,
-				   char *features, uint32_t job_id,
-				   char *script_name, uint32_t timeout,
-				   char *tmp_file_env_name, char *tmp_file_str)
+extern void slurmscriptd_run_power_action(power_action_t *action, char *hosts,
+					  char *features, uint32_t job_id,
+					  uint32_t timeout,
+					  char *tmp_file_env_name,
+					  char *tmp_file_str)
 {
 	run_script_msg_t *run_script_msg;
-	slurmscriptd_msg_t *send_args = xmalloc(sizeof(*send_args));
+	slurmscriptd_msg_t *send_args;
 	int argc;
+	int i = 0;
+	char **argv1 = NULL;
 	char **env, **argv;
+	char *exec_name = NULL;
+	char *script_path = NULL;
+	char *script_name = NULL;
 
-	argc = 3;
+	if (!action) {
+		error("%s: NULL PowerAction", __func__);
+		return;
+	}
+	script_path = action->program;
+	script_name = action->name;
+	send_args = xmalloc(sizeof(*send_args));
+
+	argc = action->argc + 2;
+	if (features)
+		argc += 1;
 	argv = xcalloc(argc + 1, sizeof(char*)); /* Null terminated */
-	argv[0] = xstrdup(script_path);
-	argv[1] = xstrdup(hosts);
-	argv[2] = xstrdup(features);
+	/* first arg is executable name */
+	exec_name = strrchr(action->program, '/');
+	argv[0] = xstrdup(exec_name ? exec_name + 1 : action->program);
+	argv1 = argv + 1;
+	for (i = 0; i < action->argc; i++) {
+		argv1[i] = xstrdup(action->argv[i]);
+	}
+	argv1[i++] = xstrdup(hosts);
+	if (features)
+		argv1[i] = features;
+	argv[argc] = NULL;
 
 	env = env_array_create();
 	env_array_append(&env, "SLURM_CONF", slurm_conf.slurm_conf);
@@ -1661,29 +1695,6 @@ extern void slurmscriptd_run_prepilog(uint32_t job_id, bool is_epilog,
 	send_args->msg_type = SLURMSCRIPTD_REQUEST_RUN_SCRIPT;
 	slurm_thread_create_detached(NULL, _async_send_to_slurmscriptd,
 				     send_args);
-}
-
-extern int slurmscriptd_run_reboot(char *script_path, uint32_t argc,
-				   char **argv)
-{
-	int status;
-
-	run_script_msg_t run_script_msg;
-
-	memset(&run_script_msg, 0, sizeof(run_script_msg));
-
-	/* Init run_script_msg */
-	run_script_msg.argc = argc;
-	run_script_msg.argv = argv;
-	run_script_msg.script_name = "RebootProgram";
-	run_script_msg.script_path = script_path;
-	run_script_msg.script_type = SLURMSCRIPTD_REBOOT;
-
-	/* Send message; wait for response */
-	status = _send_to_slurmscriptd(SLURMSCRIPTD_REQUEST_RUN_SCRIPT,
-				       &run_script_msg, true, NULL, NULL);
-
-	return status;
 }
 
 extern void slurmscriptd_run_resv(char *script_path, uint32_t argc, char **argv,

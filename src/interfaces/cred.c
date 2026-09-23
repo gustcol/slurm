@@ -80,7 +80,9 @@ typedef struct {
 	sbcast_cred_t *(*sbcast_create)	(sbcast_cred_arg_t *cred,
 					 uint16_t protocol_version);
 	sbcast_cred_t *(*sbcast_unpack)	(buf_t *buffer, bool verify,
+					 bool replay_okay,
 					 uint16_t protocol_version);
+	char *(*cred_get_signature_key)(char *signature);
 } slurm_cred_ops_t;
 
 /*
@@ -94,6 +96,7 @@ static const char *syms[] = {
 	"cred_p_extract_net_cred",
 	"sbcast_p_create",
 	"sbcast_p_unpack",
+	"cred_p_get_signature_key",
 };
 
 static slurm_cred_ops_t ops;
@@ -271,8 +274,10 @@ extern void slurm_cred_free_args(slurm_cred_arg_t *arg)
 	xfree(arg->job_alias_list);
 	xfree(arg->job_comment);
 	xfree(arg->job_constraints);
+	xfree(arg->job_extra);
 	xfree(arg->job_licenses);
 	xfree(arg->job_hostlist);
+	xfree(arg->job_het_stepmgr_host);
 	xfree(arg->sock_core_rep_count);
 	xfree(arg->sockets_per_node);
 	xfree(arg->job_mem_alloc);
@@ -281,6 +286,7 @@ extern void slurm_cred_free_args(slurm_cred_arg_t *arg)
 	xfree(arg->job_partition);
 	xfree(arg->job_qos);
 	xfree(arg->job_reservation);
+	xfree(arg->job_selinux_context);
 	xfree(arg->job_std_err);
 	xfree(arg->job_std_in);
 	xfree(arg->job_std_out);
@@ -414,6 +420,20 @@ extern char *slurm_cred_get_signature(slurm_cred_t *cred)
 	slurm_rwlock_unlock(&cred->mutex);
 
 	return sig;
+}
+
+extern char *slurm_cred_get_signature_key(slurm_cred_t *cred)
+{
+	char *key = NULL;
+
+	xassert(cred);
+
+	slurm_rwlock_rdlock(&cred->mutex);
+	if (cred->signature)
+		key = (*(ops.cred_get_signature_key))(cred->signature);
+	slurm_rwlock_unlock(&cred->mutex);
+
+	return key;
 }
 
 extern void slurm_cred_get_mem(slurm_cred_t *credential, char *node_name,
@@ -723,12 +743,20 @@ extern sbcast_cred_t *unpack_sbcast_cred(buf_t *buffer, void *msg,
 					 uint16_t protocol_version)
 {
 	file_bcast_msg_t *bmsg = msg;
-	bool verify = false;
+	bool verify = false, replay_okay = false;
 
-	if (bmsg && (bmsg->block_no == 1) && !(bmsg->flags & FILE_BCAST_SO))
+	if (bmsg && (bmsg->block_no == 1)) {
 		verify = true;
+		/*
+		 * One credential covers the executable and every shared
+		 * object sent after it, so munged only sees it a second
+		 * time on the shared object transfers.
+		 */
+		replay_okay = (bmsg->flags & FILE_BCAST_SO);
+	}
 
-	return (*(ops.sbcast_unpack))(buffer, verify, protocol_version);
+	return (*(ops.sbcast_unpack))(buffer, verify, replay_okay,
+				      protocol_version);
 }
 
 extern void print_sbcast_cred(sbcast_cred_t *sbcast_cred)
@@ -786,11 +814,19 @@ extern void setup_cred_arg(slurm_cred_arg_t *cred_arg, job_record_t *job_ptr)
 	cred_arg->job_start_time = job_ptr->start_time;
 	cred_arg->uid = job_ptr->user_id;
 
+	/*
+	 * These helpers handle job_ptr->details == NULL internally and fall
+	 * through to the partition flags, so call them unconditionally so the
+	 * cred carries the partition's exclusive/oversubscribe state even
+	 * when details are unavailable.
+	 */
+	cred_arg->job_exclusive = get_job_exclusive_display_value(job_ptr);
+	cred_arg->job_oversubscribe = get_job_oversubscribe_value(job_ptr);
+
 	if (job_ptr->details) {
 		cred_arg->job_constraints = job_ptr->details->features_use;
 		cred_arg->job_core_spec = job_ptr->details->core_spec;
 		cred_arg->job_ntasks = job_ptr->details->num_tasks;
-		cred_arg->job_oversubscribe = get_job_share_value(job_ptr);
 		cred_arg->job_std_err = job_ptr->details->std_err;
 		cred_arg->job_std_in = job_ptr->details->std_in;
 		cred_arg->job_std_out = job_ptr->details->std_out;

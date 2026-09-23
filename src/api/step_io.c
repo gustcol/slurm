@@ -179,6 +179,20 @@ struct file_read_info {
 	bool eof;
 };
 
+/*
+ * Gracefully close an eio object's file descriptor. When the object wraps a
+ * TLS connection, shut it down first (sends a close_notify so the peer sees a
+ * clean close) before closing the fd. The conn itself is destroyed later by
+ * eio_obj_destroy().
+ * IN obj - eio object whose fd to close
+ */
+static void _shutdown_and_close(eio_obj_t *obj)
+{
+	(void) conn_blocking_g_shutdown(obj->conn);
+	if (obj->fd > STDERR_FILENO)
+		close(obj->fd);
+	obj->fd = -1;
+}
 
 /**********************************************************************
  * Listening socket functions
@@ -188,11 +202,8 @@ _listening_socket_readable(eio_obj_t *obj)
 {
 	debug3("Called _listening_socket_readable");
 	if (obj->shutdown == true) {
-		if (obj->fd != -1) {
-			if (obj->fd > STDERR_FILENO)
-				close(obj->fd);
-			obj->fd = -1;
-		}
+		if (obj->fd != -1)
+			_shutdown_and_close(obj);
 		debug2("  false, shutdown");
 		return false;
 	}
@@ -273,9 +284,7 @@ _server_readable(eio_obj_t *obj)
 
 	if (obj->shutdown) {
 		if (obj->fd != -1) {
-			if (obj->fd > STDERR_FILENO)
-				close(obj->fd);
-			obj->fd = -1;
+			_shutdown_and_close(obj);
 			s->in_eof = true;
 			s->out_eof = true;
 		}
@@ -320,9 +329,7 @@ static int _server_read(eio_obj_t *obj, list_t *objs)
 					}
 				}
 			}
-			if (obj->fd > STDERR_FILENO)
-				close(obj->fd);
-			obj->fd = -1;
+			_shutdown_and_close(obj);
 			s->in_eof = true;
 			s->out_eof = true;
 			list_enqueue(s->cio->free_outgoing, s->in_msg);
@@ -401,9 +408,7 @@ static int _server_read(eio_obj_t *obj, list_t *objs)
 			if (s->cio->sls)
 				step_launch_notify_io_failure(
 					s->cio->sls, s->node_id);
-			if (obj->fd > STDERR_FILENO)
-				close(obj->fd);
-			obj->fd = -1;
+			_shutdown_and_close(obj);
 			s->in_eof = true;
 			s->out_eof = true;
 			list_enqueue(s->cio->free_outgoing, s->in_msg);
@@ -684,9 +689,7 @@ static bool _file_readable(eio_obj_t *obj)
 	}
 	if (obj->shutdown == true) {
 		debug3("  false, shutdown");
-		if (obj->fd > STDERR_FILENO)
-			close(obj->fd);
-		obj->fd = -1;
+		_shutdown_and_close(obj);
 		read_info->eof = true;
 		return false;
 	}
@@ -850,11 +853,18 @@ static int _read_io_init_msg(int fd, conn_t *conn, client_io_t *cio,
 			     slurm_addr_t *host)
 {
 	io_init_msg_t msg = { 0 };
+	const char *io_key;
 
 	if (io_init_msg_read_from_fd(fd, conn, &msg) != SLURM_SUCCESS)
 		goto fail;
 
-	if (io_init_msg_validate(&msg, cio->io_key) < 0) {
+	/* Remove when 26.05 is no longer supported */
+	if (msg.version >= SLURM_26_11_PROTOCOL_VERSION)
+		io_key = cio->io_key_hash;
+	else
+		io_key = cio->io_key;
+
+	if (io_init_msg_validate(&msg, io_key) < 0) {
 		goto fail;
 	}
 	if (msg.nodeid >= cio->num_nodes) {
@@ -894,14 +904,14 @@ static int _read_io_init_msg(int fd, conn_t *conn, client_io_t *cio,
 	xfree(msg.io_key);
 	return SLURM_SUCCESS;
 
-    fail:
+fail:
+	(void) conn_blocking_g_shutdown(conn);
 	conn_g_destroy(conn, false);
 	xfree(msg.io_key);
 	if (fd > STDERR_FILENO)
 		close(fd);
 	return SLURM_ERROR;
 }
-
 
 static bool
 _is_fd_ready(int fd)
@@ -1088,11 +1098,11 @@ _estimate_nports(int nclients, int cli_per_port)
 
 client_io_t *client_io_handler_create(slurm_step_io_fds_t fds, int num_tasks,
 				      int num_nodes, char *io_key,
-				      bool label, uint32_t het_job_offset,
+				      char *io_key_hash, bool label,
+				      uint32_t het_job_offset,
 				      uint32_t het_job_task_offset)
 {
 	int i;
-	uint16_t *ports;
 	client_io_t *cio = xmalloc(sizeof(*cio));
 
 	cio->num_tasks   = num_tasks;
@@ -1107,6 +1117,7 @@ client_io_t *client_io_handler_create(slurm_step_io_fds_t fds, int num_tasks,
 		cio->taskid_width = 0;
 
 	cio->io_key = xstrdup(io_key);
+	cio->io_key_hash = xstrdup(io_key_hash);
 
 	cio->eio = eio_handle_create(slurm_conf.eio_timeout);
 
@@ -1124,20 +1135,13 @@ client_io_t *client_io_handler_create(slurm_step_io_fds_t fds, int num_tasks,
 	slurm_mutex_init(&cio->ioservers_lock);
 
 	_init_stdio_eio_objs(fds, cio);
-	ports = slurm_get_srun_port_range();
 
 	for (i = 0; i < cio->num_listen; i++) {
 		eio_obj_t *obj;
-		int cc;
 
-		if (ports)
-			cc = net_stream_listen_ports(&cio->listensock[i],
-						     &cio->listenport[i],
-						     ports, false);
-		else
-			cc = net_stream_listen(&cio->listensock[i],
-					       &cio->listenport[i]);
-		if (cc < 0) {
+		if (slurm_init_msg_engine_srun_ports(&cio->listensock[i],
+						     &cio->listenport[i]) !=
+		    SLURM_SUCCESS) {
 			fatal("unable to initialize stdio listen socket: %m");
 		}
 		debug("initialized stdio listening socket, port %d",
@@ -1212,6 +1216,7 @@ client_io_handler_destroy(client_io_t *cio)
 	xfree(cio->listensock);
 	eio_handle_destroy(cio->eio);
 	xfree(cio->io_key);
+	xfree(cio->io_key_hash);
 	FREE_NULL_LIST(cio->free_incoming);
 	FREE_NULL_LIST(cio->free_outgoing);
 	xfree(cio);

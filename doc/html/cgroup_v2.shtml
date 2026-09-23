@@ -548,7 +548,7 @@ alone in its own delegated cgroup.</p>
 also delegated where all slurmstepd and user jobs will reside. The slurmstepd
 is migrated initially in the waiting area for new stepds, <i>system</i>
 directory, and immediately, when it initializes the job hierarchy, it will move
-itself into the corresponding <i>job_x/step_y/slurm_processes</i> directory.
+itself into the corresponding <i>SLUID/step_y/slurm_processes</i> directory.
 </p>
 <p>User processes will be spawned by slurmstepd and moved into the appropriate
 task directory.</p>
@@ -564,7 +564,7 @@ are running in a slurmstepd scope by issuing this command:</p>
      Memory: 18.7M
         CPU: 141ms
      CGroup: /system.slice/slurmstepd.scope
-             ├─job_3385
+             ├─s5K1KKYAYG5D00
              │ ├─step_0
              │ │ ├─slurm
              │ │ │ └─113630 slurmstepd: [3385.0]
@@ -680,6 +680,14 @@ or with systemd &lt; 244.
 <li><b>CgroupMountPoint=/path/to/mount/point</b>: In most cases with cgroup v2,
 this parameter should not be used because <i>/sys/fs/cgroup</i> will be the only
 cgroup directory.
+</li>
+<li><b>CgroupJobIdPaths=[yes|no]</b>: If configured to "yes" then job-level
+cgroup directories are named with the numeric job ID instead of with the SLUID
+(e.g. "<i>/sys/fs/cgroup/system.slice/slurmstepd.scope/job_123/</i>" instead of
+"<i>/sys/fs/cgroup/system.slice/slurmstepd.scope/sEKNKTV3WPV500/</i>").
+This restores the pre-26.05 cgroup/v2 path layout and may be useful for sites
+with external tooling keyed on job IDs.
+The default value is no.
 </li>
 </ul>
 

@@ -1,11 +1,15 @@
 ############################################################################
 # Copyright (C) SchedMD LLC.
 ############################################################################
-import atf
 import logging
-import pytest
 import re
+
 import pexpect
+import pytest
+
+import atf
+
+pytestmark = pytest.mark.slow
 
 
 @pytest.fixture(scope="module", autouse=True)

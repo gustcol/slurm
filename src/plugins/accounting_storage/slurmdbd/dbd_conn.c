@@ -38,9 +38,17 @@
 \*****************************************************************************/
 
 #include "src/common/slurm_xlator.h"
-#include "src/common/slurmdbd_pack.h"
-#include "src/slurmctld/trigger_mgr.h"
+
+#include <errno.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include "slurmdbd_agent.h"
+#include "src/common/fd.h"
+#include "src/common/persist_conn.h"
+#include "src/common/slurmdbd_pack.h"
+#include "src/interfaces/conn.h"
+#include "src/slurmctld/trigger_mgr.h"
 
 #define SLURMDBD_TIMEOUT	900	/* Seconds SlurmDBD for response */
 
@@ -188,6 +196,22 @@ extern int dbd_conn_check_and_reopen(persist_conn_t *pc)
 	}
 
 	/*
+	 * Bail out if slurm_conf hasn't published accounting_storage_host
+	 * yet. This races the slurmctld startup path where the agent
+	 * thread can call us while main is mid-slurm_conf_reinit() and
+	 * the host string is transiently NULL. _connect_dbd_conn()'s
+	 * _open_persist_conn() would xassert on the NULL rem_host. The
+	 * agent's outer loop retries after a backoff, so returning an
+	 * error here is fine -- we'll try again once the conf is
+	 * loaded.
+	 */
+	if (!slurm_conf.accounting_storage_host) {
+		debug("%s: accounting_storage_host not set; skipping reconnect",
+		      __func__);
+		return SLURM_ERROR;
+	}
+
+	/*
 	 * Reset the rem_host just in case we were connected to the backup
 	 * before.
 	 */
@@ -255,6 +279,51 @@ extern void dbd_conn_close(persist_conn_t **pc)
 		 (*pc)->rem_host, (*pc)->rem_port,
 		 rc, slurm_strerror(rc));
 
+	/*
+	 * In slurmctld only: synchronize with slurmdbd's connection
+	 * teardown before we let the caller (and eventually the next
+	 * slurmctld) proceed. Other callers (sacctmgr, slurmstepd, etc.)
+	 * just close and exit and don't need to wait.
+	 *
+	 * Slurmdbd runs _connection_fini_callback() on the recv thread
+	 * after that thread sees EOF on our socket. The callback is what
+	 * removes us from registered_clusters and NULLs pcon_send. Only
+	 * after the callback returns does slurmdbd's _service_connection
+	 * call slurm_persist_conn_free_thread_loc(), which destroys the
+	 * conn and closes its TCP side.
+	 *
+	 * So: half-close our write side (FIN to slurmdbd), then wait
+	 * for activity on our read side (POLLIN or POLLHUP). By the
+	 * time wait_fd() returns, slurmdbd has run the callback and
+	 * we won't race a subsequent reconnect against a stale entry
+	 * in registered_clusters / pcon_send.
+	 *
+	 * Bounded by a short poll timeout so we don't hang if slurmdbd
+	 * is itself wedged.
+	 */
+	if (running_in_slurmctld() && (*pc)->conn) {
+		int fd = conn_g_get_fd((*pc)->conn);
+		if (fd >= 0) {
+			char drain[256];
+			ssize_t n;
+
+			(void) conn_blocking_g_shutdown((*pc)->conn);
+			(void) shutdown(fd, SHUT_WR);
+
+			if (wait_fd(fd, 5, POLLIN)) {
+				error("%s: [fd:%d] problem waiting for slurmdbd to close connection on %s:%u",
+				      __func__, fd, (*pc)->rem_host,
+				      (*pc)->rem_port);
+			} else {
+				do {
+					n = read(fd, drain, sizeof(drain));
+				} while ((n < 0) && (errno == EINTR));
+			}
+
+			(*pc)->skip_conn_shutdown = true;
+		}
+	}
+
 destroy_conn:
 	slurm_persist_conn_destroy(*pc);
 	*pc = NULL;
@@ -273,6 +342,7 @@ extern int dbd_conn_send_recv_direct(uint16_t rpc_version,
 	int rc = SLURM_SUCCESS;
 	buf_t *buffer;
 	persist_conn_t *use_conn = req->pcon;
+	slurmdbd_msg_t dbd_msg = { 0 };
 
 	xassert(req);
 	xassert(resp);
@@ -288,7 +358,11 @@ extern int dbd_conn_send_recv_direct(uint16_t rpc_version,
 		}
 	}
 
-	if (!(buffer = pack_slurmdbd_msg(req, rpc_version))) {
+	dbd_msg = (slurmdbd_msg_t) {
+		.data = req->data,
+		.msg_type = req->msg_type,
+	};
+	if (!(buffer = pack_slurmdbd_msg(&dbd_msg, rpc_version))) {
 		rc = SLURM_ERROR;
 		goto end_it;
 	}
@@ -310,7 +384,10 @@ extern int dbd_conn_send_recv_direct(uint16_t rpc_version,
 		goto end_it;
 	}
 
-	rc = unpack_slurmdbd_msg(resp, rpc_version, buffer);
+	dbd_msg = (slurmdbd_msg_t) { 0 };
+	rc = unpack_slurmdbd_msg(&dbd_msg, rpc_version, buffer);
+	resp->data = dbd_msg.data;
+	resp->msg_type = dbd_msg.msg_type;
 	/* check for the rc of the start job message */
 	if (rc == SLURM_SUCCESS && resp->msg_type == DBD_ID_RC)
 		rc = ((dbd_id_rc_msg_t *)resp->data)->return_code;
@@ -387,7 +464,7 @@ extern int dbd_conn_send_recv_rc_comment_msg(uint16_t rpc_version,
 			msg->comment = NULL;
 		}
 
-		slurm_persist_free_rc_msg(msg);
+		slurm_free_persist_rc_msg(msg);
 	}
 
 	log_flag(PROTOCOL, "msg_type:%s protocol_version:%hu return_code:%d",

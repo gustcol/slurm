@@ -39,42 +39,31 @@
 #include "slurm/slurm.h"
 
 #include "src/common/pack.h"
+#include "src/common/slurm_protocol_defs.h"
 
 #include "src/interfaces/conn.h"
 
-#define PERSIST_FLAG_NONE           0x0000
-#define PERSIST_FLAG_DBD            SLURM_BIT(0)
-#define PERSIST_FLAG_RECONNECT      SLURM_BIT(1)
-#define PERSIST_FLAG_ALREADY_INITED SLURM_BIT(2)
-#define PERSIST_FLAG_P_USER_CASE    SLURM_BIT(3)
-#define PERSIST_FLAG_SUPPRESS_ERR   SLURM_BIT(4)
-#define PERSIST_FLAG_EXT_DBD        SLURM_BIT(5)
-#define PERSIST_FLAG_DONT_UPDATE_CLUSTER SLURM_BIT(6)
+typedef struct persist_conn_s persist_conn_t;
+typedef struct persist_msg_s persist_msg_t;
 
-#define PERSIST_CONN_NOT_INITED -2
-
-typedef enum {
-	PERSIST_TYPE_NONE = 0,
-	PERSIST_TYPE_DBD,
-	PERSIST_TYPE_FED,
-	PERSIST_TYPE_HA_CTL,
-	PERSIST_TYPE_HA_DBD,
-	PERSIST_TYPE_ACCT_UPDATE,
-} persist_conn_type_t;
-
-typedef struct {
-	void *pcon;		/* persist_conn_t */
+struct persist_msg_s {
+	persist_conn_t *pcon; /* persist_conn_t */
 	void *data;		/* pointer to a message type below */
 	uint16_t msg_type;	/* slurmdbd_msg_type_t / slurm_msg_type_t */
-} persist_msg_t;
+};
 
-typedef struct {
+typedef int (*persist_conn_callback_proc_t)(void *arg, persist_msg_t *msg,
+					    buf_t **out_buffer);
+
+typedef void (*persist_conn_callback_fini_t)(void *arg);
+
+struct persist_conn_s {
 	void *auth_cred;
 	uid_t auth_uid;
 	gid_t auth_gid;
 	bool auth_ids_set;
-	int (*callback_proc)(void *arg, persist_msg_t *msg, buf_t **out_buffer);
-	void (*callback_fini)(void *arg);
+	persist_conn_callback_proc_t callback_proc;
+	persist_conn_callback_fini_t callback_fini;
 	char *cluster_name;
 	time_t comm_fail_time;	/* avoid constant error messages */
 	uint16_t my_port;
@@ -88,29 +77,14 @@ typedef struct {
 	pthread_t thread_id;
 	int timeout;
 	conn_t *conn; /* interfaces/conn data */
+	int last_fd; /* most recent fd backing conn, valid while conn != NULL;
+		      * reset to -1 before conn destroy. Lock-free readable
+		      * by external wake/shutdown paths that cannot safely
+		      * deref conn. 0 means never opened. */
 	bool skip_conn_shutdown;
 	slurm_trigger_callbacks_t trigger_callbacks;
 	uint16_t version;
-} persist_conn_t;
-
-typedef struct {
-	char *cluster_name;     /* cluster this message is coming from */
-	uint16_t persist_type;	/* really persist_conn_type_t, uint16_t on wire */
-	uint16_t port;          /* If you want to open a new connection, this is
-				 *  the port to talk to. */
-	uint16_t version;	/* protocol version */
-	uint32_t uid;		/* UID originating connection,
-				 * filled by authtentication plugin*/
-} persist_init_req_msg_t;
-
-typedef struct {
-	char *comment;
-	uint16_t flags;
-	uint32_t rc;
-	uint16_t ret_info; /* protocol version we are connecting to since we
-			    * sent the lowest one to begin with, or the return
-			    * of a message type sent. */
-} persist_rc_msg_t;
+};
 
 /* setup a daemon to receive incoming persistent connections. */
 extern void slurm_persist_conn_recv_server_init(void);
@@ -139,7 +113,7 @@ extern void slurm_persist_conn_recv_thread_init(persist_conn_t *persist_conn,
 extern int slurm_persist_conn_wait_for_thread_loc(void);
 
 /* Free the index given from slurm_persist_conn_wait_for_thread_loc */
-extern void slurm_persist_conn_free_thread_loc(int thread_loc);
+extern void slurm_persist_conn_free_thread_loc(int thread_loc, bool detach);
 
 /* Open a persistent socket connection and sends an init message to establish
  * the connection.
@@ -175,18 +149,6 @@ extern buf_t *slurm_persist_msg_pack(persist_conn_t *persist_conn,
 				     persist_msg_t *req_msg);
 extern int slurm_persist_msg_unpack(persist_conn_t *persist_conn,
 				    persist_msg_t *resp_msg, buf_t *buffer);
-
-extern void slurm_persist_pack_init_req_msg(persist_init_req_msg_t *msg,
-					    buf_t *buffer);
-extern int slurm_persist_unpack_init_req_msg(persist_init_req_msg_t **msg,
-					     buf_t *buffer);
-extern void slurm_persist_free_init_req_msg(persist_init_req_msg_t *msg);
-
-extern void slurm_persist_pack_rc_msg(persist_rc_msg_t *msg, buf_t *buffer,
-				      uint16_t protocol_version);
-extern int slurm_persist_unpack_rc_msg(persist_rc_msg_t **msg, buf_t *buffer,
-				       uint16_t protocol_version);
-extern void slurm_persist_free_rc_msg(persist_rc_msg_t *msg);
 
 extern buf_t *slurm_persist_make_rc_msg(persist_conn_t *persist_conn,
 					uint32_t rc, char *comment,

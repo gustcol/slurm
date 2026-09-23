@@ -41,6 +41,9 @@
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
 
+#include "src/interfaces/hash.h"
+
+#include "src/plugins/auth/common/auth_common.h"
 #include "src/plugins/auth/slurm/auth_slurm.h"
 #include "src/plugins/cred/common/cred_common.h"
 
@@ -53,11 +56,11 @@ extern slurm_cred_t *cred_p_create(slurm_cred_arg_t *cred_arg, bool sign_it,
 	xassert(cred_arg && cred_arg->id);
 
 	/* support 'srun -Z' operation */
-	if (!running_in_slurmctld())
+	if (!running_in_daemon())
 		init_internal();
 
-	extra = get_identity_string(cred_arg->id, cred_arg->id->uid,
-				    cred_arg->id->gid);
+	extra = auth_common_get_identity_string(cred_arg->id, cred_arg->id->uid,
+						cred_arg->id->gid);
 
 	cred = cred_create(cred_arg, protocol_version);
 
@@ -115,8 +118,10 @@ extern slurm_cred_t *cred_p_unpack(buf_t *buf, uint16_t protocol_version)
 		debug2("%s: no identity provided", __func__);
 		cred->arg->id = fetch_identity(auth_cred->uid, auth_cred->gid,
 					       false);
-	} else if (!(cred->arg->id = extract_identity(json_id, auth_cred->uid,
-						      auth_cred->gid))) {
+	} else if (!(cred->arg->id =
+			     auth_common_extract_identity(json_id,
+							  auth_cred->uid,
+							  auth_cred->gid))) {
 		error("%s: extract_identity() failed", __func__);
 		goto unpack_error;
 	}
@@ -128,7 +133,6 @@ extern slurm_cred_t *cred_p_unpack(buf_t *buf, uint16_t protocol_version)
 		cred->buf_version = protocol_version;
 	}
 
-	/* FIXME: use a hash instead of the entire token? */
 	cred->signature = token;
 
 	FREE_NULL_CRED(auth_cred);
@@ -147,6 +151,16 @@ unpack_error:
 	if (jwt)
 		jwt_free(jwt);
 	return NULL;
+}
+
+extern char *cred_p_get_signature_key(char *signature)
+{
+	char *sig = xstrrchr(signature, '.');
+
+	if (sig && sig[1])
+		return xstrdup(sig + 1);
+
+	return hash_g_compute_hex(signature);
 }
 
 extern char *cred_p_create_net_cred(void *addrs, uint16_t protocol_version)
@@ -265,8 +279,10 @@ extern sbcast_cred_t *sbcast_p_unpack(buf_t *buf, bool verify,
 		debug2("%s: no identity provided", __func__);
 		cred->arg.id = fetch_identity(auth_cred->uid, auth_cred->gid,
 					      false);
-	} else if (!(cred->arg.id = extract_identity(json_id, auth_cred->uid,
-						     auth_cred->gid))) {
+	} else if (!(cred->arg.id =
+			     auth_common_extract_identity(json_id,
+							  auth_cred->uid,
+							  auth_cred->gid))) {
 		error("%s: extract_identity() failed", __func__);
 		goto unpack_error;
 	} else {

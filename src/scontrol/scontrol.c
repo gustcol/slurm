@@ -44,6 +44,8 @@
 #include <limits.h>
 #include <stdarg.h>
 
+#include "slurm/slurm.h"
+
 #include "src/common/data.h"
 #include "src/common/proc_args.h"
 #include "src/common/ref.h"
@@ -83,12 +85,14 @@ int verbosity = 0;	/* count of "-v" options */
 uint32_t euid = SLURM_AUTH_NOBODY; /* proxy request as user */
 const char *mime_type = NULL; /* mimetype if we are using data_parser */
 const char *data_parser = NULL; /* data_parser args */
+int orig_argc; /* used when dumping meta data */
+char **orig_argv;
 
 job_info_msg_t *old_job_info_ptr = NULL;
 node_info_msg_t *old_node_info_ptr = NULL;
 partition_info_msg_t *old_part_info_ptr = NULL;
 reserve_info_msg_t *old_res_info_ptr = NULL;
-slurm_ctl_conf_info_msg_t *old_slurm_ctl_conf_ptr = NULL;
+slurm_conf_t *old_slurm_conf_ptr = NULL;
 
 static void	_create_it(int argc, char **argv);
 static void	_delete_it(int argc, char **argv);
@@ -153,6 +157,12 @@ int main(int argc, char **argv)
 		{"yaml", optional_argument, 0, OPT_LONG_YAML},
 		{NULL,       0, 0, 0}
 	};
+
+	/* Copy order of argv here since getopt_long() may reorder it */
+	orig_argc = argc;
+	orig_argv = xcalloc((argc + 1), sizeof(*orig_argv));
+	for (int i = 0; i < argc; i++)
+		orig_argv[i] = argv[i];
 
 	command_name = argv[0];
 	slurm_init(NULL);
@@ -293,12 +303,15 @@ int main(int argc, char **argv)
 		   !xstrcmp(data_parser, "list")) {
 		/*
 		 * We are only listing the available data parser plugins.
-		 * Calling DATA_DUMP_CLI_SINGLE() with a dummy type to get to
-		 * "list".
-		 * TODO: After Bug 18109 is fixed, replace this logic:
+		 * data_parser_cli_load() prints the plugin list and returns a
+		 * NULL parser before any RPC would be made.
 		 */
-		DATA_DUMP_CLI_SINGLE(OPENAPI_PING_ARRAY_RESP, NULL, argc, argv,
-				     NULL, mime_type, data_parser, exit_code);
+		data_parser_t *parser = NULL;
+
+		exit_code =
+			data_parser_cli_load(&parser, NULL, orig_argc,
+					     orig_argv, mime_type, data_parser);
+		data_parser_cli_free_ctxt(&parser);
 	} else {
 		/* We are running interactively multiple commands */
 		int input_field_count = 0;
@@ -328,8 +341,9 @@ int main(int argc, char **argv)
 	slurm_free_node_info_msg(old_node_info_ptr);
 	slurm_free_partition_info_msg(old_part_info_ptr);
 	slurm_free_reservation_info_msg(old_res_info_ptr);
-	slurm_free_ctl_conf(old_slurm_ctl_conf_ptr);
+	slurm_free_conf(old_slurm_conf_ptr);
 
+	xfree(orig_argv);
 #endif /* MEMORY_LEAK_DEBUG */
 
 	exit(exit_code);
@@ -461,18 +475,18 @@ static void _write_config(char *file_name)
 	int error_code;
 	node_info_msg_t *node_info_ptr = NULL;
 	partition_info_msg_t *part_info_ptr = NULL;
-	slurm_ctl_conf_info_msg_t  *slurm_ctl_conf_ptr = NULL;
+	slurm_conf_t *slurm_conf_ptr = NULL;
 
 	/* slurm config loading code copied from _print_config() */
 
-	if (old_slurm_ctl_conf_ptr) {
-		error_code = slurm_load_ctl_conf (
-				old_slurm_ctl_conf_ptr->last_update,
-				&slurm_ctl_conf_ptr);
+	if (old_slurm_conf_ptr) {
+		error_code =
+			slurm_load_ctl_conf(old_slurm_conf_ptr->last_update,
+					    &slurm_conf_ptr);
 		if (error_code == SLURM_SUCCESS) {
-			slurm_free_ctl_conf(old_slurm_ctl_conf_ptr);
+			slurm_free_conf(old_slurm_conf_ptr);
 		} else if (errno == SLURM_NO_CHANGE_IN_DATA) {
-			slurm_ctl_conf_ptr = old_slurm_ctl_conf_ptr;
+			slurm_conf_ptr = old_slurm_conf_ptr;
 			error_code = SLURM_SUCCESS;
 			if (quiet_flag == -1) {
 				printf ("slurm_load_ctl_conf no change "
@@ -480,15 +494,14 @@ static void _write_config(char *file_name)
 			}
 		}
 	} else {
-		error_code = slurm_load_ctl_conf ((time_t) NULL,
-						  &slurm_ctl_conf_ptr);
+		error_code =
+			slurm_load_ctl_conf((time_t) NULL, &slurm_conf_ptr);
 	}
 
 	if (error_code) {
 		_printf_error("slurm_load_ctl_conf error");
 	} else
-		old_slurm_ctl_conf_ptr = slurm_ctl_conf_ptr;
-
+		old_slurm_conf_ptr = slurm_conf_ptr;
 
 	if (error_code == SLURM_SUCCESS) {
 		int save_all_flag = all_flag;
@@ -516,10 +529,20 @@ static void _write_config(char *file_name)
 		}
 
 		/* send the info off to be written */
-		slurm_write_ctl_conf (slurm_ctl_conf_ptr,
-				      node_info_ptr,
-				      part_info_ptr);
+		slurm_write_ctl_conf(slurm_conf_ptr, node_info_ptr,
+				     part_info_ptr);
 	}
+}
+
+static void _dump_config(data_parser_t *parser,
+			 slurm_conf_t *slurm_ctl_conf_ptr)
+{
+	openapi_resp_config_t resp = {
+		.slurm_conf = slurm_ctl_conf_ptr,
+	};
+
+	exit_code = data_parser_dump_cli_resp(DATA_PARSER_OPENAPI_CONF_RESP,
+					      &resp, sizeof(resp), parser);
 }
 
 /*
@@ -529,47 +552,58 @@ static void _write_config(char *file_name)
 static void _print_config(char *config_param, int argc, char **argv)
 {
 	int error_code;
-	slurm_ctl_conf_info_msg_t  *slurm_ctl_conf_ptr = NULL;
+	slurm_conf_t *slurm_conf_ptr = NULL;
+	data_parser_t *parser = NULL;
 
-	/*
-	 * There isn't a parser for slurm.conf but there is one for ping, which
-	 * gets printed as part of this function. So to make sure the output is
-	 * not mixing output types disable json/yaml output for ping.
-	 */
-	mime_type = NULL;
+	if (mime_type) {
+		error_code =
+			data_parser_cli_load(&parser, NULL, orig_argc,
+					     orig_argv, mime_type, data_parser);
+		if (error_code)
+			exit_code = 1;
+		if (error_code || !parser)
+			goto cleanup;
+	}
 
-	if (old_slurm_ctl_conf_ptr) {
-		error_code = slurm_load_ctl_conf (
-				old_slurm_ctl_conf_ptr->last_update,
-				&slurm_ctl_conf_ptr);
+	if (old_slurm_conf_ptr) {
+		error_code =
+			slurm_load_ctl_conf(old_slurm_conf_ptr->last_update,
+					    &slurm_conf_ptr);
+
 		if (error_code == SLURM_SUCCESS)
-			slurm_free_ctl_conf(old_slurm_ctl_conf_ptr);
+			slurm_free_conf(old_slurm_conf_ptr);
 		else if (errno == SLURM_NO_CHANGE_IN_DATA) {
-			slurm_ctl_conf_ptr = old_slurm_ctl_conf_ptr;
+			slurm_conf_ptr = old_slurm_conf_ptr;
 			error_code = SLURM_SUCCESS;
 			if (quiet_flag == -1) {
 				printf ("slurm_load_ctl_conf no change "
 					"in data\n");
 			}
 		}
-	}
-	else
-		error_code = slurm_load_ctl_conf ((time_t) NULL,
-						  &slurm_ctl_conf_ptr);
+	} else
+		error_code =
+			slurm_load_ctl_conf((time_t) NULL, &slurm_conf_ptr);
 
 	if (error_code) {
 		_printf_error("slurm_load_ctl_conf error");
 	}
 	else
-		old_slurm_ctl_conf_ptr = slurm_ctl_conf_ptr;
+		old_slurm_conf_ptr = slurm_conf_ptr;
 
-
-	if (error_code == SLURM_SUCCESS) {
-		slurm_print_ctl_conf (stdout, slurm_ctl_conf_ptr) ;
-		fprintf(stdout, "\n");
+	if (slurm_conf_ptr) {
+		if (mime_type) {
+			_dump_config(parser, slurm_conf_ptr);
+		} else {
+			slurm_print_ctl_conf(stdout, slurm_conf_ptr);
+			fprintf(stdout, "\n");
+		}
 	}
-	if (slurm_ctl_conf_ptr)
+	if (slurm_conf_ptr && !mime_type)
 		_print_ping(argc, argv);
+
+cleanup:
+	if (mime_type)
+		data_parser_cli_free_ctxt(&parser);
 }
 
 /* Print slurmd status on localhost.
@@ -592,13 +626,23 @@ static void _print_ping(int argc, char **argv)
 	static const char *state[2] = { "DOWN", "UP" };
 	char mode[64];
 	bool down_msg = false;
-	controller_ping_t *pings = ping_all_controllers();
+	controller_ping_t *pings = NULL;
+	data_parser_t *parser = NULL;
 
 	if (mime_type) {
-		DATA_DUMP_CLI_SINGLE(OPENAPI_PING_ARRAY_RESP, pings, argc, argv,
-				     NULL, mime_type, data_parser, exit_code);
-		xfree(pings);
-		return;
+		exit_code =
+			data_parser_cli_load(&parser, NULL, orig_argc,
+					     orig_argv, mime_type, data_parser);
+		if (exit_code || !parser)
+			goto cleanup;
+	}
+
+	pings = ping_all_controllers();
+
+	if (mime_type) {
+		exit_code = data_parser_dump_cli_single(
+			DATA_PARSER_OPENAPI_PING_ARRAY_RESP, pings, parser);
+		goto cleanup;
 	}
 
 	exit_code = 1;
@@ -617,13 +661,17 @@ static void _print_ping(int argc, char **argv)
 		fprintf(stdout, "Slurmctld(%s) at %s is %s\n",
 			mode, ping->hostname, state[ping->pinged]);
 	}
-	xfree(pings);
 
 	if (down_msg && (getuid() == 0)) {
 		fprintf(stdout, "*****************************************\n");
 		fprintf(stdout, "** RESTORE SLURMCTLD DAEMON TO SERVICE **\n");
 		fprintf(stdout, "*****************************************\n");
 	}
+
+cleanup:
+	if (mime_type)
+		data_parser_cli_free_ctxt(&parser);
+	xfree(pings);
 }
 
 /*
@@ -632,7 +680,7 @@ static void _print_ping(int argc, char **argv)
 static void
 _print_daemons (void)
 {
-	slurm_ctl_conf_info_msg_t *conf;
+	slurm_conf_t *conf;
 	char node_name_short[HOST_NAME_MAX];
 	char node_name_long[HOST_NAME_MAX];
 	char *c, *n, *token, *save_ptr = NULL;
@@ -720,76 +768,101 @@ void _process_reboot_command(const char *tag, int argc, char **argv)
 {
 	int error_code = SLURM_SUCCESS;
 	bool asap = false;
+	bool force = false;
+	char *node_list = NULL;
+	char *power_action = NULL;
 	char *reason = NULL;
+	char *tok = NULL;
 	uint32_t next_state = NO_VAL;
 	int argc_offset = 1;
 
-	if (argc > 1) {
-		int i = 1;
-		for (; i <= 3 && i < argc; i++) {
-			if (!strcasecmp(argv[i], "ASAP")) {
-				asap = true;
-				argc_offset++;
-			} else if (!xstrncasecmp(argv[i], "Reason=",
-						 strlen("Reason="))) {
-				char *tmp_ptr = strchr(argv[i], '=');
-				if (!tmp_ptr || !*(tmp_ptr + 1)) {
-					_printf_error("missing reason");
-					xfree(reason);
-					return;
-				}
+	if (argc > 7) {
+		exit_code = 1;
+		_printf_error("too many arguments for keyword:%s", tag);
+		return;
+	}
 
-				xfree(reason);
-				reason = xstrdup(tmp_ptr+1);
-				argc_offset++;
-			} else if (!xstrncasecmp(argv[i], "nextstate=",
-						 strlen("nextstate="))) {
-				int state_str_len;
-				char* state_str;
-				char *tmp_ptr = strchr(argv[i], '=');
-				if (!tmp_ptr || !*(tmp_ptr + 1)) {
-					_printf_error("missing state");
-					xfree(reason);
-					return;
-				}
+	for (; argc_offset < argc; argc_offset++) {
+		tok = argv[argc_offset];
+		if (!strcasecmp(tok, "ASAP")) {
+			asap = true;
+		} else if (!strcasecmp(tok, "FORCE")) {
+			force = true;
+		} else if (!xstrncasecmp(tok, "Action=", strlen("Action="))) {
+			char *tmp_ptr = strchr(tok, '=');
+			if (!tmp_ptr || !*(tmp_ptr + 1)) {
+				_printf_error("missing power action");
+				goto cleanup;
+			}
+			if (power_action) {
+				_printf_error(
+					"multiple power actions specified");
+				goto cleanup;
+			}
+			power_action = xstrdup(tmp_ptr + 1);
+		} else if (!xstrncasecmp(tok, "Reason=", strlen("Reason="))) {
+			char *tmp_ptr = strchr(tok, '=');
+			if (!tmp_ptr || !*(tmp_ptr + 1)) {
+				_printf_error("missing reason");
+				goto cleanup;
+			}
 
-				state_str = xstrdup(tmp_ptr+1);
-				state_str_len = strlen(state_str);
-				argc_offset++;
+			if (reason) {
+				_printf_error("multiple reasons specified");
+				goto cleanup;
+			}
+			reason = xstrdup(tmp_ptr + 1);
+		} else if (!xstrncasecmp(tok,
+					 "nextstate=", strlen("nextstate="))) {
+			int state_str_len;
+			char *state_str;
+			char *tmp_ptr = strchr(tok, '=');
+			if (!tmp_ptr || !*(tmp_ptr + 1)) {
+				_printf_error("missing state");
+				goto cleanup;
+			}
 
-				if (!xstrncasecmp(state_str, "DOWN",
-						  MAX(state_str_len, 1)))
-					next_state = NODE_STATE_DOWN;
-				else if (!xstrncasecmp(state_str, "RESUME",
-						       MAX(state_str_len, 1)))
-					next_state = NODE_RESUME;
-				else {
-					_printf_error("Invalid state: %s\n Valid states: DOWN, RESUME",
-						      state_str);
-					xfree(reason);
-					xfree(state_str);
-					return;
-				}
+			state_str = xstrdup(tmp_ptr + 1);
+			state_str_len = strlen(state_str);
+
+			if (!xstrncasecmp(state_str, "DOWN",
+					  MAX(state_str_len, 1))) {
+				next_state = NODE_STATE_DOWN;
+			} else if (!xstrncasecmp(state_str, "RESUME",
+						 MAX(state_str_len, 1))) {
+				next_state = NODE_RESUME;
+			} else {
+				_printf_error(
+					"Invalid state: %s\n Valid states: DOWN, RESUME",
+					state_str);
 				xfree(state_str);
+				goto cleanup;
+			}
+			xfree(state_str);
+		} else {
+			if (node_list) {
+				_printf_error("Multiple node lists specified");
+				goto cleanup;
+			} else {
+				node_list = xstrdup(tok);
 			}
 		}
 	}
-	if ((argc - argc_offset) > 1) {
-		exit_code = 1;
-		fprintf (stderr,
-			 "too many arguments for keyword:%s\n",
-			 tag);
-	} else if ((argc - argc_offset) < 1) {
+	if (!node_list) {
 		exit_code = 1;
 		fprintf(stderr, "Missing node list. Specify ALL|<NodeList>");
 	} else {
-		error_code = scontrol_reboot_nodes(argv[argc_offset], asap,
-						   next_state, reason);
+		error_code =
+			scontrol_reboot_nodes(node_list, asap, force,
+					      next_state, reason, power_action);
 	}
-
-	xfree(reason);
 	if (error_code)
 		_printf_error("scontrol_reboot_nodes error");
+
+cleanup:
+	xfree(reason);
+	xfree(node_list);
+	xfree(power_action);
 }
 
 void _process_power_command(const char *tag, int argc, char **argv)
@@ -799,14 +872,15 @@ void _process_power_command(const char *tag, int argc, char **argv)
 	bool asap = false;
 	bool force = false;
 	int min_argv = 3;
-	int max_argv = 5;
+	int max_argv = 6;
+	char *power_action = NULL;
+	char *reason = NULL;
 
 	/* at least 'power' should have been supplied */
 	xassert(argc);
 
 	if ((argc <= max_argv) && (argc >= min_argv)) {
 		int idx = 1;
-		char *reason = NULL;
 
 		/* up or down subcommand */
 		if (!xstrcasecmp(argv[idx], "UP")) {
@@ -819,10 +893,6 @@ void _process_power_command(const char *tag, int argc, char **argv)
 		}
 		idx++;
 
-		/*
-		 * Optional asap|force if powerering down. Silently ignore
-		 * asap|force if powering up as there's no such option.
-		 */
 		if (!xstrcasecmp(argv[idx], "ASAP")) {
 			asap = true;
 			idx++;
@@ -831,7 +901,7 @@ void _process_power_command(const char *tag, int argc, char **argv)
 			idx++;
 		}
 
-		if ((force || asap) && power_up) {
+		if (asap && power_up) {
 			_printf_error("The '%s' argument is not valid for power up requests",
 				      argv[idx - 1]);
 			goto done;
@@ -844,35 +914,38 @@ void _process_power_command(const char *tag, int argc, char **argv)
 			goto done;
 		}
 
-		/* We have one more argument - it may be Reason= */
-		if ((idx + 1) < argc) {
-			if (!xstrncasecmp(argv[idx + 1],
+		/* Optional arguments: Reason= (power down only), Action= (power up or down) */
+		for (int opt = idx + 1; opt < argc; opt++) {
+			char *tmp_ptr = strchr(argv[opt], '=');
+			if (!tmp_ptr || !*(tmp_ptr + 1)) {
+				_printf_error("invalid argument: '%s'",
+					      argv[opt]);
+				goto done;
+			}
+			if (!xstrncasecmp(argv[opt],
 					  "Reason=", strlen("Reason="))) {
 				if (!power_up) {
-					char *tmp_ptr =
-						strchr(argv[idx + 1], '=');
-
-					if (!tmp_ptr || !*(tmp_ptr + 1)) {
-						exit_code = 1;
-						_printf_error("missing reason");
-						goto done;
-					}
+					xfree(reason);
 					reason = xstrdup(tmp_ptr + 1);
 				} else {
-					_printf_error("Reason only allowed for scontrol power down operation");
+					_printf_error(
+						"Reason only allowed for scontrol power down operation");
 					goto done;
 				}
+			} else if (!xstrncasecmp(argv[opt], "Action=",
+						 strlen("Action="))) {
+				xfree(power_action);
+				power_action = xstrdup(tmp_ptr + 1);
 			} else {
 				_printf_error("unexpected argument:'%s'",
-					      argv[idx + 1]);
+					      argv[opt]);
 				goto done;
 			}
 		}
 
 		/* call with nodelist */
 		error_code = scontrol_power_nodes(argv[idx], power_up, asap,
-						  force, reason);
-		xfree(reason);
+						  force, reason, power_action);
 
 	} else if (argc < min_argv) {
 		_printf_error("too few arguments for keyword:%s", argv[0]);
@@ -881,6 +954,9 @@ void _process_power_command(const char *tag, int argc, char **argv)
 	}
 
 done:
+	xfree(reason);
+	xfree(power_action);
+
 	if (error_code)
 		_printf_error("scontrol_power_nodes error");
 }
@@ -1104,8 +1180,8 @@ static int _process_command (int argc, char **argv)
 		old_part_info_ptr = NULL;
 		slurm_free_reservation_info_msg(old_res_info_ptr);
 		old_res_info_ptr = NULL;
-		slurm_free_ctl_conf(old_slurm_ctl_conf_ptr);
-		old_slurm_ctl_conf_ptr = NULL;
+		slurm_free_conf(old_slurm_conf_ptr);
+		old_slurm_conf_ptr = NULL;
 		/* if (old_job_info_ptr) */
 		/* 	old_job_info_ptr->last_update = 0; */
 		/* if (old_node_info_ptr) */
@@ -1114,8 +1190,8 @@ static int _process_command (int argc, char **argv)
 		/* 	old_part_info_ptr->last_update = 0; */
 		/* if (old_res_info_ptr) */
 		/* 	old_res_info_ptr->last_update = 0; */
-		/* if (old_slurm_ctl_conf_ptr) */
-		/* 	old_slurm_ctl_conf_ptr->last_update = 0; */
+		/* if (old_slurm_conf_ptr) */
+		/* 	old_slurm_conf_ptr->last_update = 0; */
 	} else if (!xstrncasecmp(tag, "create", MAX(tag_len, 2))) {
 		if (argc < 2) {
 			exit_code = 1;
@@ -1469,10 +1545,10 @@ static int _process_command (int argc, char **argv)
 		}
 	} else if (!xstrncasecmp(tag, "takeover", MAX(tag_len, 8))) {
 		int backup_inx = 1, control_cnt;
-		slurm_ctl_conf_info_msg_t  *slurm_ctl_conf_ptr = NULL;
+		slurm_conf_t *slurm_conf_ptr = NULL;
 
-		slurm_ctl_conf_ptr = slurm_conf_lock();
-		control_cnt = slurm_ctl_conf_ptr->control_cnt;
+		slurm_conf_ptr = slurm_conf_lock();
+		control_cnt = slurm_conf_ptr->control_cnt;
 		slurm_conf_unlock();
 		if (argc > 2) {
 			exit_code = 1;
@@ -1858,6 +1934,7 @@ static void _update_it(int argc, char **argv)
 {
 	char *val = NULL;
 	int i, error_code = SLURM_SUCCESS;
+	int hres_tag = 0;
 	int node_tag = 0, part_tag = 0, job_tag = 0;
 	int res_tag = 0;
 	int debug_tag = 0, step_tag = 0;
@@ -1886,7 +1963,9 @@ static void _update_it(int argc, char **argv)
 			}
 			val++;
 		}
-		if (!xstrncasecmp(tag, "NodeName", MAX(tag_len, 3))) {
+		if (!xstrncasecmp(tag, "HRESName", MAX(tag_len, 8))) {
+			hres_tag = 1;
+		} else if (!xstrncasecmp(tag, "NodeName", MAX(tag_len, 3))) {
 			node_tag = 1;
 		} else if (!xstrncasecmp(tag, "PartitionName",
 					MAX(tag_len, 3))) {
@@ -1926,6 +2005,8 @@ static void _update_it(int argc, char **argv)
 		error_code = scontrol_update_step (argc, argv);
 	else if (res_tag)
 		error_code = scontrol_update_res (argc, argv);
+	else if (hres_tag)
+		error_code = scontrol_update_hres(argc, argv);
 	else if (node_tag)
 		error_code = scontrol_update_node (argc, argv);
 	else if (part_tag)
@@ -1943,7 +2024,7 @@ static void _update_it(int argc, char **argv)
 		fprintf(stderr, "No valid entity in update command\n");
 		fprintf(stderr, "Input line must include \"NodeName\", ");
 		fprintf(stderr, "\"PartitionName\", \"Reservation\", "
-			"\"JobId\", or \"SlurmctldDebug\"\n");
+			"\"JobId\", \"HRESName\", or \"SlurmctldDebug\"\n");
 	}
 
 	if (error_code) {

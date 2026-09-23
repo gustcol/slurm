@@ -204,7 +204,7 @@
 <li><a href="#cpu_freq">Why is Slurm unable to set the CPU frequency for jobs?</a></li>
 <li><a href="#salloc_default_command">Can the salloc command be configured to
   launch a shell on a node in the job's allocation?</a></li>
-<li><a href="#tmpfs_jobcontainer">How can I set up a private /tmp and /dev/shm for
+<li><a href="#job_tmp_files">How can I set up a private /tmp and /dev/shm for
   jobs on my machine?</a></li>
 <li><a href="#sysv_memory">How do I configure Slurm to work with System V IPC
   enabled applications?</a></li>
@@ -1134,11 +1134,15 @@ $ rpmbuild -ta slurm-23.11.1.tar.bz2 > /dev/null
 </p>
 
 <p>Alternatively, as of Slurm 24.11.0 when using <b>rpmbuild</b>, a patched
-package may be created directly by placing the patch file in the same directory
-as the source tarball and executing the following command:</p>
+package may be created directly by placing the patch file(s) in the same
+directory as the source tarball and executing the following command:</p>
+
 <pre>
-$ rpmbuild -ta --define 'patch security.patch' slurm-24.11.0.tar.bz2
+$ rpmbuild -ta --define 'patch security.patch bug2.patch' slurm-24.11.0.tar.bz2
 </pre>
+
+<p><b>NOTE</b>: Only use a single <code>--define</code>; using multiple will
+cause only the last flag to take effect.</p>
 
 <p><a id="epel"><b>Why am I being offered an automatic update for Slurm?</b></a>
 <br>
@@ -1946,53 +1950,12 @@ launch a shell on a node in the job's allocation?</b></a><br>
 Yes, just set "use_interactive_step" as part of the LaunchParameters
 configuration option in slurm.conf.</p>
 
-<p><a id="tmpfs_jobcontainer"><b>How can I set up a private /tmp and /dev/shm for
+<p><a id="job_tmp_files"><b>How can I set up a private /tmp and /dev/shm for
   jobs on my machine?</b></a>
 <br/>
-Tmpfs job container plugin can be used by including
-<i>JobContainerType=job_container/tmpfs</i>
-in your slurm.conf file. It additionally requires a
-<a href="job_container.conf.html">job_container.conf</a> file to be
-set up which is further described in the man page.
-Tmpfs plugin creates a private mount namespace inside of which it mounts a
-private /tmp to a location that is configured in job_container.conf. The basepath
-is used to construct the mount path, by creating a job specific directory inside it
-and mounting /tmp to it. Since all the mounts are created inside of a mount
-namespace which is private, they are only visible inside the job. Hence this
-proves to be a useful solution for jobs that are on shared nodes, since each
-job can only view mounts created in their own mount namespace. A private
-/dev/shm is also mounted to isolate it between different jobs.</p>
-<p>
-Mount namespace construction also happens before job's spank environment is
-set up. Hence all spank related job steps will view only private /tmp the
-plugin creates. The plugin also provides an optional initialization script that
-is invoked before the job's namespace is constructed. This can be useful for
-any site specific customization that may be necessary.</p>
-<pre>
-parallels@linux_vb:~$ echo $SLURM_JOB_ID
-7
-parallels@linux_vb:~$ findmnt -o+PROPAGATION | grep /tmp
-└─/tmp  /dev/sda1[/storage/7/.7] ext4  rw,relatime,errors=remount-ro,data=ordered   private
-</pre>
-<p>In the example above, <i>BasePath</i> points to /storage and a slurm job with
-job id 7 is set up to mount /tmp on /storage/7/.7. When user from inside a job
-tries to look up mounts, they can see that their /tmp is mounted. However
-they are prevented from mistakenly accessing the backing directory directly.</p>
-<pre>
-parallels@linux_vb:~$ cd /storage/7/
-bash: cd: /storage/7/: Permission denied
-</pre>
-<p>They are allowed to access (read/write) /tmp only.</p>
-<p>
-Additionally pam_slurm_adopt has also been extended to support this functionality.
-If a user starts an ssh session which is managed by pam_slurm_adopt, then
-the user's process joins the namespace that is constructed by tmpfs plugin.
-Hence in ssh sessions, user has the same view of /tmp and /dev/shm as
-their job. This functionality is enabled by default in pam_slurm_adopt
-but can be disabled explicitly by appending <i>join_container=false</i> as shown:</p>
-<pre>
-account	sufficient  pam_slurm_adopt.so join_container=false
-</pre>
+A namespace plugin can be enabled to provide private, temporary file system
+space for each job. Refer to the <a href="namespace.html">Namespace Plugins</a>
+page for more details.</p>
 
 <p><a id="sysv_memory"><b>How do I configure Slurm to work with System V IPC
   enabled applications?</b></a><br>
@@ -2229,13 +2192,9 @@ allocated node that all processes associated with that job should be
 terminated.
 The slurmd daemon maintains a list of the jobs which have already been
 terminated to avoid replay of task launch requests.
-If the slurmctld daemon is cold-started (with the &quot;-c&quot; option
-or &quot;/etc/init.d/slurm startclean&quot;), it starts job ID values
-over based upon <b>FirstJobId</b>.
-If the slurmd is not also cold-started, it will reject job launch requests
-for jobs that it considers terminated.
-This solution to this problem is to cold-start all slurmd daemons whenever
-the slurmctld daemon is cold-started.</p>
+If job ID numbering is reset due to missing or corrupted files in
+<b>StateSaveLocation</b>, then previously used job IDs will be assigned
+again.</p>
 
 <p><a id="file_limit"><b>&quot;Unable to accept new connection: Too many open
   files&quot;</b></a><br>

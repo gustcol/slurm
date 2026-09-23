@@ -174,7 +174,7 @@ extern int topology_p_add_rm_node(node_record_t *node_ptr, char *unit,
 			ctx->switch_table[sw].nodes =
 				bitmap2node_name(ctx->switch_table[sw]
 							 .node_bitmap);
-			switch_record_update_block_config(tctx, sw);
+			switch_record_update_switch_config(tctx, sw);
 			sw = ctx->switch_table[sw].parent;
 		}
 	}
@@ -182,6 +182,11 @@ fini:
 	xfree(added);
 	xfree(tmp_str);
 	return rc;
+}
+
+extern bool topology_p_allow_one_node(void *tctx)
+{
+	return true;
 }
 
 /*
@@ -205,6 +210,11 @@ extern int topology_p_destroy_config(topology_ctx_t *tctx)
 	return SLURM_SUCCESS;
 }
 
+extern int topology_p_eval_node(topology_eval_t *topo_eval, int node_idx)
+{
+	return common_test_node(topo_eval, node_idx);
+}
+
 extern int topology_p_eval_nodes(topology_eval_t *topo_eval)
 {
 	topo_eval->eval_nodes = eval_nodes_tree;
@@ -224,6 +234,50 @@ extern int topology_p_whole_topo(bitstr_t *node_mask, void *tctx)
 			bit_or(node_mask, ctx->switch_table[i].node_bitmap);
 		}
 	}
+	return SLURM_SUCCESS;
+}
+
+extern int topology_p_get_rank(bitstr_t *node_bitmap, uint32_t **node_rank,
+			       uint32_t *size, void *tctx)
+{
+	uint32_t count = 0;
+	tree_context_t *ctx = tctx;
+
+	xassert(node_rank);
+	xassert(size);
+
+	*node_rank = NULL;
+	*size = 0;
+
+	if (!node_bitmap)
+		return SLURM_SUCCESS;
+
+	count = bit_set_count(node_bitmap);
+
+	if (!count)
+		return SLURM_SUCCESS;
+
+	*node_rank = xcalloc(count, sizeof(**node_rank));
+	*size = count;
+
+	count = 0;
+	for (int i = 0; next_node_bitmap(node_bitmap, &i); i++) {
+		switch_record_t *switch_ptr = ctx->switch_table;
+		uint32_t switch_rank = 1;
+
+		for (int j = 0; j < ctx->switch_count; j++, switch_ptr++) {
+			if (switch_ptr->level != 0)
+				continue;
+			if (bit_test(switch_ptr->node_bitmap, i)) {
+				(*node_rank)[count] = switch_rank
+						      << TOPO_RANK_ID_SHIFT;
+				break;
+			}
+			switch_rank++;
+		}
+		count++;
+	}
+
 	return SLURM_SUCCESS;
 }
 
@@ -365,6 +419,47 @@ extern int topology_p_get_node_addr(char *node_name, char **paddr,
 }
 
 /*
+ * _relay_switch_sublist() emit one relay sublist for switch k, if it holds any
+ * of the message's nodes, and remove those nodes from the message list.
+ *
+ * IN/OUT nodes_bitmap - bitmap of all hosts that still need to be sent
+ * IN k - switch in ctx->switch_table to relay to
+ * IN i - sublist index, for ROUTE debug only
+ * IN/OUT fwd_bitmap - scratch bitmap reused across calls
+ * IN/OUT sp_hl - array of subhostlists
+ * IN/OUT count - position in sp_hl array
+ * RET number of nodes placed on this switch's sublist
+ */
+static int _relay_switch_sublist(bitstr_t *nodes_bitmap, int k, int i,
+				 bitstr_t **fwd_bitmap, hostlist_t ***sp_hl,
+				 int *count, tree_context_t *ctx)
+{
+	int sw_count;
+
+	if (!*fwd_bitmap)
+		*fwd_bitmap = bit_copy(ctx->switch_table[k].node_bitmap);
+	else
+		bit_copybits(*fwd_bitmap, ctx->switch_table[k].node_bitmap);
+	bit_and(*fwd_bitmap, nodes_bitmap);
+	sw_count = bit_set_count(*fwd_bitmap);
+	if (!sw_count)
+		return 0; /* no nodes on this switch in message list */
+
+	(*sp_hl)[*count] = bitmap2hostlist(*fwd_bitmap);
+	/* Now remove nodes from this switch from message list */
+	bit_and_not(nodes_bitmap, *fwd_bitmap);
+	if (slurm_conf.debug_flags & DEBUG_FLAG_ROUTE) {
+		char *buf = hostlist_ranged_string_xmalloc((*sp_hl)[*count]);
+		debug("ROUTE: ... sublist[%d] switch=%s :: %s",
+		      i, ctx->switch_table[k].name, buf);
+		xfree(buf);
+	}
+	(*count)++;
+
+	return sw_count;
+}
+
+/*
  * _subtree_split_hostlist() split a hostlist into topology aware subhostlists
  *
  * IN/OUT nodes_bitmap - bitmap of all hosts that need to be sent
@@ -377,39 +472,29 @@ static int _subtree_split_hostlist(bitstr_t *nodes_bitmap, int parent,
 				   int *msg_count, hostlist_t ***sp_hl,
 				   int *count, tree_context_t *ctx)
 {
-	int lst_count = 0, sw_count;
+	int lst_count = 0;
 	bitstr_t *fwd_bitmap = NULL;		/* nodes in forward list */
+
+	/* A top-level leaf has no children; relay its own nodes as one list. */
+	if (!ctx->switch_table[parent].num_switches) {
+		lst_count =
+			_relay_switch_sublist(nodes_bitmap, parent, 0,
+					      &fwd_bitmap, sp_hl, count, ctx);
+		goto fini;
+	}
 
 	for (int i = 0; i < ctx->switch_table[parent].num_switches; i++) {
 		int k = ctx->switch_table[parent].switch_index[i];
 
-		if (!fwd_bitmap)
-			fwd_bitmap = bit_copy(ctx->switch_table[k].node_bitmap);
-		else
-			bit_copybits(fwd_bitmap,
-				     ctx->switch_table[k].node_bitmap);
-		bit_and(fwd_bitmap, nodes_bitmap);
-		sw_count = bit_set_count(fwd_bitmap);
-		if (sw_count == 0) {
-			continue; /* no nodes on this switch in message list */
-		}
-		(*sp_hl)[*count] = bitmap2hostlist(fwd_bitmap);
-		/* Now remove nodes from this switch from message list */
-		bit_and_not(nodes_bitmap, fwd_bitmap);
-		if (slurm_conf.debug_flags & DEBUG_FLAG_ROUTE) {
-			char *buf;
-			buf = hostlist_ranged_string_xmalloc((*sp_hl)[*count]);
-			debug("ROUTE: ... sublist[%d] switch=%s :: %s",
-			      i, ctx->switch_table[i].name, buf);
-			xfree(buf);
-		}
-		(*count)++;
-		lst_count += sw_count;
+		lst_count +=
+			_relay_switch_sublist(nodes_bitmap, k, i, &fwd_bitmap,
+					      sp_hl, count, ctx);
 		if (lst_count == *msg_count)
 			break; /* all nodes in message are in a child list */
 	}
-	*msg_count -= lst_count;
 
+fini:
+	*msg_count -= lst_count;
 	FREE_NULL_BITMAP(fwd_bitmap);
 	return lst_count;
 }

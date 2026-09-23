@@ -1,4 +1,4 @@
-.TH sinfo "1" "Slurm Commands" "Slurm 26.05" "Slurm Commands"
+.TH sinfo "1" "Slurm Commands" "Slurm 26.11" "Slurm Commands"
 
 .SH "NAME"
 sinfo \- View information about Slurm nodes and partitions.
@@ -176,7 +176,7 @@ be placed on separate lines.
 
 .TP
 \fB%d\fR
-Size of temporary disk space per node in megabytes.
+Size of temporary disk space per node in mebibytes.
 .IP
 
 .TP
@@ -186,7 +186,7 @@ Number of nodes.
 
 .TP
 \fB%e\fR
-The total memory, in MB, currently free on the node as reported by the OS. This
+The total memory, in MiB, currently free on the node as reported by the OS. This
 value is for informational use only and is not used for scheduling.
 .IP
 
@@ -250,7 +250,7 @@ Default time for any job in the format "days\-hours:minutes:seconds"
 
 .TP
 \fB%m\fR
-Size of memory per node in megabytes.
+Size of memory per node in mebibytes.
 .IP
 
 .TP
@@ -458,7 +458,7 @@ Default time for any job in the format "days\-hours:minutes:seconds".
 
 .TP
 \fBDisk\fR
-Size of temporary disk space per node in megabytes.
+Size of temporary disk space per node in mebibytes.
 .IP
 
 .TP
@@ -478,7 +478,7 @@ Features currently active on the nodes. Also see \fBfeatures\fR.
 
 .TP
 \fBFreeMem\fR
-The total memory, in MB, currently free on the node as reported by the OS. This
+The total memory, in MiB, currently free on the node as reported by the OS. This
 value is for informational use only and is not used for scheduling.
 .IP
 
@@ -490,6 +490,8 @@ Generic resources (gres) associated with the nodes.
 .TP
 \fBGresUsed\fR
 Generic resources (gres) currently in use on the nodes.
+For shared GRES usage details, see
+\fIhttps://slurm.schedmd.com/gres.html#Shared_GRES_Usage\fR.
 .IP
 
 .TP
@@ -504,7 +506,7 @@ The max number of CPUs per node available to jobs in the partition.
 
 .TP
 \fBMemory\fR
-Size of memory per node in megabytes.
+Size of memory per node in mebibytes.
 .IP
 
 .TP
@@ -785,12 +787,11 @@ List nodes only having the given state(s). Multiple states
 may be comma separated and the comparison is case insensitive.
 If the states are separated by '+', then the nodes must be in all states.
 The state can be prefixed with '~' which will invert the result of match.
-Possible values include (case insensitive): ALLOC, ALLOCATED, BLOCKED, CLOUD,
-COMP, COMPLETING, DOWN, DRAIN (for node in DRAINING or DRAINED
-states), DRAINED, DRAINING, FAIL, FUTURE, FUTR,
-IDLE, MAINT, MIX, MIXED, NO_RESPOND, NPC, PERFCTRS, PLANNED,
-POWER_DOWN, POWERING_DOWN, POWERED_DOWN, POWERING_UP, REBOOT_ISSUED,
-REBOOT_REQUESTED, RESV, RESERVED, UNK, and UNKNOWN.
+See the \fBNODE STATE CODES\fR section below for the common node states.
+\fB\-\-states\fR also accepts any node state flag name, for example
+\fBCLOUD\fR or \fBNOT_RESPONDING\fR, even when it is not listed there.
+A state of \fBDRAIN\fR matches nodes in either the \fBDRAINING\fR or
+\fBDRAINED\fR state.
 By default nodes in the specified state are reported whether
 they are responding or not.
 The \fB\-\-dead\fR and \fB\-\-responding\fR options may be
@@ -884,7 +885,7 @@ partitions without a job time limit.
 
 .TP
 \fBMEMORY\fR
-Size of real memory in megabytes on these nodes.
+Size of real memory in mebibytes on these nodes.
 .IP
 
 .TP
@@ -928,28 +929,29 @@ restricted to user root, \fByes\fR or \fBno\fR.
 
 .TP
 \fBOVERSUBSCRIBE\fR
-Whether jobs allocated resources in this partition can/will oversubscribe
-those compute resources (e.g. CPUs).
-\fBNO\fR indicates resources are never oversubscribed.
-\fBEXCLUSIVE\fR indicates whole nodes are dedicated to jobs
-(equivalent to srun \-\-exclusive option, may be used even
-with select/cons_tres managing individual processors).
-\fBFORCE\fR indicates resources are always available to be oversubscribed.
-\fBYES\fR indicates resource may be oversubscribed, if requested by the job's
-resource allocation.
-
-\fBNOTE\fR: If OverSubscribe is set to FORCE or YES,
-the OversubScribe value will be appended to the output.
+Whether the partition allows more than one job at a time on the same
+resource (node, socket, or core per \fBSelectTypeParameters\fR), and the
+maximum share when applicable.
+.RS
+.TP
+\fBNO\fR: no sharing, only one job per resource.
+.TP
+\fBYES:n\fR: sharing allowed when the job requests \fB\-\-oversubscribe\fR,
+up to \fBn\fR jobs per resource.
+.TP
+\fBFORCE:n\fR: sharing always allowed, up to \fBn\fR jobs per resource (jobs
+cannot opt out).
 .IP
+.RE
 
 .TP
 \fBSTATE\fR
 State of the nodes.
 Possible states include: allocated, blocked, completing, down,
 drained, draining, fail, failing, future, idle, maint, mixed,
-perfctrs, planned, power_down, power_up, reserved, and unknown.
+planned, power_down, power_up, reserved, and unknown.
 Their abbreviated forms are: alloc, block, comp, down, drain, drng,
-fail, failg, futr, idle, maint, mix, npc, plnd, pow_dn, pow_up, resv,
+fail, failg, futr, idle, maint, mix, plnd, pow_dn, pow_up, resv,
 and unk respectively.
 
 \fBNOTE\fR: The suffix "*" identifies nodes that are presently
@@ -958,7 +960,7 @@ not responding.
 
 .TP
 \fBTMP_DISK\fR
-Size of temporary disk space in megabytes on these nodes.
+Size of temporary disk space in mebibytes on these nodes.
 .IP
 
 .SH "NODE STATE CODES"
@@ -1128,12 +1130,6 @@ A request to reboot this node has been made, but hasn't been handled yet.
 \fBMIXED\fR
 The node has some of its CPUs \fBALLOCATED\fR while others are \fBIDLE\fR.
 Or the node has a suspended job allocated to some of its TRES (e.g. memory).
-.IP
-
-.TP
-\fBPERFCTRS (NPC)\fR
-Network Performance Counters associated with this node are in use, rendering
-this node as not usable for any other jobs
 .IP
 
 .TP

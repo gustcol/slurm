@@ -45,6 +45,11 @@
 
 #include "scontrol.h"
 
+typedef struct {
+	char *pos;
+	char *str;
+} foreach_base2str_arg_t;
+
 static void _print_license_info(const char *, license_info_msg_t *);
 static slurm_license_info_t ** _license_sort(license_info_msg_t
 					     *license_list);
@@ -91,9 +96,18 @@ static slurm_license_info_t ** _license_sort(license_info_msg_t
 extern void scontrol_print_licenses(const char *name, int argc, char **argv)
 {
 	int cc;
-	license_info_msg_t *msg;
+	int rc = SLURM_SUCCESS;
+	license_info_msg_t *msg = NULL;
 	uint16_t show_flags;
 	static time_t last_update;
+	data_parser_t *parser = NULL;
+
+	if (mime_type) {
+		rc = data_parser_cli_load(&parser, NULL, orig_argc, orig_argv,
+					  mime_type, data_parser);
+		if (rc || !parser)
+			goto cleanup;
+	}
 
 	show_flags = 0;
 	/* call the controller to get the meat
@@ -105,7 +119,7 @@ extern void scontrol_print_licenses(const char *name, int argc, char **argv)
 		exit_code = 1;
 		if (quiet_flag != 1)
 			slurm_perror ("slurm_load_license error");
-		return;
+		goto cleanup;
 	}
 
 	last_update = time(NULL);
@@ -113,26 +127,58 @@ extern void scontrol_print_licenses(const char *name, int argc, char **argv)
 	 * Print the info
 	 */
 	if (mime_type) {
-		int rc;
 		openapi_resp_license_info_msg_t resp = {
 			.licenses = msg,
 			.last_update = msg->last_update,
 		};
 
-		DATA_DUMP_CLI(OPENAPI_LICENSES_RESP, resp, argc, argv, NULL,
-			      mime_type, data_parser, rc);
-
-		if (rc)
-			exit_code = 1;
+		rc = data_parser_dump_cli_resp(
+			DATA_PARSER_OPENAPI_LICENSES_RESP, &resp, sizeof(resp),
+			parser);
 	} else {
 		_print_license_info(name, msg);
 	}
 
-	/* free at last
-	 */
+cleanup:
+	if (rc)
+		exit_code = 1;
+	if (mime_type)
+		data_parser_cli_free_ctxt(&parser);
 	slurm_free_license_info_msg(msg);
+}
 
-	return;
+static int _match_license_name(const char *query, const char *name, bool fuzzy)
+{
+	if (fuzzy)
+		return slurm_remote_license_fuzzy_match(query, name);
+	return xstrcmp(query, name) == 0;
+}
+
+static int _foreach_base2str(void *x, void *arg)
+{
+	hres_variable_t *var = x;
+	foreach_base2str_arg_t *barg = arg;
+
+	xstrfmtcatat(barg->str, &barg->pos, "%s%s:%u", (barg->str ? "," : ""),
+		     var->name, var->value);
+	return 0;
+}
+
+/*
+ * Build "Base=<name>:<value>[,<name>:<value>...]", the same syntax accepted by
+ * "scontrol update HRESName=... Base=...". Prints "Base=(null)" if empty.
+ */
+static char *_lic_base2str(list_t *base, bool one_liner)
+{
+	foreach_base2str_arg_t arg = { 0 };
+	char *str = NULL;
+
+	if (base)
+		list_for_each(base, _foreach_base2str, &arg);
+	str = xstrdup_printf("%sBase=%s", (one_liner ? " " : "\n    "),
+			     (arg.str ? arg.str : "(null)"));
+	xfree(arg.str);
+	return str;
 }
 
 /* _print_license_info()
@@ -141,43 +187,88 @@ extern void scontrol_print_licenses(const char *name, int argc, char **argv)
  */
 static void _print_license_info(const char *name, license_info_msg_t *msg)
 {
-	int cc;
+	int cc, disp_num_lic = 0, fuzzy_num_lic = 0;
+	bool use_fuzzy_match = false;
 	slurm_license_info_t **sorted_lic = NULL;
+	slurm_license_info_t **display_lic = NULL;
 
 	if (!msg->num_lic) {
 		printf("No licenses configured in Slurm.\n");
 		return;
 	}
 
-	sorted_lic = _license_sort(msg);
+	display_lic = xcalloc(sizeof(slurm_license_info_t *), msg->num_lic);
+	if (xstrcasestr(slurm_conf.license_params, "RemoteFuzzyMatch"))
+		use_fuzzy_match = true;
 
+	sorted_lic = _license_sort(msg);
 	for (cc = 0; cc < msg->num_lic; cc++) {
-		if (name && xstrcmp((sorted_lic[cc])->name, name))
-			continue;
+		if (name) {
+			bool remote_fuzzy =
+				(use_fuzzy_match && sorted_lic[cc]->remote);
+			switch (_match_license_name(name, sorted_lic[cc]->name,
+						    remote_fuzzy)) {
+			case LIC_NO_MATCH:
+				continue;
+			case LIC_FUZZY_MATCH:
+				fuzzy_num_lic++;
+			}
+		}
+		display_lic[disp_num_lic++] = sorted_lic[cc];
+	}
+
+	if (name && fuzzy_num_lic > 1) {
+		/* fuzzy matching should never over-match */
+		error("query \"%s\" matched more than one result, exiting.", name);
+		exit_code = 1;
+		goto cleanup;
+	} else if (name && disp_num_lic == 0) {
+		error("query \"%s\" matched zero licenses.", name);
+		exit_code = 1;
+		goto cleanup;
+	}
+
+	for (cc = 0; cc < disp_num_lic; cc++) {
 		printf("LicenseName=%s%sTotal=%u Used=%u Free=%u Reserved=%u Remote=%s",
-		       (sorted_lic[cc])->name,
-		       one_liner ? " " : "\n    ",
-		       (sorted_lic[cc])->total,
-		       (sorted_lic[cc])->in_use,
-		       (sorted_lic[cc])->available,
-		       (sorted_lic[cc])->reserved,
-		       (sorted_lic[cc])->remote ? "yes" : "no");
-		if (sorted_lic[cc]->mode) {
-			printf("%sNodes=%s Mode=%u\n",
+		       (display_lic[cc])->name, one_liner ? " " : "\n    ",
+		       (display_lic[cc])->total, (display_lic[cc])->in_use,
+		       (display_lic[cc])->available,
+		       (display_lic[cc])->reserved,
+		       (display_lic[cc])->remote ? "yes" : "no");
+		if (display_lic[cc]->mode) {
+			char *base_str = _lic_base2str(display_lic[cc]->base,
+						       one_liner);
+			char *nodes_str = display_lic[cc]->nodes ?
+				display_lic[cc]->nodes : "(null)";
+
+			printf("%sLayerName=%s%s%s Nodes=%s Mode=%u DisableHRES=%s DisableLayer=%s ConfTotal=%u BaseUsage=%u%s\n",
 			       one_liner ? " " : "\n    ",
-			       sorted_lic[cc]->nodes, sorted_lic[cc]->mode);
-		} else if (sorted_lic[cc]->remote) {
+			       display_lic[cc]->layer_name,
+			       display_lic[cc]->parent_name ? " ParentName=" :
+			       "",
+			       display_lic[cc]->parent_name ?
+			       display_lic[cc]->parent_name : "",
+			       nodes_str, display_lic[cc]->mode,
+			       display_lic[cc]->disable_hres ? "true" : "false",
+			       display_lic[cc]->disable_layer ?
+			       "true" : "false",
+			       display_lic[cc]->conf_total,
+			       display_lic[cc]->base_usage, base_str);
+			xfree(base_str);
+		} else if (display_lic[cc]->remote) {
 			char time_str[256];
-			slurm_make_time_str(&sorted_lic[cc]->last_update,
+			slurm_make_time_str(&display_lic[cc]->last_update,
 					    time_str, sizeof(time_str));
 			printf("%sLastConsumed=%u LastDeficit=%u LastUpdate=%s\n",
 			       one_liner ? " " : "\n    ",
-			       sorted_lic[cc]->last_consumed,
-			       sorted_lic[cc]->last_deficit, time_str);
+			       display_lic[cc]->last_consumed,
+			       display_lic[cc]->last_deficit, time_str);
 		} else {
 			printf("\n");
 		}
 	}
 
+cleanup:
 	xfree(sorted_lic);
+	xfree(display_lic);
 }

@@ -53,6 +53,7 @@ typedef struct {
 	job_record_t *(*find_job_array_rec)(uint32_t array_job_id,
 					    uint32_t array_task_id);
 	void (*agent_queue_request)(agent_arg_t *agent_arg_ptr);
+	int (*get_het_step_id)(uint32_t het_job_id, uint32_t *step_id_out);
 } stepmgr_ops_t;
 
 extern stepmgr_ops_t *stepmgr_ops;
@@ -77,23 +78,6 @@ extern void delete_step_records(job_record_t *job_ptr);
  */
 extern int job_step_signal(slurm_step_id_t *step_id,
 			   uint16_t signal, uint16_t flags, uid_t uid);
-
-/*
- * step_create - creates a step_record in step_specs->job_id, sets up the
- *	according to the step_specs.
- * IN job_ptr - job_ptr to create step in
- * IN step_specs - job step specifications
- * OUT new_step_record - pointer to the new step_record (NULL on error)
- * IN protocol_version - slurm protocol version of client
- * OUT err_msg - Custom error message to the user, caller to xfree results
-  * RET - 0 or error code
- * NOTE: don't free the returned step_record because that is managed through
- * 	the job.
- */
-extern int step_create(job_record_t *job_ptr,
-		       job_step_create_request_msg_t *step_specs,
-		       step_record_t **new_step_record,
-		       uint16_t protocol_version, char **err_msg);
 
 /*
  * step_layout_create - creates a step_layout according to the inputs.
@@ -224,5 +208,14 @@ extern int stepmgr_get_job_sbcast_cred_msg(
 
 extern resource_allocation_response_msg_t *build_job_info_resp(
 	job_record_t *job_ptr);
+
+/*
+ * Complete any step that has tasks on a node in node_list.
+ *
+ * IN job_ptr from where to kill the steps.
+ * In node_list list of nodes whose steps must be killed.
+ * RET: SLURM_SUCCESS on success, SLURM_ERROR otherwise.
+ */
+extern int stepmgr_kill_steps_on_resize(job_record_t *job_ptr, char *node_list);
 
 #endif /* _SLURM_STEP_MGR_H */

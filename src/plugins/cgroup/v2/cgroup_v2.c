@@ -52,6 +52,7 @@
 #include "src/common/fd.h"
 #include "src/common/list.h"
 #include "src/common/log.h"
+#include "src/common/sluid.h"
 #include "src/common/timers.h"
 #include "src/common/xassert.h"
 #include "src/common/xmalloc.h"
@@ -394,7 +395,7 @@ static char *_get_proc_cg_path(char *pid_str)
  * /sys/fs/cgroup[/docker.slice/docker-<some UUID>.scope]
  *
  */
-static char *_get_init_cg_path()
+static char *_get_init_cg_path(void)
 {
 	char *cg_path, *ret = NULL;
 
@@ -415,7 +416,7 @@ static char *_get_init_cg_path()
  * to what will be our root cgroup.
  * E.g. /sys/fs/cgroup/system.slice/node1_slurmstepd.scope/ for slurmstepd.
  */
-static void _set_int_cg_ns()
+static void _set_int_cg_ns(void)
 {
 	int_cg_ns.init_cg_path = _get_init_cg_path();
 
@@ -597,7 +598,7 @@ cleanup:
  * slice we want to live, will make systemd to automatically activate the
  * controllers in the tree, so this operation here would be redundant.
  */
-static int _enable_system_controllers()
+static int _enable_system_controllers(void)
 {
 	char *slice_path = NULL;
 	bitstr_t *system_ctrls = bit_alloc(CG_CTL_CNT);
@@ -642,7 +643,7 @@ end:
  * Read the cgroup.controllers file of the root to detect which are the
  * available controllers in this system.
  */
-static int _setup_controllers()
+static int _setup_controllers(void)
 {
 	/* Field not used in v2 */
 	int_cg_ns.subsystems = NULL;
@@ -699,7 +700,7 @@ static void _free_task_cg_info(void *x)
 	}
 }
 
-static void _all_tasks_destroy()
+static void _all_tasks_destroy(void)
 {
 	/* Empty the lists of accounted tasks, do a best effort in rmdir */
 	(void) list_delete_all(task_list, _rmdir_task, NULL);
@@ -1161,7 +1162,7 @@ rwfail:
  *
  * This directory will be used to place future slurmstepds.
  */
-static int _init_slurmd_system_scope()
+static int _init_slurmd_system_scope(void)
 {
 	struct stat sb;
 
@@ -1295,10 +1296,20 @@ static int _reparent_into_cgroup(char *new_path, char *name)
 {
 	char *new_home = NULL;
 	pid_t slurmd_pid = getpid();
+	xcgroup_t original_cg = { 0 };
+	original_cg.path = int_cg[CG_LEVEL_ROOT].path;
+
+	/*
+	 * If we are already inside /name, do not attempt to move ourselves
+	 * again. This is useful in reconfigure situations.
+	 */
+	if (!xstrcmp(xbasename(original_cg.path), name))
+		return SLURM_SUCCESS;
 
 	xstrfmtcat(new_home, "%s/%s", new_path, name);
 	bit_clear_all(int_cg_ns.avail_controllers);
 	xfree(int_cg_ns.mnt_point);
+	int_cg[CG_LEVEL_ROOT].path = NULL;
 	common_cgroup_destroy(&int_cg[CG_LEVEL_ROOT]);
 
 	int_cg_ns.mnt_point = new_home;
@@ -1306,13 +1317,13 @@ static int _reparent_into_cgroup(char *new_path, char *name)
 	if (common_cgroup_create(&int_cg_ns, &int_cg[CG_LEVEL_ROOT], "",
 				 (uid_t) 0, (gid_t) 0) != SLURM_SUCCESS) {
 		error("unable to create root cgroup");
-		return SLURM_ERROR;
+		goto error;
 	}
 
 	if (common_cgroup_instantiate(&int_cg[CG_LEVEL_ROOT]) !=
 	    SLURM_SUCCESS) {
 		error("Unable to instantiate slurmd %s cgroup", new_home);
-		return SLURM_ERROR;
+		goto error;
 	}
 	log_flag(CGROUP, "Created %s", new_home);
 
@@ -1326,21 +1337,31 @@ static int _reparent_into_cgroup(char *new_path, char *name)
 	    SLURM_SUCCESS) {
 		error("Unable to attach slurmd pid %d to %s cgroup.",
 		      slurmd_pid, new_home);
-		return SLURM_ERROR;
+		goto error;
+	}
+
+	if (!common_cgroup_wait_pid_moved(&original_cg, slurmd_pid,
+					  original_cg.path)) {
+		error("Timeout waiting for pid %d to leave %s", slurmd_pid,
+		      original_cg.path);
+		goto error;
 	}
 
 	if (_get_controllers(new_path, int_cg_ns.avail_controllers) !=
 	    SLURM_SUCCESS)
-		return SLURM_ERROR;
+		goto error;
 
 	if (_enable_subtree_control(new_path, int_cg_ns.avail_controllers) !=
 	    SLURM_SUCCESS) {
 		error("Cannot enable subtree_control at the top level %s",
 		      int_cg_ns.mnt_point);
-		return SLURM_ERROR;
+		goto error;
 	}
-
+	common_cgroup_destroy(&original_cg);
 	return SLURM_SUCCESS;
+error:
+	common_cgroup_destroy(&original_cg);
+	return SLURM_ERROR;
 }
 
 static void _get_memory_events(uint64_t *job_kills, uint64_t *step_kills)
@@ -1887,7 +1908,7 @@ extern int cgroup_p_step_create(cgroup_ctl_type_t ctl, stepd_step_rec_t *step)
 {
 	int rc = SLURM_SUCCESS;
 	char *new_path = NULL;
-	char tmp_char[64];
+	char tmp_char[64], sluid_str[SLUID_STR_BYTES];
 
 	/*
 	 * Lock the root cgroup so we don't race with other steps that are being
@@ -1908,7 +1929,12 @@ extern int cgroup_p_step_create(cgroup_ctl_type_t ctl, stepd_step_rec_t *step)
 	}
 
 	/* Job cgroup */
-	xstrfmtcat(new_path, "/job_%u", step->step_id.job_id);
+	if (slurm_cgroup_conf.cgroup_job_id_paths) {
+		xstrfmtcat(new_path, "/job_%u", step->step_id.job_id);
+	} else {
+		print_sluid(step->step_id.sluid, sluid_str, sizeof(sluid_str));
+		xstrfmtcat(new_path, "/%s", sluid_str);
+	}
 	if (common_cgroup_create(&int_cg_ns, &int_cg[CG_LEVEL_JOB],
 				 new_path, 0, 0) != SLURM_SUCCESS) {
 		error("unable to create %pI cgroup", &step->step_id);
@@ -2303,13 +2329,10 @@ extern int cgroup_p_constrain_set(cgroup_ctl_type_t ctl, cgroup_level_t level,
 			    limits->limit_in_bytes) != SLURM_SUCCESS) {
 			rc = SLURM_ERROR;
 		}
-		if ((limits->soft_limit_in_bytes != NO_VAL64) &&
-		    common_cgroup_set_uint64_param(
-			    &int_cg[level],
-			    "memory.high",
-			    limits->soft_limit_in_bytes) != SLURM_SUCCESS) {
-			rc = SLURM_ERROR;
-		}
+		/*
+		 * soft_limit_in_bytes is ignored because cgroup/v2 has no
+		 * equivalent of cgroup/v1's memory.soft_limit_in_bytes.
+		 */
 		if ((limits->memsw_limit_in_bytes != NO_VAL64) &&
 		    common_cgroup_set_uint64_param(
 			    &int_cg[level],
@@ -2780,7 +2803,7 @@ extern int cgroup_p_task_addto(cgroup_ctl_type_t ctl, stepd_step_rec_t *step,
 	return SLURM_SUCCESS;
 }
 
-extern cgroup_acct_t *cgroup_p_task_get_acct_data(uint32_t task_id)
+static cgroup_acct_t *_get_acct_data(xcgroup_t *cg, char *label)
 {
 	uint64_t active_file, inactive_file;
 	char *cpu_stat = NULL, *memory_stat = NULL, *memory_current = NULL;
@@ -2788,20 +2811,10 @@ extern cgroup_acct_t *cgroup_p_task_get_acct_data(uint32_t task_id)
 	char *ptr;
 	size_t tmp_sz = 0;
 	cgroup_acct_t *stats = NULL;
-	task_cg_info_t *task_cg_info;
-	bool memory_peak_interface = false, no_file_cache = false;
-	static bool interfaces_checked = false;
+	bool no_file_cache = false;
+	static bool interfaces_checked = false, memory_peak_interface = false;
 
-	if (!(task_cg_info = list_find_first(task_list, _find_task_cg_info,
-					     &task_id))) {
-		if (task_id == task_special_id)
-			error("No task found with id %u (task_special), this should never happen",
-			      task_id);
-		else
-			error("No task found with id %u, this should never happen",
-			      task_id);
-		return NULL;
-	}
+	xassert(cg);
 
 	if (xstrcasestr(slurm_conf.job_acct_gather_params, "no_file_cache"))
 		no_file_cache = true;
@@ -2820,49 +2833,26 @@ extern cgroup_acct_t *cgroup_p_task_get_acct_data(uint32_t task_id)
 		interfaces_checked = true;
 	}
 
-	if (common_cgroup_get_param(&task_cg_info->task_cg,
-				    "cpu.stat",
-				    &cpu_stat,
-				    &tmp_sz) != SLURM_SUCCESS) {
-		if (task_id == task_special_id)
-			log_flag(CGROUP, "Cannot read task_special cpu.stat file");
-		else
-			log_flag(CGROUP, "Cannot read task %d cpu.stat file",
-				 task_id);
+	if (common_cgroup_get_param(cg, "cpu.stat", &cpu_stat, &tmp_sz) !=
+	    SLURM_SUCCESS) {
+		log_flag(CGROUP, "Cannot read %s cpu.stat file", label);
 	}
 
-	if (common_cgroup_get_param(&task_cg_info->task_cg,
-				    "memory.current",
-				    &memory_current,
+	if (common_cgroup_get_param(cg, "memory.current", &memory_current,
 				    &tmp_sz) != SLURM_SUCCESS) {
-		if (task_id == task_special_id)
-			log_flag(CGROUP, "Cannot read task_special memory.current file");
-		else
-			log_flag(CGROUP, "Cannot read task %d memory.current file",
-				 task_id);
+		log_flag(CGROUP, "Cannot read %s memory.current file", label);
 	}
 
-	if (common_cgroup_get_param(&task_cg_info->task_cg,
-				    "memory.stat",
-				    &memory_stat,
-				    &tmp_sz) != SLURM_SUCCESS) {
-		if (task_id == task_special_id)
-			log_flag(CGROUP, "Cannot read task_special memory.stat file");
-		else
-			log_flag(CGROUP, "Cannot read task %d memory.stat file",
-				 task_id);
+	if (common_cgroup_get_param(cg, "memory.stat", &memory_stat, &tmp_sz) !=
+	    SLURM_SUCCESS) {
+		log_flag(CGROUP, "Cannot read %s memory.stat file", label);
 	}
 
 	if (memory_peak_interface) {
-		if (common_cgroup_get_param(&task_cg_info->task_cg,
-					    "memory.peak",
-					    &memory_peak,
+		if (common_cgroup_get_param(cg, "memory.peak", &memory_peak,
 					    &tmp_sz) != SLURM_SUCCESS) {
-			if (task_id == task_special_id)
-				log_flag(CGROUP, "Cannot read task_special memory.peak interface, does your OS support it?");
-			else
-				log_flag(CGROUP, "Cannot read task %d memory.peak interface, does your OS support it?",
-					 task_id);
+			log_flag(CGROUP, "Cannot read %s memory.peak file",
+				 label);
 		}
 	}
 
@@ -2935,6 +2925,48 @@ extern cgroup_acct_t *cgroup_p_task_get_acct_data(uint32_t task_id)
 	xfree(memory_peak);
 
 	return stats;
+}
+
+extern cgroup_acct_t *cgroup_p_task_get_acct_data(uint32_t task_id)
+{
+	task_cg_info_t *task_cg_info;
+	cgroup_acct_t *stats = NULL;
+	char *label = NULL;
+
+	if (!(task_cg_info = list_find_first(task_list, _find_task_cg_info,
+					     &task_id))) {
+		if (task_id == task_special_id)
+			error("No task found with id %u (task_special), this should never happen",
+			      task_id);
+		else
+			error("No task found with id %u, this should never happen",
+			      task_id);
+		return NULL;
+	}
+
+	if (slurm_conf.debug_flags & DEBUG_FLAG_CGROUP) {
+		if (task_id == task_special_id)
+			label = xstrdup("task_special");
+		else
+			xstrfmtcat(label, "task %d", task_id);
+	}
+
+	stats = _get_acct_data(&(task_cg_info->task_cg), label);
+	xfree(label);
+
+	return stats;
+}
+
+extern cgroup_acct_t *cgroup_p_job_get_acct_data(void)
+{
+	xcgroup_t *cg = &(int_cg[CG_LEVEL_JOB]);
+
+	if (!cg->path) {
+		log_flag(CGROUP, "Job cgroup not initialized");
+		return NULL;
+	}
+
+	return _get_acct_data(cg, "job");
 }
 
 /*
@@ -3094,7 +3126,7 @@ extern void cgroup_p_bpf_set_token(int fd)
 	token_fd = fd;
 }
 
-extern int cgroup_p_bpf_get_token()
+extern int cgroup_p_bpf_get_token(void)
 {
 	return token_fd;
 }

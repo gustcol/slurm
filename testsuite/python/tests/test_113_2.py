@@ -1,9 +1,11 @@
 ############################################################################
 # Copyright (C) SchedMD LLC.
 ############################################################################
-import atf
-import pytest
 import re
+
+import pytest
+
+import atf
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -18,7 +20,7 @@ def default_partition():
     return atf.default_partition()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def queued_job(default_partition):
     nodes_dict = atf.get_nodes()
     total_cpus = 0

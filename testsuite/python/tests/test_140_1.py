@@ -2,11 +2,14 @@
 # Copyright (C) SchedMD LLC.
 ############################################################################
 
-import atf
+import re
 
 # from os import stat
 import pytest
-import re
+
+import atf
+
+pytestmark = pytest.mark.slow
 
 cpu_total_cnt = 6
 license_total_cnt = 50

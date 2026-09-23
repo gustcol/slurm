@@ -171,6 +171,8 @@ static uint16_t cr_type;
 static struct cr_record *cr_ptr = NULL;
 static pthread_mutex_t cr_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+static time_t last_set_all = 0;
+
 /* Add job id to record of jobs running on this node */
 static void _add_run_job(struct cr_record *cr_ptr, uint32_t job_id)
 {
@@ -1905,8 +1907,10 @@ static int _run_now(job_record_t *job_ptr, bitstr_t *bitmap,
 		}
 	}
 
-top:	if ((rc != SLURM_SUCCESS) && preemptee_candidates &&
-	    (exp_cr = _dup_cr(cr_ptr))) {
+top:
+	if ((rc != SLURM_SUCCESS) && preemptee_candidates &&
+	    (exp_cr = _dup_cr(cr_ptr)) &&
+	    !(job_ptr->bit_flags & NEED_MORE_FEATURES)) {
 		/* Remove all preemptable jobs from simulated environment */
 		job_iterator = list_iterator_create(preemptee_candidates);
 		while ((tmp_job_ptr = list_next(job_iterator))) {
@@ -2364,6 +2368,35 @@ extern int select_p_job_expand(job_record_t *from_job_ptr,
  *      Only support jobs shrinking now.
  * RET: 0 or an error code
  */
+extern void select_p_job_mem_reduce(job_record_t *job_ptr)
+{
+	job_resources_t *job_res = job_ptr->job_resrcs;
+	uint64_t new_mem = job_ptr->details->pn_min_memory;
+	int n = -1;
+
+	xassert(job_res);
+
+	slurm_mutex_lock(&cr_mutex);
+	if (cr_ptr == NULL)
+		_init_node_cr();
+
+	for (int i = 0; next_node_bitmap(job_res->node_bitmap, &i); i++) {
+		uint64_t delta;
+		n++;
+		if (job_res->memory_allocated[n] <= new_mem)
+			continue;
+		delta = job_res->memory_allocated[n] - new_mem;
+		if (cr_ptr->nodes[i].alloc_memory >= delta)
+			cr_ptr->nodes[i].alloc_memory -= delta;
+		else {
+			error("%s: memory underflow on node %d for %pJ",
+			      __func__, i, job_ptr);
+			cr_ptr->nodes[i].alloc_memory = 0;
+		}
+	}
+	slurm_mutex_unlock(&cr_mutex);
+}
+
 extern int select_p_job_resized(job_record_t *job_ptr, node_record_t *node_ptr)
 {
 	int rc = SLURM_SUCCESS;
@@ -2444,7 +2477,6 @@ extern int select_p_select_nodeinfo_set_all(void)
 {
 	node_record_t *node_ptr = NULL;
 	int n;
-	static time_t last_set_all = 0;
 
 	/* only set this once when the last_node_update is newer than
 	 * the last time we set things up. */
@@ -2454,7 +2486,7 @@ extern int select_p_select_nodeinfo_set_all(void)
 		       (long)last_set_all);
 		return SLURM_NO_CHANGE_IN_DATA;
 	}
-	last_set_all = last_node_update;
+	last_set_all = time(NULL);
 
 	for (n = 0; (node_ptr = next_node(&n)); n++) {
 		node_select_stats_t *node_stats = node_select_stats_array[n];
@@ -2495,6 +2527,8 @@ extern int select_p_select_nodeinfo_set(job_record_t *job_ptr)
 
 extern int select_p_reconfigure(void)
 {
+	last_set_all = 0;
+
 	slurm_mutex_lock(&cr_mutex);
 	_free_cr(cr_ptr);
 	cr_ptr = NULL;

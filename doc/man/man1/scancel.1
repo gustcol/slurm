@@ -1,4 +1,4 @@
-.TH scancel "1" "Slurm Commands" "Slurm 26.05" "Slurm Commands"
+.TH scancel "1" "Slurm Commands" "Slurm 26.11" "Slurm Commands"
 
 .SH "NAME"
 scancel \- Used to signal jobs or job steps that are under the control of Slurm.
@@ -24,6 +24,32 @@ a PENDING state will return an error.
 After the job has begun execution, an individual component can be cancelled
 except for component zero. If component zero is cancelled, the whole het job is
 cancelled.
+Step IDs are unique across the whole heterogeneous job.
+Cancelling a step through the job leader kills that step in every component
+that has it, and leaves the component allocations running.
+Cancelling a step through an individual component signals only that component's
+step.
+It is not an error for a component not to have that step; only a step ID that
+no component has is reported as an invalid job ID.
+When the job's steps are managed by a step manager (see \fB\-\-stepmgr\fR in
+\fBsalloc\fR(1)), the cancel is forwarded to each component's step manager and
+a step ID that no component has is accepted rather than reported as an error.
+Signals other than the default SIGKILL are sent only to the step of the
+Step IDs are unique across the whole heterogeneous job.
+Cancelling a step through component zero (the heterogeneous job leader)
+kills that step in every component that has it, and leaves the component
+allocations running.
+It is not an error if some components do not have that step; only a step ID
+that no component has is reported as an invalid job ID.
+When the job's steps are managed by a step manager (see \fB\-\-stepmgr\fR in
+\fBsalloc\fR(1)), the cancel is forwarded to each component's step manager and
+a step ID that no component has is accepted rather than reported as an error.
+Cancelling a step through an individual component signals only that
+component's step.
+If that component does not have the step, the request is reported as an
+invalid job ID.
+Signals other than the default SIGKILL are sent only to the step of the
+component whose job ID was given.
 A job or job step can only be signaled by the owner of that job or user root.
 If an attempt is made by an unauthorized user to signal a job or job step, an
 error message will be printed and the job will not be signaled.
@@ -203,7 +229,8 @@ ARGUMENTS
 
 .TP
 \fIjob_id\fP
-The Slurm job ID to be signaled.
+The Slurm job ID to be signaled. A SLUID may also be used in place of a
+numeric job ID.
 .IP
 
 .TP
@@ -221,6 +248,19 @@ the shell may forward the signal.
 When \fB\-\-batch\fR is not used but \fB\-\-signal\fR is used,
 then all job steps will be signaled, but the batch script itself
 will not be signaled.
+
+A queued (PENDING) step may also be targeted by its step ID, but only through
+the controller: use \fBscancel\fR \fIjob_id\fR.\fIstep_id\fR with no
+\fB\-\-signal\fR, or add \fB\-\-ctld\fR. A queued step has no tasks on any node,
+so a signal sent directly to the slurmd daemons fails. A terminating signal
+(INT, TERM, or KILL) cancels the step before it launches; any other signal is a
+no-op, since the step has no tasks yet. This applies equally to a step queued
+by \fBsrun \-\-async\fR.
+
+A queued step is targetable by step ID only if it was submitted by \fBsrun\fR
+26.11 or newer; an older \fBsrun\fR's queued step is shown as
+\fIjob_id\fR.TBD and can only be cancelled at the job level. See
+\fBsrun\fR(1).
 .IP
 
 .SH "PERFORMANCE"

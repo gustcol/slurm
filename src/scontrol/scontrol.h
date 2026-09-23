@@ -89,12 +89,14 @@ extern int sibling_flag; /* show sibling jobs (if any fed job). */
 extern uint32_t euid; /* send request to the slurmctld in behave of this user */
 extern const char *mime_type; /* user requested JSON or YAML */
 extern const char *data_parser; /* data_parser args */
+extern int orig_argc; /* used when dumping meta data */
+extern char **orig_argv;
 
 extern job_info_msg_t *old_job_info_ptr;
 extern node_info_msg_t *old_node_info_ptr;
 extern partition_info_msg_t *old_part_info_ptr;
 extern reserve_info_msg_t *old_res_info_ptr;
-extern slurm_ctl_conf_info_msg_t *old_slurm_ctl_conf_ptr;
+extern slurm_conf_t *old_slurm_conf_ptr;
 
 extern int	parse_requeue_flags(char *s, uint32_t *flags);
 extern int	scontrol_batch_script(int argc, char **argv);
@@ -111,8 +113,8 @@ extern void scontrol_list_jobs(int argc, char **argv);
 extern void scontrol_list_pids(int argc, char **argv);
 extern void scontrol_list_steps(int argc, char **argv);
 extern void	scontrol_getent(const char *node_name);
-extern int scontrol_load_job(job_info_msg_t **job_buffer_pptr, sluid_t sluid,
-			     uint32_t job_id);
+extern int scontrol_load_job(job_info_msg_t **job_buffer_pptr,
+			     slurm_step_id_t step_id);
 extern int 	scontrol_load_nodes (node_info_msg_t ** node_buffer_pptr,
 				     uint16_t show_flags);
 extern int 	scontrol_load_partitions (partition_info_msg_t **
@@ -149,14 +151,16 @@ extern int	scontrol_update_node (int argc, char **argv);
 extern int	scontrol_update_part (int argc, char **argv);
 extern int	scontrol_update_res (int argc, char **argv);
 extern int	scontrol_update_step (int argc, char **argv);
+extern int scontrol_update_hres(int argc, char **argv);
 
 /* power_node.c */
 extern int scontrol_power_nodes(char *node_list, bool power_up, bool asap,
-				bool force, char *reason);
+				bool force, char *reason, char *power_action);
 
 /* reboot_node.c */
 extern int      scontrol_cancel_reboot(char *nodes);
-extern int      scontrol_reboot_nodes(char *node_list, bool asap,
-				      uint32_t next_state, char *reason);
+extern int scontrol_reboot_nodes(char *node_list, bool asap, bool force,
+				 uint32_t next_state, char *reason,
+				 char *power_action);
 
 #endif

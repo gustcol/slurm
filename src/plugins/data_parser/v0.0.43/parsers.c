@@ -75,6 +75,8 @@
 #include "src/sinfo/sinfo.h" /* provides sinfo_data_t */
 #include "src/slurmctld/licenses.h" /* provides licenses_t - don't use funcs */
 
+#define SLURM_24_11_PROTOCOL_VERSION MAKE_SLURM_VER(42)
+
 #define IS_INFINITE(x) is_overloaded_INFINITE(&(x), sizeof(x))
 #define IS_NO_VAL(x) is_overloaded_NO_VAL(&(x), sizeof(x), false)
 /* Force evaluation against (32bit) NO_VAL cast to value */
@@ -510,410 +512,6 @@ static int PARSE_FUNC(STRING)(const parser_t *const parser, void *obj,
 static int DUMP_FUNC(STRING)(const parser_t *const parser, void *obj,
 			     data_t *data, args_t *args);
 
-#ifndef NDEBUG
-static void _check_flag_bit(int8_t i, const flag_bit_t *bit, bool *found_bit,
-			    ssize_t parser_size)
-{
-	xassert(bit->magic == MAGIC_FLAG_BIT);
-	xassert(bit->type > FLAG_BIT_TYPE_INVALID);
-	xassert(bit->type < FLAG_BIT_TYPE_MAX);
-	xassert(bit->name && bit->name[0]);
-
-	if (bit->type == FLAG_BIT_TYPE_REMOVED) {
-		xassert(!bit->mask_size);
-		xassert(!bit->mask_name);
-		xassert(!bit->value);
-		xassert(!bit->flag_name);
-		xassert(!bit->flag_size);
-		xassert(bit->deprecated);
-		return;
-	}
-
-	/* mask must be set */
-	xassert(bit->mask);
-	xassert(bit->flag_size <= sizeof(bit->value));
-	xassert(bit->flag_size > 0);
-	xassert(bit->flag_name && bit->flag_name[0]);
-	xassert(bit->mask_size <= sizeof(bit->value));
-	xassert(bit->mask_size > 0);
-	xassert(bit->mask_name && bit->mask_name[0]);
-
-	/* Bit values must fit in parser->size bits */
-	switch (parser_size) {
-	case sizeof(uint8_t):
-		xassert((bit->value & UINT8_MAX) == bit->value);
-		break;
-	case sizeof(uint16_t):
-		xassert((bit->value & UINT16_MAX) == bit->value);
-		break;
-	case sizeof(uint32_t):
-		xassert((bit->value & UINT32_MAX) == bit->value);
-		break;
-	case sizeof(uint64_t):
-		xassert((bit->value & UINT64_MAX) == bit->value);
-		break;
-	default:
-		error("Parser->size (%zd) is invalid. This should never happen.",
-		      parser_size);
-		xassert(false);
-	}
-
-	if (bit->type == FLAG_BIT_TYPE_BIT) {
-		/* at least one bit must be set */
-		xassert(bit->value);
-		/* mask must include all value bits */
-		xassert((bit->mask & bit->value) == bit->value);
-		*found_bit = true;
-	} else if (bit->type == FLAG_BIT_TYPE_EQUAL) {
-		/*
-		 * bit->mask must include all value bits
-		 * (if there are any)
-		 */
-		xassert(!bit->value ||
-			((bit->mask & bit->value) == bit->value));
-		/*
-		 * All equal type flags should come before any bit
-		 * type flags to avoid issues with masks overlapping
-		 */
-		xassert(!*found_bit);
-	}
-}
-
-extern void check_parser_funcname(const parser_t *const parser,
-				  const char *func_name)
-{
-	xassert(parser->magic == MAGIC_PARSER);
-
-	xassert(parser->model > PARSER_MODEL_INVALID);
-	xassert(parser->model < PARSER_MODEL_MAX);
-
-	if (parser->model == PARSER_MODEL_REMOVED) {
-		xassert(parser->deprecated > 0);
-		xassert(parser->obj_openapi > OPENAPI_FORMAT_INVALID);
-		xassert(parser->obj_openapi < OPENAPI_FORMAT_MAX);
-		xassert(!parser->size);
-		xassert(!parser->field_name);
-		xassert(parser->ptr_offset == NO_VAL);
-		xassert(!parser->key);
-		xassert(!parser->flag_bit_array_count);
-		xassert(!parser->type_string);
-		xassert(parser->list_type == DATA_PARSER_TYPE_INVALID);
-		xassert(!parser->fields);
-		xassert(!parser->field_count);
-		xassert(!parser->parse);
-		xassert(!parser->dump);
-		xassert(!parser->pointer_type);
-		xassert(!parser->array_type);
-		return;
-	}
-
-	xassert(parser->obj_type_string && parser->obj_type_string[0]);
-
-	if (parser->model == PARSER_MODEL_ALIAS) {
-		xassert(!parser->size);
-		xassert(!parser->field_name);
-		xassert(parser->ptr_offset == NO_VAL);
-		xassert(!parser->key);
-		xassert(!parser->deprecated);
-		xassert(!parser->flag_bit_array_count);
-		xassert(parser->type_string && parser->type_string[0]);
-		xassert(parser->list_type == DATA_PARSER_TYPE_INVALID);
-		xassert(!parser->fields);
-		xassert(!parser->field_count);
-		xassert(!parser->parse);
-		xassert(!parser->dump);
-		xassert(!parser->pointer_type);
-		xassert(!parser->array_type);
-		xassert(parser->obj_openapi == OPENAPI_FORMAT_INVALID);
-		xassert(parser->alias_type > DATA_PARSER_TYPE_INVALID);
-		xassert(parser->alias_type < DATA_PARSER_TYPE_MAX);
-		xassert(parser->alias_type != parser->type);
-		return;
-	}
-
-	xassert(parser->alias_type == DATA_PARSER_TYPE_INVALID);
-
-	if (parser->model == PARSER_MODEL_ARRAY_REMOVED_FIELD) {
-		xassert(!parser->size);
-		xassert(!parser->field_name);
-		xassert(parser->ptr_offset == NO_VAL);
-		xassert(parser->key && parser->key[0]);
-		xassert(parser->deprecated);
-		xassert(!parser->flag_bit_array_count);
-		xassert(parser->type_string && parser->type_string[0]);
-		xassert(parser->list_type == DATA_PARSER_TYPE_INVALID);
-		xassert(!parser->fields);
-		xassert(!parser->field_count);
-		xassert(!parser->parse);
-		xassert(!parser->dump);
-		xassert(!parser->pointer_type);
-		xassert(!parser->array_type);
-		xassert(parser->obj_openapi == OPENAPI_FORMAT_INVALID);
-		return;
-	}
-
-	xassert(parser->size > 0);
-
-	if (parser->model == PARSER_MODEL_ARRAY_SKIP_FIELD) {
-		/* field is only a place holder so most assert()s don't apply */
-		xassert(parser->field_name && parser->field_name[0]);
-		xassert(parser->type == DATA_PARSER_TYPE_INVALID);
-		xassert(!parser->flag_bit_array_count);
-		xassert(parser->needs == NEED_NONE);
-		xassert(!parser->field_name_overloads);
-		xassert(!parser->key);
-		xassert(!parser->type_string);
-		xassert(!parser->required);
-		xassert((parser->ptr_offset < NO_VAL) ||
-			(parser->ptr_offset >= 0));
-		return;
-	}
-
-	xassert(parser->type > DATA_PARSER_TYPE_INVALID);
-	xassert(parser->type < DATA_PARSER_TYPE_MAX);
-	xassert(parser->type_string && parser->type_string[0]);
-
-	if (parser->model == PARSER_MODEL_FLAG_ARRAY) {
-		bool found_bit_type = false;
-
-		/* parser of a specific flag field list */
-		xassert(parser->flag_bit_array);
-		xassert(parser->flag_bit_array_count < NO_VAL8);
-
-		for (int8_t i = 0; i < parser->flag_bit_array_count; i++) {
-			_check_flag_bit(i, &parser->flag_bit_array[i],
-					&found_bit_type, parser->size);
-
-			/* check for duplicate flag names */
-			for (int8_t j = 0; j < parser->flag_bit_array_count;
-			     j++) {
-				xassert((i == j) ||
-					xstrcasecmp(parser->flag_bit_array[i]
-							    .name,
-						    parser->flag_bit_array[j]
-							    .name));
-			}
-		}
-
-		/* make sure this is not a list or array type */
-		xassert(parser->list_type == DATA_PARSER_TYPE_INVALID);
-		xassert(!parser->fields);
-		xassert(!parser->field_count);
-		xassert(!parser->parse);
-		xassert(!parser->dump);
-		xassert(parser->ptr_offset == NO_VAL);
-		xassert(!parser->pointer_type);
-		xassert(!parser->array_type);
-		xassert(parser->obj_openapi == OPENAPI_FORMAT_ARRAY);
-	} else if (parser->model == PARSER_MODEL_LIST) {
-		/* parser of a List */
-		xassert(parser->list_type > DATA_PARSER_TYPE_INVALID);
-		xassert(parser->list_type < DATA_PARSER_TYPE_MAX);
-		xassert(!parser->flag_bit_array_count);
-		xassert(!parser->fields);
-		xassert(!parser->field_count);
-		xassert(!parser->parse);
-		xassert(!parser->dump);
-		xassert(parser->size == sizeof(list_t *));
-		xassert(parser->ptr_offset == NO_VAL);
-		xassert(!parser->pointer_type);
-		xassert(!parser->array_type);
-		xassert(!parser->obj_openapi);
-	} else if (parser->model == PARSER_MODEL_ARRAY) {
-		/* parser of a parser Array */
-		xassert(parser->field_count > 0);
-
-		xassert(parser->ptr_offset == NO_VAL);
-		xassert(!parser->flag_bit_array_count);
-		xassert(!parser->parse);
-		xassert(!parser->dump);
-		xassert(parser->list_type == DATA_PARSER_TYPE_INVALID);
-		xassert(parser->fields);
-		xassert(!parser->pointer_type);
-		xassert(!parser->array_type);
-		xassert(parser->obj_openapi == OPENAPI_FORMAT_OBJECT);
-
-		for (int i = 0; i < parser->field_count; i++) {
-			/* recursively check the child parsers */
-			check_parser(&parser->fields[i]);
-
-			/*
-			 * Verify each field_name is unique while ignoring
-			 * complex parsers.
-			 */
-			if (parser->fields[i].field_name) {
-				int matches = 0;
-
-				for (int j = 0; j < parser->field_count; j++) {
-					if (i == j)
-						continue;
-
-					if (!xstrcasecmp(
-						parser->fields[i].field_name,
-						parser->fields[j].field_name))
-						matches++;
-				}
-
-				xassert(matches ==
-					parser->fields[i].field_name_overloads);
-			}
-
-			/*
-			 * Verify each key path is unique while ignoring skipped
-			 * parsers
-			 */
-			if (parser->fields[i].key)
-				for (int j = 0; j < parser->field_count; j++)
-					xassert((i == j) ||
-						xstrcasecmp(parser->fields[i]
-								    .key,
-							    parser->fields[j]
-								    .key));
-		}
-	} else if ((parser->model == PARSER_MODEL_ARRAY_LINKED_FIELD) ||
-		   (parser->model ==
-		    PARSER_MODEL_ARRAY_LINKED_EXPLODED_FLAG_ARRAY_FIELD)) {
-		/* parser array link to a another parser */
-		const parser_t *const linked =
-			find_parser_by_type(parser->type);
-
-		if (parser->model !=
-		    PARSER_MODEL_ARRAY_LINKED_EXPLODED_FLAG_ARRAY_FIELD) {
-			xassert(parser->key && parser->key[0]);
-		}
-
-		xassert(!parser->flag_bit_array_count);
-		xassert(!parser->fields);
-		xassert(!parser->field_count);
-		xassert(!parser->parse);
-		xassert(!parser->dump);
-		xassert(parser->list_type == DATA_PARSER_TYPE_INVALID);
-		xassert(!parser->pointer_type);
-		xassert(!parser->array_type);
-		xassert(!parser->obj_openapi);
-
-		switch (linked->model) {
-		case PARSER_MODEL_ALIAS:
-			xassert(linked->alias_type > DATA_PARSER_TYPE_INVALID);
-			xassert(linked->alias_type < DATA_PARSER_TYPE_MAX);
-			xassert(linked->alias_type != parser->type);
-			break;
-		case PARSER_MODEL_REMOVED:
-			fatal_abort("should never execute");
-		case PARSER_MODEL_SIMPLE:
-			xassert(parser->field_name && parser->field_name[0]);
-			/* fall through */
-		case PARSER_MODEL_ARRAY:
-		case PARSER_MODEL_FLAG_ARRAY:
-		case PARSER_MODEL_LIST:
-		case PARSER_MODEL_PTR:
-		case PARSER_MODEL_NT_ARRAY:
-		case PARSER_MODEL_NT_PTR_ARRAY:
-			/* linked parsers must always be the same size */
-			xassert((parser->size == NO_VAL) ||
-				(parser->size == linked->size));
-			xassert((parser->ptr_offset < NO_VAL) ||
-				(parser->ptr_offset >= 0));
-			break;
-		case PARSER_MODEL_COMPLEX:
-			xassert(!parser->field_name);
-			/*
-			 * complex uses the size of the struct which we don't
-			 * know here
-			 */
-			xassert(parser->size > 0);
-			xassert(parser->size <= NO_VAL);
-			xassert(parser->ptr_offset == NO_VAL);
-			break;
-		case PARSER_MODEL_ARRAY_LINKED_FIELD:
-		case PARSER_MODEL_ARRAY_LINKED_EXPLODED_FLAG_ARRAY_FIELD:
-			fatal_abort("linked parsers must not link to other linked parsers");
-		case PARSER_MODEL_ARRAY_SKIP_FIELD:
-			fatal_abort("linked parsers must not link to a skip parsers");
-		case PARSER_MODEL_ARRAY_REMOVED_FIELD:
-			fatal_abort("linked parsers must not link to a removed parser");
-		case PARSER_MODEL_INVALID:
-		case PARSER_MODEL_MAX:
-			fatal_abort("invalid model");
-		}
-	} else if ((parser->model == PARSER_MODEL_SIMPLE) ||
-		   (parser->model == PARSER_MODEL_COMPLEX)) {
-		xassert(parser->ptr_offset == NO_VAL);
-		xassert(!parser->key);
-		xassert(!parser->field_name);
-		xassert(!parser->flag_bit_array_count);
-		xassert(!parser->fields);
-		xassert(!parser->field_count);
-		xassert(parser->parse);
-		xassert(parser->dump);
-		xassert(parser->list_type == DATA_PARSER_TYPE_INVALID);
-		if ((parser->obj_openapi == OPENAPI_FORMAT_ARRAY) ||
-		    (parser->obj_openapi == OPENAPI_FORMAT_OBJECT) ||
-		    (parser->obj_openapi == OPENAPI_FORMAT_INVALID)) {
-			/*
-			 * Only one of the overrides is allowed but one must be
-			 * set
-			 */
-			if (parser->array_type) {
-				xassert(!parser->pointer_type);
-			} else if (parser->pointer_type) {
-				xassert(!parser->array_type);
-			} else if (!parser->field_name) {
-				/* field-less parser can can be any type */
-			} else {
-				fatal_abort("invalid openapi override");
-			}
-		} else {
-			xassert(parser->obj_openapi > OPENAPI_FORMAT_INVALID);
-			xassert(parser->obj_openapi < OPENAPI_FORMAT_MAX);
-			xassert(!parser->pointer_type);
-			xassert(!parser->array_type);
-		}
-	} else if (parser->model == PARSER_MODEL_PTR) {
-		xassert(parser->pointer_type > DATA_PARSER_TYPE_INVALID);
-		xassert(parser->pointer_type < DATA_PARSER_TYPE_MAX);
-		xassert(parser->size == sizeof(void *));
-		xassert(parser->ptr_offset == NO_VAL);
-		xassert(!parser->field_name);
-		xassert(!parser->key);
-		xassert(!parser->field_name);
-		xassert(!parser->flag_bit_array_count);
-		xassert(!parser->fields);
-		xassert(!parser->field_count);
-		xassert(!parser->parse);
-		xassert(!parser->dump);
-		xassert(parser->list_type == DATA_PARSER_TYPE_INVALID);
-		xassert(!parser->array_type);
-		xassert(!parser->obj_openapi);
-	} else if ((parser->model == PARSER_MODEL_NT_ARRAY) ||
-		   (parser->model == PARSER_MODEL_NT_PTR_ARRAY)) {
-		if (parser->model == PARSER_MODEL_NT_PTR_ARRAY) {
-			const parser_t *const eparser =
-				find_parser_by_type(parser->array_type);
-			xassert(eparser->pointer_type);
-		}
-
-		xassert(!parser->pointer_type);
-		xassert(parser->array_type > DATA_PARSER_TYPE_INVALID);
-		xassert(parser->array_type < DATA_PARSER_TYPE_MAX);
-		xassert(parser->size == sizeof(void *));
-		xassert(parser->ptr_offset == NO_VAL);
-		xassert(!parser->field_name);
-		xassert(!parser->key);
-		xassert(!parser->field_name);
-		xassert(!parser->flag_bit_array_count);
-		xassert(!parser->fields);
-		xassert(!parser->field_count);
-		xassert(!parser->parse);
-		xassert(!parser->dump);
-		xassert(parser->list_type == DATA_PARSER_TYPE_INVALID);
-		xassert(!parser->obj_openapi);
-	} else {
-		fatal_abort("invalid parser model %u", parser->model);
-	}
-}
-#endif /* !NDEBUG */
-
 static bool is_overloaded_INFINITE(const void *ptr, const size_t bytes)
 {
 	switch (bytes) {
@@ -1207,7 +805,6 @@ static int DUMP_FUNC(QOS_PREEMPT_LIST)(const parser_t *const parser, void *obj,
 {
 	slurmdb_qos_rec_t *qos = obj;
 
-	check_parser(parser);
 	xassert(args->qos_list);
 	xassert(!qos->preempt_list);
 
@@ -1333,8 +930,6 @@ static int PARSE_FUNC(JOB_ASSOC_ID)(const parser_t *const parser, void *obj,
 	slurmdb_job_rec_t *job = obj;
 	slurmdb_assoc_rec_t *assoc = NULL;
 	slurmdb_assoc_rec_t key = { 0 };
-
-	check_parser(parser);
 
 	if ((rc = PARSE(ASSOC_SHORT, key, src, parent_path, args)))
 		return rc;
@@ -2156,8 +1751,17 @@ static int PARSE_FUNC(USER_ID)(const parser_t *const parser, void *obj,
 					   src);
 		/* fall through */
 	case DATA_TYPE_INT_64:
-		uid = data_get_int(src);
+	{
+		int64_t tmp_val = data_get_int(src);
+		if ((tmp_val < 0) || (tmp_val > UINT32_MAX))
+			return parse_error(
+				parser, args, parent_path,
+				ESLURM_USER_ID_INVALID,
+				"Invalid user ID (overflow): %" PRId64,
+				tmp_val);
+		uid = tmp_val;
 		break;
+	}
 	case DATA_TYPE_STRING:
 	{
 		int rc;
@@ -2195,11 +1799,6 @@ static int PARSE_FUNC(USER_ID)(const parser_t *const parser, void *obj,
 		fatal_abort("invalid type");
 	}
 
-	if (uid >= INT_MAX)
-		return parse_error(parser, args, parent_path,
-				   ESLURM_USER_ID_INVALID,
-				   "Invalid user ID: %d", uid);
-
 	*uid_ptr = uid;
 
 	return SLURM_SUCCESS;
@@ -2220,8 +1819,17 @@ static int PARSE_FUNC(GROUP_ID)(const parser_t *const parser, void *obj,
 					   src);
 		/* fall through */
 	case DATA_TYPE_INT_64:
-		gid = data_get_int(src);
+	{
+		int64_t tmp_val = data_get_int(src);
+		if ((tmp_val < 0) || (tmp_val > UINT32_MAX))
+			return parse_error(
+				parser, args, parent_path,
+				ESLURM_GROUP_ID_INVALID,
+				"Invalid group ID (overflow): %" PRId64,
+				tmp_val);
+		gid = tmp_val;
 		break;
+	}
 	case DATA_TYPE_STRING:
 	{
 		int rc;
@@ -2258,11 +1866,6 @@ static int PARSE_FUNC(GROUP_ID)(const parser_t *const parser, void *obj,
 	case DATA_TYPE_MAX:
 		fatal_abort("invalid type");
 	}
-
-	if (gid >= INT_MAX)
-		return parse_error(parser, args, parent_path,
-				   ESLURM_GROUP_ID_INVALID,
-				   "Invalid group ID: %d", gid);
 
 	*gid_ptr = gid;
 
@@ -3121,8 +2724,6 @@ static int DUMP_FUNC(STEP_NODES)(const parser_t *const parser, void *src,
 	slurmdb_step_rec_t *step = src;
 	hostlist_t *host_list;
 
-	check_parser(parser);
-
 	/* ignore empty node list */
 	if (!step->nodes)
 		return SLURM_SUCCESS;
@@ -3144,7 +2745,6 @@ static int DUMP_FUNC(STEP_TRES_REQ_MAX)(const parser_t *const parser, void *src,
 					data_t *dst, args_t *args)
 {
 	slurmdb_step_rec_t *step = src;
-	check_parser(parser);
 
 	return _dump_tres_nct(parser, dst, step->stats.tres_usage_in_max,
 			      step->stats.tres_usage_in_max_nodeid,
@@ -3158,7 +2758,6 @@ static int DUMP_FUNC(STEP_TRES_REQ_MIN)(const parser_t *const parser, void *src,
 					data_t *dst, args_t *args)
 {
 	slurmdb_step_rec_t *step = src;
-	check_parser(parser);
 
 	return _dump_tres_nct(parser, dst, step->stats.tres_usage_in_min,
 			      step->stats.tres_usage_in_min_nodeid,
@@ -3172,7 +2771,6 @@ static int DUMP_FUNC(STEP_TRES_USAGE_MAX)(const parser_t *const parser,
 					  void *src, data_t *dst, args_t *args)
 {
 	slurmdb_step_rec_t *step = src;
-	check_parser(parser);
 
 	return _dump_tres_nct(parser, dst, step->stats.tres_usage_out_max,
 			      step->stats.tres_usage_out_max_nodeid,
@@ -3186,7 +2784,6 @@ static int DUMP_FUNC(STEP_TRES_USAGE_MIN)(const parser_t *const parser,
 					  void *src, data_t *dst, args_t *args)
 {
 	slurmdb_step_rec_t *step = src;
-	check_parser(parser);
 
 	return _dump_tres_nct(parser, dst, step->stats.tres_usage_out_min,
 			      step->stats.tres_usage_out_min_nodeid,
@@ -7046,7 +6643,7 @@ static int _foreach_license(void *x, void *arg)
 	xassert(license);
 	xassert(resources);
 
-	if (!license->nodes)
+	if (license->mode == HRES_MODE_OFF)
 		return SLURM_SUCCESS; /* not a hierarchical resource - skip */
 
 	if (!*resources)
@@ -9190,6 +8787,8 @@ static const parser_t PARSER_ARRAY(JOB_DESC_MSG)[] = {
 
 #define add_parse(mtype, field, path, desc) \
 	add_parser(update_node_msg_t, mtype, false, field, 0, path, desc)
+#define add_removed(mtype, path, desc, deprec) \
+	add_parser_removed(update_node_msg_t, mtype, false, path, desc, deprec)
 static const parser_t PARSER_ARRAY(UPDATE_NODE_MSG)[] = {
 	add_parse(STRING, comment, "comment", "Arbitrary comment"),
 	add_parse(UINT32, cpu_bind, "cpu_bind", "Default method for binding tasks to allocated CPUs"),
@@ -9202,12 +8801,13 @@ static const parser_t PARSER_ARRAY(UPDATE_NODE_MSG)[] = {
 	add_parse(HOSTLIST_STRING, node_names, "name", "NodeName"),
 	add_parse(NODE_STATES, node_state, "state", "New state to assign to the node"),
 	add_parse(STRING, reason, "reason", "Reason for node being DOWN or DRAINING"),
-	add_parse(USER_ID, reason_uid, "reason_uid", "User ID to associate with the reason (needed if user root is sending message)"),
+	add_removed(USER_ID, "reason_uid", "User ID to associate with the reason (needed if user root is sending message)", SLURM_26_05_PROTOCOL_VERSION),
 	add_parse(UINT32_NO_VAL, resume_after, "resume_after", "Number of seconds after which to automatically resume DOWN or DRAINED node"),
 	add_parse(STRING, topology_str, "topology_str", "Topology"),
 	add_parse(UINT32_NO_VAL, weight, "weight", "Weight of the node for scheduling purposes"),
 };
 #undef add_parse
+#undef add_removed
 
 #define add_parse(mtype, field, path, desc) \
 	add_parser(openapi_resp_meta_t, mtype, false, field, 0, path, desc)
@@ -9873,7 +9473,7 @@ static const flag_bit_t PARSER_FLAG_ARRAY(CR_TYPE)[] = {
 	add_flag_equal(SELECT_CPU, (SELECT_CPU|SELECT_SOCKET|SELECT_CORE), "CPU"),
 	add_flag_equal(SELECT_SOCKET, (SELECT_CPU|SELECT_SOCKET|SELECT_CORE), "SOCKET"),
 	add_flag_equal(SELECT_CORE, (SELECT_CPU|SELECT_SOCKET|SELECT_CORE), "CORE"),
-	add_flag_bit(SELECT_BOARD, "BOARD"),
+	add_flag_removed("BOARD", SLURM_26_11_PROTOCOL_VERSION),
 	add_flag_bit(SELECT_MEMORY, "MEMORY"),
 	add_flag_bit(SELECT_ONE_TASK_PER_CORE, "ONE_TASK_PER_CORE"),
 	add_flag_bit(SELECT_PACK_NODES, "PACK_NODES"),
@@ -11140,15 +10740,6 @@ extern const parser_t *unalias_parser(const parser_t *parser)
 	}
 
 	return parser;
-}
-
-extern void parsers_init(void)
-{
-#ifndef NDEBUG
-	/* sanity check the parsers */
-	for (int i = 0; i < ARRAY_SIZE(parsers); i++)
-		check_parser(&parsers[i]);
-#endif /* !NDEBUG */
 }
 
 #ifndef NDEBUG

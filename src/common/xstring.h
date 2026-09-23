@@ -49,8 +49,6 @@
 #define xstrcatchar(__p, __c)		_xstrcatchar(&(__p), __c)
 #define xstrftimecat(__p, __fmt)	_xstrftimecat(&(__p), __fmt)
 #define xiso8601timecat(__p, __msec)            _xiso8601timecat(&(__p), __msec)
-#define xrfc5424timecat(__p, __msec)            _xrfc5424timecat(&(__p), __msec)
-#define xrfc3339timecat(__p) _xrfc3339timecat(&(__p))
 #define xstrfmtcat(__p, __fmt, args...)	_xstrfmtcat(&(__p), __fmt, ## args)
 #define xstrfmtcatat(__p, __q, __fmt, args...) \
 	_xstrfmtcatat(&(__p), __q, __fmt, ## args)
@@ -110,16 +108,6 @@ void _xstrftimecat(char **str, const char *fmt);
 void _xiso8601timecat(char **str, bool);
 
 /*
-** Concatenate a RFC 5424 timestamp onto str.
-*/
-void _xrfc5424timecat(char **str, bool);
-
-/*
- * Concatenate a RFC 3339 timestamp onto str.
- */
-void _xrfc3339timecat(char **str);
-
-/*
  * Concatenate printf-style formatted string onto str
  */
 void _xstrfmtcat(char **str, const char *fmt, ...)
@@ -154,6 +142,9 @@ size_t _xstrdup_vprintf(char **str, const char *_fmt, va_list _ap);
 ** strndup which uses xmalloc routines
 */
 char *xstrndup(const char *str, size_t n);
+
+/* xstrndup which uses xmalloc routines but may return NULL on ENOMEM */
+extern char *try_xstrndup(const char *str, const size_t n);
 
 /*
 ** strtol which only reads 'n' number of chars in the str to get the number
@@ -264,6 +255,15 @@ extern char *xstring_bytes2hex(const unsigned char *string, int len,
  */
 extern char *xstring_bytes2printable(const unsigned char *string, int len,
 				     const char replace);
+
+/*
+ * Alternative to strtok_r() that's easier to construct loops with.
+ * If str and *saveptr are NULL then returns NULL.
+ * Unlike strtok_r, the str argument should continue to point to the
+ * string being parsed. This avoids needing to manipulate the first
+ * argument as part of the loop.
+ */
+extern char *xstrtoken(char *str, const char *delim, char **saveptr);
 
 /*
  * Return an xmalloc'd string in base64 format given a base64url string.

@@ -1,13 +1,17 @@
 ############################################################################
 # Copyright (C) SchedMD LLC.
 ############################################################################
-import atf
-import pytest
 import os
 
 # import re
 # import time
 import pwd
+
+import pytest
+
+import atf
+
+pytestmark = pytest.mark.slow
 
 max_mem_cpu = 2
 max_mem_node = 1
@@ -74,7 +78,7 @@ def setup():
 
     atf.require_auto_config("wants to change partitions, modify/create nodes")
     atf.require_accounting(modify=True)
-    atf.require_config_parameter("AccountingStorageEnforce", "limits")
+    atf.require_config_parameter_includes("AccountingStorageEnforce", "limits")
 
     # Gather a list of nodes that meet the RealMemory Requirement (node_list)
     atf.require_nodes(4, [("RealMemory", max_mem_node + 1)])
@@ -118,13 +122,6 @@ def setup_account():
         user=atf.properties["slurm-user"],
         fatal=True,
     )
-
-
-@pytest.fixture(scope="function")
-def cancel_jobs():
-    """Cancel all jobs after each test"""
-    yield
-    atf.cancel_all_jobs(fatal=True)
 
 
 # Helper funcs:
@@ -391,7 +388,7 @@ def enforce_NO_QOS(limit_name, flag, val_fail, val_pass):
 
 # Tests:
 @pytest.mark.parametrize("limit_name", limits_dict.keys())
-def test_ALL(limit_name, setup_account, cancel_jobs):
+def test_ALL(limit_name, setup_account):
     """Verify jobs are accepted and rejected with EnforePartLimits=ALL"""
 
     set_enforce_part_limits_policy("ALL")
@@ -401,7 +398,7 @@ def test_ALL(limit_name, setup_account, cancel_jobs):
 
 
 @pytest.mark.parametrize("limit_name", limits_dict.keys())
-def test_ANY(limit_name, setup_account, cancel_jobs):
+def test_ANY(limit_name, setup_account):
     """Verify jobs are accepted and rejected with EnforePartLimits=ANY"""
 
     set_enforce_part_limits_policy("ANY")
@@ -411,7 +408,7 @@ def test_ANY(limit_name, setup_account, cancel_jobs):
 
 
 @pytest.mark.parametrize("limit_name", limits_dict.keys())
-def test_NO(limit_name, setup_account, cancel_jobs):
+def test_NO(limit_name, setup_account):
     """Verify jobs are accepted and rejected with EnforcePartLimits=NO"""
 
     set_enforce_part_limits_policy("NO")

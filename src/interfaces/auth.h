@@ -42,10 +42,10 @@
 #include <inttypes.h>
 #include <stdio.h>
 
-#include "slurm/slurm.h"
-
 #include "src/common/plugrack.h"
 #include "src/common/pack.h"
+
+#define AUTH_PLUGIN_TYPE "auth"
 
 /*
  * This should be equal to MUNGE_UID_ANY
@@ -85,7 +85,7 @@ extern bool slurm_get_plugin_hash_enable(int index);
 /*
  * Check if specific plugin type has been initialized
  */
-extern bool auth_is_plugin_type_inited(auth_plugin_type_t plugin_id);
+extern bool auth_is_plugin_type_inited(int plugin_id);
 
 /*
  * Expose the context_lock externally so slurmstepd can prevent the
@@ -121,25 +121,20 @@ extern void auth_g_get_ids(void *cred, uid_t *uid, gid_t *gid);
 extern uid_t auth_g_get_uid(void *cred);
 extern char *auth_g_get_host(void *slurm_msg);
 extern int auth_g_get_data(void *cred, char **data, uint32_t *len);
+extern time_t auth_g_get_time(void *cred);
 extern void *auth_g_get_identity(void *cred);
 extern int auth_g_pack(void *cred, buf_t *buf, uint16_t protocol_version);
 extern void *auth_g_unpack(buf_t *buf, uint16_t protocol_version);
 
-/*
- * Generate authentication credential from token/username instead of unpacking
- * from a buffer
- */
-extern void *auth_g_cred_generate(auth_plugin_type_t plugin_id,
-				  const char *token, const char *username);
-
-extern char *auth_g_token_generate(auth_plugin_type_t plugin_id,
-				   const char *username, int lifespan);
+extern char *auth_g_token_generate(int plugin_id, const char *username,
+				   int lifespan);
 
 /*
- * Get file descriptor that must survive reconfig
- * RET -1 or file descriptor that must survive reconfig
+ * Prepare for reconfig: set env var into child env, mark fd no-close-on-exec.
+ * IN/OUT env - child environment to update
+ * RET -1 or file descriptor to skip close
  */
-extern int auth_g_get_reconfig_fd(auth_plugin_type_t plugin_id);
+extern int auth_g_prepare_reconfig_fd(int plugin_id, char ***env);
 
 /*
  * Set local thread security context
@@ -156,6 +151,6 @@ extern void auth_g_thread_clear(void);
 /*
  * Give auth plugin type if known from plugin_id
  */
-extern const char *auth_get_plugin_name(auth_plugin_type_t plugin_id);
+extern const char *auth_get_plugin_name(int plugin_id);
 
 #endif

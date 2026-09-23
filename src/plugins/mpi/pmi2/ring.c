@@ -163,7 +163,7 @@ static hostlist_t *pmix_stepd_hostlist = NULL;
 
 /* return rank of our parent in stepd tree,
  * returns -1 if we're the root */
-static int pmix_stepd_rank_parent()
+static int pmix_stepd_rank_parent(void)
 {
 	int rank = -1;
 	if (pmix_stepd_rank > 0) {
@@ -305,39 +305,6 @@ int pmix_ring_init(const pmi2_job_info_t* job, char*** env)
 
 	/* initialize count */
 	pmix_ring_count = 0;
-
-	return rc;
-}
-
-/* free resources allocated to track PMIX_Ring state */
-int pmix_ring_finalize()
-{
-	int rc = SLURM_SUCCESS;
-
-	/* clear the pmix_ring_in messages for next ring operation */
-        if (pmix_ring_msgs != NULL) {
-		int i;
-		for (i = 0; i < pmix_ring_children; i++) {
-			/* free any memory allocated for each message */
-			pmix_ring_msg* msg = &pmix_ring_msgs[i];
-			msg->count = 0;
-			if (msg->left != NULL) {
-				xfree(msg->left);
-				msg->left = NULL;
-			}
-			if (msg->right != NULL) {
-				xfree(msg->right);
-				msg->right = NULL;
-			}
-		}
-
-		/* free array of messages */
-		xfree(pmix_ring_msgs);
-		pmix_ring_msgs = NULL;
-	}
-
-	/* free host list */
-	FREE_NULL_HOSTLIST(pmix_stepd_hostlist);
 
 	return rc;
 }

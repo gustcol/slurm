@@ -84,6 +84,7 @@ strong_alias(stepd_gethostbyname, slurm_stepd_gethostbyname);
 strong_alias(xfree_struct_hostent, slurm_xfree_struct_hostent);
 strong_alias(stepd_get_namespace_fd, slurm_stepd_get_namespace_fd);
 strong_alias(stepd_get_namespace_fds, slurm_stepd_get_namespace_fds);
+strong_alias(stepd_destroy_ns_fd_map, slurm_stepd_destroy_ns_fd_map);
 
 /*
  * Should be called when a connect() to a socket returns ECONNREFUSED.
@@ -104,14 +105,13 @@ _handle_stray_socket(const char *socket_name)
 		return;
 
 	if (stat(socket_name, &buf) == -1) {
-		debug3("_handle_stray_socket: unable to stat %s: %m",
-			socket_name);
+		debug3("%s: unable to stat %s: %m", __func__, socket_name);
 		return;
 	}
 
 	if ((uid = getuid()) != buf.st_uid) {
-		debug3("_handle_stray_socket: socket %s is not owned by uid %u",
-		       socket_name, uid);
+		debug3("%s: socket %s is not owned by uid %u",
+		       __func__, socket_name, uid);
 		return;
 	}
 
@@ -120,8 +120,8 @@ _handle_stray_socket(const char *socket_name)
 		/* remove the socket */
 		if (unlink(socket_name) == -1) {
 			if (errno != ENOENT) {
-				error("_handle_stray_socket: unable to clean up"
-				      " stray socket %s: %m", socket_name);
+				error("%s: unable to clean up stray socket %s: %m",
+				      __func__, socket_name);
 			}
 		} else {
 			debug("Cleaned up stray socket %s", socket_name);
@@ -295,6 +295,29 @@ rwfail:
 	return status;
 }
 
+#define T(flag, str) { flag, XSTRINGIFY(flag), str }
+
+static const struct {
+	slurmstepd_state_t val;
+	char *state_str;
+	const char *str;
+} slurmstepd_state_map[] = {
+	T(SLURMSTEPD_NOT_RUNNING, "NOT RUNNING"),
+	T(SLURMSTEPD_STEP_STARTING, "STARTING"),
+	T(SLURMSTEPD_STEP_RUNNING, "RUNNING"),
+	T(SLURMSTEPD_STEP_CANCELLED, "CANCELLED"),
+	T(SLURMSTEPD_STEP_ENDING, "ENDING"),
+};
+
+extern const char *stepd_state_2str(slurmstepd_state_t state)
+{
+	for (int i = 0; i < ARRAY_SIZE(slurmstepd_state_map); i++) {
+		if (slurmstepd_state_map[i].val == state)
+			return slurmstepd_state_map[i].str;
+	}
+	return "UNKNOWN";
+}
+
 /*
  * Send job notification message to a batch job
  */
@@ -354,6 +377,31 @@ int stepd_signal_container(int fd, uint16_t protocol_version, int signal,
 	return rc;
 rwfail:
 	return -1;
+}
+
+/*
+ * Update the memory limit for a running job step.
+ */
+extern int stepd_update_mem_limit(int fd, uint16_t protocol_version,
+				  uint64_t job_mem_per_node)
+{
+	int req = REQUEST_STEP_UPDATE_MEM_LIMITS;
+	int rc;
+
+	safe_write(fd, &req, sizeof(int));
+	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
+		safe_write(fd, &job_mem_per_node, sizeof(uint64_t));
+	} else {
+		error("%s: invalid protocol_version %u",
+		      __func__, protocol_version);
+		goto rwfail;
+	}
+
+	/* Receive the return code */
+	safe_read(fd, &rc, sizeof(int));
+	return rc;
+rwfail:
+	return SLURM_ERROR;
 }
 
 /*
@@ -425,8 +473,23 @@ extern int stepd_get_namespace_fds(int fd, list_t *fd_map,
 	return fd_count;
 
 rwfail:
-	list_destroy(fd_map);
+	/*
+	 * fd_map is owned by the caller. Flush so any partially-received fds
+	 * are closed via the list's destructor, but do not destroy the list
+	 * itself - the caller will.
+	 */
+	list_flush(fd_map);
 	return SLURM_ERROR;
+}
+
+extern void stepd_destroy_ns_fd_map(void *x)
+{
+	ns_fd_map_t *entry = x;
+
+	if (!entry)
+		return;
+	fd_close(&entry->fd);
+	xfree(entry);
 }
 
 /*
@@ -534,7 +597,8 @@ rwfail:
  * On success returns SLURM_SUCCESS and fills in resp->local_pids,
  * resp->gtids, resp->ntasks, and resp->executable.
  */
-extern int stepd_attach(int fd, uint16_t protocol_version, slurm_addr_t *ioaddr,
+extern int stepd_attach(int fd, uint16_t stepd_protocol_version,
+			uint16_t srun_protocol_version, slurm_addr_t *ioaddr,
 			slurm_addr_t *respaddr, char *cert, char *io_key,
 			uid_t uid, reattach_tasks_response_msg_t *resp)
 {
@@ -543,7 +607,7 @@ extern int stepd_attach(int fd, uint16_t protocol_version, slurm_addr_t *ioaddr,
 	uint32_t cert_len;
 	int rc = SLURM_SUCCESS;
 
-	if (protocol_version >= SLURM_25_05_PROTOCOL_VERSION) {
+	if (stepd_protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
 		safe_write(fd, &req, sizeof(int)); /* needs to be first */
 
 		if (cert) {
@@ -560,15 +624,7 @@ extern int stepd_attach(int fd, uint16_t protocol_version, slurm_addr_t *ioaddr,
 		safe_write(fd, &io_key_len, sizeof(uint32_t));
 		safe_write(fd, io_key, io_key_len);
 		safe_write(fd, &uid, sizeof(uid_t));
-		safe_write(fd, &protocol_version, sizeof(uint16_t));
-	} else if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
-		safe_write(fd, &req, sizeof(int));
-		safe_write(fd, ioaddr, sizeof(slurm_addr_t));
-		safe_write(fd, respaddr, sizeof(slurm_addr_t));
-		safe_write(fd, &io_key_len, sizeof(uint32_t));
-		safe_write(fd, io_key, io_key_len);
-		safe_write(fd, &uid, sizeof(uid_t));
-		safe_write(fd, &protocol_version, sizeof(uint16_t));
+		safe_write(fd, &srun_protocol_version, sizeof(uint16_t));
 	} else
 		goto rwfail;
 
@@ -737,11 +793,16 @@ extern list_t *stepd_available(const char *directory, const char *nodename)
 		slurm_step_id_t step_id;
 
 		if (!_sockname_regex(&re, ent->d_name, &step_id)) {
+			char *full_string =
+				xstrdup_printf("%s/%s", dir, ent->d_name);
 			debug4("found %ps", &step_id);
 			loc = xmalloc(sizeof(step_loc_t));
 			loc->directory = xstrdup(dir);
 			loc->nodename = xstrdup(nodename);
 			loc->step_id = step_id;
+			if (!stat(full_string, &stat_buf))
+				loc->start_time = stat_buf.st_ctime;
+			xfree(full_string);
 			list_append(l, (void *) loc);
 		}
 	}
@@ -1367,6 +1428,33 @@ rwfail:
 	error("gathering job accounting: %d", rc);
 	jobacctinfo_destroy(resp->jobacct);
 	resp->jobacct = NULL;
+	return rc;
+}
+
+extern int stepd_job_usage(int fd, uint16_t protocol_version,
+			   jobacctinfo_t **jobacct)
+{
+	int req = REQUEST_JOB_USAGE;
+	int rc = SLURM_ERROR;
+
+	if (!(*jobacct = jobacctinfo_create(NULL)))
+		return rc;
+
+	debug("Entering %s", __func__);
+
+	safe_write(fd, &req, sizeof(int));
+
+	if (wait_fd(fd, 300, POLLIN))
+		goto rwfail;
+
+	rc = jobacctinfo_getinfo(*jobacct, JOBACCT_DATA_PIPE, &fd,
+				 protocol_version);
+rwfail:
+	if (rc) {
+		error("%s: failed: %d", __func__, rc);
+		jobacctinfo_destroy(*jobacct);
+		*jobacct = NULL;
+	}
 	return rc;
 }
 

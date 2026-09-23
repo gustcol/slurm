@@ -421,6 +421,14 @@ int _print_int(int number, int width, bool right, bool cut_output)
 	return _print_str(buf, width, right, cut_output);
 }
 
+static int _print_uint(unsigned int number, int width, bool right,
+		       bool cut_output)
+{
+	char buf[32];
+
+	snprintf(buf, 32, "%u", number);
+	return _print_str(buf, width, right, cut_output);
+}
 
 int _print_secs(long time, int width, bool right, bool cut_output)
 {
@@ -660,6 +668,19 @@ int _print_job_container_id(job_info_t *job, int width, bool right,
 	return SLURM_SUCCESS;
 }
 
+extern int print_job_runtime(job_info_t *job, int width, bool right,
+			     char *suffix)
+{
+	if (!job) /* Print the Header instead */
+		_print_str("RUNTIME", width, right, true);
+	else
+		_print_str(job->runtime, width, right, true);
+
+	if (suffix)
+		printf("%s", suffix);
+	return SLURM_SUCCESS;
+}
+
 int _print_job_core_spec(job_info_t * job, int width, bool right, char* suffix)
 {
 	char spec[FORMAT_STRING_SIZE];
@@ -833,7 +854,7 @@ int _print_job_user_id(job_info_t * job, int width, bool right, char* suffix)
 	if (job == NULL)	/* Print the Header instead */
 		_print_str("UID", width, right, true);
 	else
-		_print_int(job->user_id, width, right, true);
+		_print_uint(job->user_id, width, right, true);
 	if (suffix)
 		printf("%s", suffix);
 	return SLURM_SUCCESS;
@@ -857,7 +878,7 @@ int _print_job_group_id(job_info_t * job, int width, bool right, char* suffix)
 	if (job == NULL)	/* Print the Header instead */
 		_print_str("GROUP", width, right, true);
 	else
-		_print_int(job->group_id, width, right, true);
+		_print_uint(job->group_id, width, right, true);
 	if (suffix)
 		printf("%s", suffix);
 	return SLURM_SUCCESS;
@@ -1286,14 +1307,28 @@ int _print_job_num_tasks(job_info_t * job, int width, bool right, char* suffix)
 	return SLURM_SUCCESS;
 }
 
+int _print_job_exclusive(job_info_t *job, int width, bool right_justify,
+			 char *suffix)
+{
+	if (job == NULL) { /* Print the Header instead */
+		_print_str("EXCLUSIVE", width, right_justify, true);
+	} else {
+		_print_str(job_exclusive_display_string(job->exclusive), width,
+			   right_justify, true);
+	}
+	if (suffix)
+		printf("%s", suffix);
+	return SLURM_SUCCESS;
+}
+
 int _print_job_over_subscribe(job_info_t * job, int width, bool right_justify,
 			      char* suffix)
 {
 	if (job == NULL) {	/* Print the Header instead */
 		_print_str("OVER_SUBSCRIBE", width, right_justify, true);
 	} else {
-		_print_str(job_share_string(job->shared),
-			   width, right_justify, true);
+		_print_str(job_oversubscribe_string(job->oversubscribe), width,
+			   right_justify, true);
 	}
 	if (suffix)
 		printf("%s", suffix);
@@ -2546,6 +2581,19 @@ int _print_step_container_id(job_step_info_t *step, int width, bool right,
 	return SLURM_SUCCESS;
 }
 
+extern int print_step_runtime(job_step_info_t *step, int width, bool right,
+			      char *suffix)
+{
+	if (!step) /* Print the Header instead */
+		_print_str("RUNTIME", width, right, true);
+	else
+		_print_str(step->runtime, width, right, true);
+
+	if (suffix)
+		printf("%s", suffix);
+	return SLURM_SUCCESS;
+}
+
 int _print_step_id(job_step_info_t * step, int width, bool right, char* suffix)
 {
 	char id[FORMAT_STRING_SIZE];
@@ -2666,7 +2714,7 @@ int _print_step_user_id(job_step_info_t * step, int width, bool right,
 	if (step == NULL)	/* Print the Header instead */
 		_print_str("UID", width, right, true);
 	else
-		_print_int(step->user_id, width, right, true);
+		_print_uint(step->user_id, width, right, true);
 	if (suffix)
 		printf("%s", suffix);
 	return SLURM_SUCCESS;
@@ -3029,10 +3077,24 @@ static bool _filter_job(job_info_t *job)
 	if (job->step_id.job_id == 0)
 		return true;
 
-	if (params.job_list) {
+	/*
+	 * With --only-job-state, RESPONSE_JOB_STATE entries lack the sluid
+	 * (and other fields the filters below rely on) so the sluid match
+	 * always misses. The controller has already applied params.job_list
+	 * for us, so skip the redundant client-side job_list filter here.
+	 */
+	if (!params.only_state && params.job_list) {
 		bool filter = true;
 		iterator = list_iterator_create(params.job_list);
 		while ((job_step_id = list_next(iterator))) {
+			if (job_step_id->step_id.sluid) {
+				if (job_step_id->step_id.sluid ==
+				    job->step_id.sluid) {
+					filter = false;
+					break;
+				}
+				continue;
+			}
 			if (((job_step_id->array_id == NO_VAL) &&
 			     ((job_step_id->step_id.job_id ==
 			       job->array_job_id) ||

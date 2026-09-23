@@ -52,7 +52,9 @@
 #include "slurm/slurm.h"
 #include "slurm/slurmdb.h"
 
+#include "src/common/daemonize.h"
 #include "src/common/data.h"
+#include "src/common/http_con.h"
 #include "src/common/log.h"
 #include "src/common/slurm_protocol_defs.h"
 #include "src/common/uid.h"
@@ -76,7 +78,9 @@ extern int slurm_rest_auth_p_apply(rest_auth_context_t *context);
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 /* protected by lock */
-static bool become_user = false;
+static bool become_user_mode = false;
+static bool local_unshare_sysv = false;
+static bool local_unshare_files = false;
 
 #define MAGIC 0xd11abee2
 typedef struct {
@@ -115,15 +119,15 @@ static int _auth_socket(on_http_request_args_t *args,
 {
 	int rc;
 	const char *name = args->name;
-	conmgr_fd_t *con = conmgr_fd_get_ref(args->con);
+	http_con_t *hcon = args->hcon;
 	uid_t cred_uid = SLURM_AUTH_NOBODY;
 	gid_t cred_gid = SLURM_AUTH_NOBODY;
 	pid_t cred_pid = 0;
 
 	xassert(!ctxt->user_name);
 
-	if ((rc = conmgr_get_fd_auth_creds(con, &cred_uid, &cred_gid,
-					   &cred_pid))) {
+	if ((rc = http_con_get_auth_creds(hcon, &cred_uid, &cred_gid,
+					  &cred_pid))) {
 		/* socket may be remote, local auth doesn't apply */
 		debug("%s: [%s] unable to get socket ownership: %s",
 		      __func__, name, slurm_strerror(rc));
@@ -164,7 +168,7 @@ static int _auth_socket(on_http_request_args_t *args,
 		 * users trying to connect
 		 */
 		slurm_mutex_lock(&lock);
-		if (become_user) {
+		if (become_user_mode) {
 			info("%s: [%s] accepted user proxy socket connection with uid:%u gid:%u pid:%ld",
 			     __func__, name, cred_uid, cred_gid,
 			     (long) cred_pid);
@@ -179,27 +183,17 @@ static int _auth_socket(on_http_request_args_t *args,
 				fatal("%s: [%s] unable to resolve user uid %u",
 				      __func__, name, cred_uid);
 
-			if (setgroups(0, NULL))
-				fatal("Unable to drop supplementary groups: %m");
-
-			if (setuid(cred_uid))
-				fatal("%s: [%s] unable to switch to user uid %u: %m",
-				      __func__, name, cred_uid);
-
-			if ((getgid() != cred_gid) && setgid(cred_gid))
-				fatal("%s: [%s] unable to switch to user gid %u: %m",
-				      __func__, name, cred_gid);
-
-			if ((getuid() != cred_uid) || (getgid() != cred_gid))
-				fatal("%s: [%s] user switch sanity check failed",
-				      __func__, name);
+			if (become_user(cred_uid, cred_gid, NULL, 0, true,
+					local_unshare_sysv, local_unshare_files,
+					true, true, false, false))
+				exit(1);
 
 			/*
 			 * Only allow user change once to ensure against replay
 			 * attacks. Next attempt to connect will be forced to be
 			 * the same user.
 			 */
-			become_user = false;
+			become_user_mode = false;
 			slurm_mutex_unlock(&lock);
 		} else {
 			slurm_mutex_unlock(&lock);
@@ -226,29 +220,23 @@ extern int slurm_rest_auth_p_authenticate(on_http_request_args_t *args,
 	struct stat status = { 0 };
 	const char *header_user_name = find_http_header(args->headers,
 							HTTP_HEADER_USER_NAME);
-	conmgr_fd_t *con = conmgr_fd_get_ref(args->con);
-	const conmgr_fd_status_t cstatus = conmgr_fd_get_status(con);
+	http_con_t *hcon = args->hcon;
+	conmgr_fd_status_t cstatus = { 0 };
 	const char *name = args->name;
-	int rc = EINVAL, input_fd = -1, output_fd = -1;
+	int rc = EINVAL;
 
 	xassert(!ctxt->user_name);
 
-	if ((rc = conmgr_con_get_input_fd(args->con, &input_fd))) {
-		debug3("%s: [%s] skipping auth local with invalid input_fd: %s",
-		       __func__, conmgr_con_get_name(args->con),
-		       slurm_strerror(rc));
+	if ((rc = http_con_get_status(hcon, &cstatus))) {
+		debug3("%s: [%s] skipping auth local with invalid connection: %s",
+		       __func__, name, slurm_strerror(rc));
 		return ESLURM_AUTH_SKIP;
 	}
-	if ((rc = conmgr_con_get_output_fd(args->con, &output_fd))) {
-		debug3("%s: [%s] skipping auth local with invalid output_fd: %s",
-		       __func__, conmgr_con_get_name(args->con),
-		       slurm_strerror(rc));
-		return ESLURM_AUTH_SKIP;
-	}
-	if ((input_fd < 0) || (output_fd < 0)) {
+
+	if (!cstatus.is_connected) {
 		/* local auth requires there to be a valid fd */
-		debug3("%s: skipping auth local with invalid input_fd:%u output_fd:%u",
-		       __func__, input_fd, output_fd);
+		debug3("%s: [%s] skipping auth local with unconnected connection",
+		       __func__, name);
 		return ESLURM_AUTH_SKIP;
 	}
 
@@ -261,16 +249,17 @@ extern int slurm_rest_auth_p_authenticate(on_http_request_args_t *args,
 		return ESLURM_AUTH_SKIP;
 	} else if (cstatus.is_socket && cstatus.unix_socket) {
 		return _auth_socket(args, ctxt, header_user_name);
-	} else if (fstat(input_fd, &status)) {
-		error("%s: [%s] unable to stat fd %d: %m",
-		      __func__, name, input_fd);
+	} else if ((rc = http_con_fstat_input(hcon, &status))) {
+		/* only the non-socket paths below need the file mode */
+		error("%s: [%s] unable to stat input: %s",
+		      __func__, name, slurm_strerror(rc));
 		return ESLURM_AUTH_CRED_INVALID;
 	} else if (S_ISCHR(status.st_mode) || S_ISFIFO(status.st_mode) ||
 		   S_ISREG(status.st_mode)) {
 		bool reject_proxy = false;
 
 		slurm_mutex_lock(&lock);
-		if (become_user)
+		if (become_user_mode)
 			reject_proxy = true;
 		slurm_mutex_unlock(&lock);
 
@@ -345,16 +334,19 @@ extern void slurm_rest_auth_p_free(rest_auth_context_t *context)
 	xfree(context->plugin_data);
 }
 
-extern void slurm_rest_auth_p_init(bool bu)
+extern void slurm_rest_auth_p_init(bool bu, bool unshare_sysv,
+				   bool unshare_files)
 {
 	if (!bu) {
 		debug3("%s: REST local auth activated", __func__);
 	} else if (!getuid()) {
 		slurm_mutex_lock(&lock);
-		if (become_user)
+		if (become_user_mode)
 			fatal("duplicate call to %s", __func__);
 
-		become_user = true;
+		become_user_mode = true;
+		local_unshare_sysv = unshare_sysv;
+		local_unshare_files = unshare_files;
 		slurm_mutex_unlock(&lock);
 
 		debug3("%s: REST local auth with become user mode active",

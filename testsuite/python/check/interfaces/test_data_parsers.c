@@ -1,21 +1,21 @@
 /*****************************************************************************\
- *  Test for data_parser plugin
- *****************************************************************************
  *  Copyright (C) SchedMD LLC.
+ *****************************************************************************
+ *  Test for data_parser plugin
 \*****************************************************************************/
 
-#define _GNU_SOURCE
 #include <check.h>
 
 #include "slurm/slurm.h"
 #include "slurm/slurmdb.h"
 
 #include "src/common/data.h"
-#include "src/common/log.h"
 #include "src/common/list.h"
+#include "src/common/log.h"
 #include "src/common/macros.h"
-#include "src/common/read_config.h"
+#include "src/common/openapi.h"
 #include "src/common/plugrack.h"
+#include "src/common/read_config.h"
 #include "src/common/xassert.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"

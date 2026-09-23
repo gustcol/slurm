@@ -39,9 +39,10 @@
 
 #include "scontrol.h"
 #include "src/common/env.h"
-#include "src/interfaces/gres.h"
 #include "src/common/proc_args.h"
+#include "src/common/sluid.h"
 #include "src/common/uid.h"
+#include "src/interfaces/gres.h"
 
 typedef struct job_ids {
 	uint32_t job_id;
@@ -55,7 +56,7 @@ static bool	_is_job_id(char *job_str);
 static bool	_is_single_job(char *job_id_str);
 static char *	_job_name2id(char *job_name, uint32_t job_uid);
 static char *	_next_job_id(void);
-static void	_update_job_size(uint32_t job_id);
+static void _update_job_size(slurm_step_id_t step_id);
 
 /* Local variables for managing job IDs */
 static char *local_job_str = NULL;
@@ -72,7 +73,15 @@ static bool _is_job_id(char *job_str)
 
 	local_job_str = xstrdup(job_str);
 	for (i = 0; local_job_str[i]; i++) {
-		if (local_job_str[i] == '+') {
+		if (local_job_str[i] == 's') {
+			int end_sluid = i + SLUID_STR_BYTES - 1;
+			char c = local_job_str[end_sluid];
+			local_job_str[end_sluid] = '\0';
+			if (!str2sluid(&local_job_str[i]))
+				goto fail;
+			local_job_str[end_sluid] = c;
+			i += SLUID_STR_BYTES - 2;
+		} else if (local_job_str[i] == '+') {
 			if (have_plus)
 				goto fail;	/* multiple '+' in name */
 			have_plus = true;
@@ -225,6 +234,7 @@ scontrol_hold(char *op, char *job_str)
 	char *job_name = NULL;
 	char *job_id_str = NULL;
 	slurm_job_info_t *job_ptr;
+	slurm_step_id_t step_id = SLURM_STEP_ID_INITIALIZER;
 
 	if (job_str && !xstrncasecmp(job_str, "JobID=", 6))
 		job_str += 6;
@@ -299,7 +309,10 @@ scontrol_hold(char *op, char *job_str)
 	}
 
 	if (last_job_id != job_id) {
-		if (scontrol_load_job(&jobs, 0, job_id)) {
+		step_id.job_id = job_id;
+		step_id.sluid = 0;
+
+		if (scontrol_load_job(&jobs, step_id)) {
 			if (quiet_flag == -1)
 				slurm_perror ("slurm_load_job error");
 			return 1;
@@ -895,6 +908,38 @@ extern int scontrol_update_job(int argc, char **argv)
 		} else if (!xstrncasecmp(tag, "WCKey", MAX(taglen, 1))) {
 			job_msg.wckey = val;
 			update_cnt++;
+		} else if (!xstrncasecmp(tag, "SegmentSize", MAX(taglen, 7))) {
+			if (parse_uint16(val, &job_msg.segment_size)) {
+				error("Invalid SegmentSize value: %s", val);
+				exit_code = 1;
+				return 0;
+			}
+			update_cnt++;
+		} else if (!xstrncasecmp(tag, "SpreadSegments",
+					 MAX(taglen, 6))) {
+			if (!xstrncasecmp(val, "YES", MAX(vallen, 1))) {
+				job_msg.bitflags |= SPREAD_SEGMENTS;
+			} else if (!xstrncasecmp(val, "NO", MAX(vallen, 1))) {
+				job_msg.bitflags |= RESET_SPREAD_SEGMENTS;
+			} else {
+				error("Invalid SpreadSegments value: %s", val);
+				exit_code = 1;
+				return 0;
+			}
+			update_cnt++;
+		} else if (!xstrncasecmp(tag, "ConsolidateSegments",
+					 MAX(taglen, 11))) {
+			if (!xstrncasecmp(val, "YES", MAX(vallen, 1))) {
+				job_msg.bitflags |= CONSOLIDATE_SEGMENTS;
+			} else if (!xstrncasecmp(val, "NO", MAX(vallen, 1))) {
+				job_msg.bitflags |= RESET_CONSOLIDATE_SEGMENTS;
+			} else {
+				error("Invalid ConsolidateSegments value: %s",
+				      val);
+				exit_code = 1;
+				return 0;
+			}
+			update_cnt++;
 		} else if (!xstrncasecmp(tag, "StdErr", MAX(taglen, 6))) {
 			job_msg.std_err = val;
 			update_cnt++;
@@ -924,9 +969,9 @@ extern int scontrol_update_job(int argc, char **argv)
 		} else if (!xstrncasecmp(tag, "OverSubscribe", MAX(taglen, 2)) ||
 			   !xstrncasecmp(tag, "Shared", MAX(taglen, 2))) {
 			if (!xstrncasecmp(val, "YES", MAX(vallen, 1)))
-				job_msg.shared = 1;
+				job_msg.shared = JOB_SHARED_OK;
 			else if (!xstrncasecmp(val, "NO", MAX(vallen, 1)))
-				job_msg.shared = 0;
+				job_msg.shared = JOB_SHARED_NONE;
 			else if (parse_uint16(val, &job_msg.shared)) {
 				error("Invalid OverSubscribe value: %s", val);
 				exit_code = 1;
@@ -1135,7 +1180,7 @@ extern int scontrol_update_job(int argc, char **argv)
 				/* See check above for one job ID */
 				job_msg.step_id.job_id =
 					slurm_atoul(job_msg.job_id_str);
-				_update_job_size(job_msg.step_id.job_id);
+				_update_job_size(job_msg.step_id);
 			}
 			if (rc2 != SLURM_SUCCESS) {
 				rc2 = errno;
@@ -1200,6 +1245,7 @@ extern int scontrol_job_notify(int argc, char **argv)
 	int i;
 	uint32_t job_id;
 	char *message = NULL;
+	slurm_step_id_t step_id = SLURM_STEP_ID_INITIALIZER;
 
 	job_id = atoi(argv[0]);
 	if (job_id <= 0) {
@@ -1214,7 +1260,8 @@ extern int scontrol_job_notify(int argc, char **argv)
 			xstrcat(message, argv[i]);
 	}
 
-	i = slurm_notify_job(job_id, message);
+	step_id.job_id = job_id;
+	i = slurm_notify_job(step_id, message);
 	xfree(message);
 
 	if (i)
@@ -1223,7 +1270,7 @@ extern int scontrol_job_notify(int argc, char **argv)
 		return 0;
 }
 
-static void _update_job_size(uint32_t job_id)
+static void _update_job_size(slurm_step_id_t step_id)
 {
 	resource_allocation_response_msg_t *alloc_info;
 	char *fname_csh = NULL, *fname_sh = NULL;
@@ -1232,8 +1279,7 @@ static void _update_job_size(uint32_t job_id)
 	if (!getenv("SLURM_JOBID"))
 		return;		/* No job environment here to update */
 
-	if (slurm_allocation_lookup(job_id, &alloc_info) !=
-	    SLURM_SUCCESS) {
+	if (slurm_allocation_lookup(step_id, &alloc_info) != SLURM_SUCCESS) {
 		if (errno != ESLURM_ALREADY_DONE) {
 			slurm_perror("slurm_allocation_lookup");
 			return;
@@ -1243,8 +1289,8 @@ static void _update_job_size(uint32_t job_id)
 		alloc_info->node_list = xstrdup("");
 	}
 
-	xstrfmtcat(fname_csh, "slurm_job_%u_resize.csh", job_id);
-	xstrfmtcat(fname_sh,  "slurm_job_%u_resize.sh", job_id);
+	xstrfmtcat(fname_csh, "slurm_job_%u_resize.csh", step_id.job_id);
+	xstrfmtcat(fname_sh, "slurm_job_%u_resize.sh", step_id.job_id);
 	(void) unlink(fname_csh);
 	(void) unlink(fname_sh);
  	if (!(resize_csh = fopen(fname_csh, "w"))) {
@@ -1357,14 +1403,15 @@ extern int parse_requeue_flags(char *s, uint32_t *flags)
  * information is not available */
 static uint32_t _get_job_time(const char *job_id_str)
 {
-	uint32_t job_id, task_id;
+	uint32_t task_id;
 	char *next_str = NULL;
 	uint32_t time_limit = NO_VAL;
 	int i, rc;
 	job_info_msg_t *resp;
 	bitstr_t *array_bitmap;
+	slurm_step_id_t step_id = SLURM_STEP_ID_INITIALIZER;
 
-	job_id = (uint32_t)strtol(job_id_str, &next_str, 10);
+	step_id.job_id = (uint32_t) strtol(job_id_str, &next_str, 10);
 	if (next_str[0] == '_') {
 		task_id = (uint32_t)strtol(next_str+1, &next_str, 10);
 		if (next_str[0] != '\0') {
@@ -1378,7 +1425,7 @@ static uint32_t _get_job_time(const char *job_id_str)
 		task_id = NO_VAL;
 	}
 
-	rc = slurm_load_job(&resp, job_id, SHOW_ALL);
+	rc = slurm_load_job(&resp, step_id, SHOW_ALL);
 	if (rc == SLURM_SUCCESS) {
 		if (resp->record_count == 0) {
 			error("Job ID %s not found", job_id_str);
@@ -1397,14 +1444,15 @@ static uint32_t _get_job_time(const char *job_id_str)
 			return time_limit;
 		}
 		for (i = 0; i < resp->record_count; i++) {
-			if ((resp->job_array[i].step_id.job_id == job_id) &&
+			if ((resp->job_array[i].step_id.job_id ==
+			     step_id.job_id) &&
 			    (resp->job_array[i].array_task_id == NO_VAL) &&
 			    (resp->job_array[i].array_bitmap == NULL)) {
 				/* Regular job match */
 				time_limit = resp->job_array[i].time_limit;
 				break;
 			}
-			if (resp->job_array[i].array_job_id != job_id)
+			if (resp->job_array[i].array_job_id != step_id.job_id)
 				continue;
 			array_bitmap = resp->job_array[i].array_bitmap;
 			if ((task_id == NO_VAL) ||
@@ -1428,39 +1476,33 @@ static uint32_t _get_job_time(const char *job_id_str)
 
 static bool _is_single_job(char *job_id_str)
 {
-	uint32_t job_id, task_id;
-	char *next_str = NULL;
 	int rc;
 	job_info_msg_t *resp;
 	bool is_single = false;
+	slurm_selected_step_t sel = { 0 };
 
-	job_id = (uint32_t)strtol(job_id_str, &next_str, 10);
-	if (next_str[0] == '_') {
-		task_id = (uint32_t)strtol(next_str+1, &next_str, 10);
-		if (next_str[0] != '\0') {
-			error("Invalid job ID %s", job_id_str);
-			return is_single;
-		}
-	} else if (next_str[0] != '\0') {
+	if (unfmt_job_id_string(job_id_str, &sel, NO_VAL)) {
 		error("Invalid job ID %s", job_id_str);
 		return is_single;
-	} else {
-		task_id = NO_VAL;
 	}
 
-	rc = slurm_load_job(&resp, job_id, SHOW_ALL);
+	/* SLUID always identifies a single job */
+	if (sel.step_id.sluid)
+		return true;
+
+	rc = slurm_load_job(&resp, sel.step_id, SHOW_ALL);
 	if (rc == SLURM_SUCCESS) {
 		if (resp->record_count == 0) {
 			error("Job ID %s not found", job_id_str);
 			slurm_free_job_info_msg(resp);
 			return is_single;
 		}
-		if ((resp->record_count > 1) && (task_id == NO_VAL)) {
+		if ((resp->record_count > 1) && (sel.array_task_id == NO_VAL)) {
 			error("Job resizing not supported for job arrays");
 			slurm_free_job_info_msg(resp);
 			return is_single;
 		}
-		is_single = true;	/* Do not bother to validate */
+		is_single = true;
 		slurm_free_job_info_msg(resp);
 	} else {
 		error("Could not load state information for job %s: %m",
@@ -1478,10 +1520,15 @@ static char *_job_name2id(char *job_name, uint32_t job_uid)
 	job_info_msg_t *resp;
 	slurm_job_info_t *job_ptr;
 	char *job_id_str = NULL, *sep = "";
+	slurm_step_id_t step_id = SLURM_STEP_ID_INITIALIZER;
 
 	xassert(job_name);
 
-	rc = scontrol_load_job(&resp, 0, 0);
+	/* All jobs */
+	step_id.sluid = 0;
+	step_id.job_id = 0;
+
+	rc = scontrol_load_job(&resp, step_id);
 	if (rc == SLURM_SUCCESS) {
 		if (resp->record_count == 0) {
 			error("JobName %s not found", job_name);

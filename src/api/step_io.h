@@ -50,6 +50,7 @@ typedef struct {
 					 * NO_VAL */
 
 	char *io_key;
+	char *io_key_hash;
 
 	/* internal variables */
 	bool io_running;		/* I/O thread running */
@@ -98,7 +99,8 @@ typedef struct {
 
 client_io_t *client_io_handler_create(slurm_step_io_fds_t fds, int num_tasks,
 				      int num_nodes, char *io_key,
-				      bool label, uint32_t het_job_offset,
+				      char *io_key_hash, bool label,
+				      uint32_t het_job_offset,
 				      uint32_t het_job_task_offset);
 
 extern void client_io_handler_start(client_io_t *cio);
@@ -120,7 +122,7 @@ void client_io_handler_downnodes(client_io_t *cio,
 /*
  * Tell the client IO handler to test the communication path to a
  * node suspected to be down by sending a message, which will be
- * ignored by the slurmstepd.  If the write fails the step_launch_state
+ * ignored by the slurmstepd.  If the write fails the step launch state
  * will be notified.
  */
 int client_io_handler_send_test_message(client_io_t *cio, int node_id,

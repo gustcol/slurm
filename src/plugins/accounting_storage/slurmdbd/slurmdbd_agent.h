@@ -42,6 +42,7 @@
 
 #include "dbd_conn.h"
 #include "src/common/assoc_mgr.h"
+#include "src/common/persist_conn.h"
 
 extern persist_conn_t *slurmdbd_conn;
 
@@ -49,6 +50,13 @@ extern persist_conn_t *slurmdbd_conn;
 extern void slurmdbd_agent_set_conn(persist_conn_t *pc);
 /* Shut down the agent */
 extern void slurmdbd_agent_rem_conn(void);
+/*
+ * Final teardown of the agent queue. Save any messages still queued
+ * (including late writers that enqueued after the agent thread exited)
+ * to dbd.messages and free the queue. Must only be called after the
+ * plugin is otherwise idle (i.e. no concurrent slurmdbd_agent_send()).
+ */
+extern void slurmdbd_agent_fini(void);
 
 /*
  * Send an RPC to the SlurmDBD and wait for an arbitrary reply message.
@@ -76,5 +84,15 @@ extern int slurmdbd_agent_queue_count(void);
 
 /* set up local variables based on slurm.conf params */
 extern void slurmdbd_agent_config_setup(void);
+
+/*
+ * Signal to the agent thread that the slurmctld has finished recovery
+ * (read_slurm_conf has run, job_list/job_hash are populated). Until this is
+ * called, the agent thread blocks before sending any RPCs so that returns
+ * from DBD_JOB_START messages aren't processed against an empty job_hash.
+ * Held messages in agent_list (including the on-disk dbd.messages loaded at
+ * startup) are processed in FIFO order once signaled.
+ */
+extern void slurmdbd_agent_ctld_recovered(void);
 
 #endif

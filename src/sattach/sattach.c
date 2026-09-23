@@ -50,9 +50,11 @@
 #include "src/common/macros.h"
 #include "src/common/net.h"
 #include "src/common/read_config.h"
+#include "src/common/sluid.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/slurm_protocol_defs.h"
 #include "src/common/threadpool.h"
+#include "src/common/workerpool.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xsignal.h"
 #include "src/common/xstring.h"
@@ -61,11 +63,16 @@
 #include "src/interfaces/certgen.h"
 #include "src/interfaces/certmgr.h"
 #include "src/interfaces/conn.h"
+#include "src/interfaces/hash.h"
 
 #include "src/api/step_io.h"
 
+#include "src/conmgr/conmgr.h"
+
 #include "src/sattach/attach.h"
 #include "src/sattach/opt.h"
+
+#define SATTACH_WORKERPOOL_THREADS CONMGR_THREAD_COUNT_MIN
 
 static void _mpir_init(int num_tasks);
 static void _mpir_cleanup(void);
@@ -113,6 +120,31 @@ static struct io_operations message_socket_ops = {
 
 static struct termios termdefaults;
 
+/* Set by _on_detach_signal(); guarded by the message thread state lock. */
+static bool detach_requested = false;
+
+/*
+ * conmgr signal work run when a detach signal (SIGINT etc.) is received. It
+ * wakes _msg_thr_wait() so sattach falls through to its normal teardown, which
+ * gracefully shuts down (TLS included) the I/O connections; the step is left
+ * running. conmgr catches the signal and runs this from a worker thread (not
+ * the signal handler itself), so waking the condition variable here is safe.
+ * IN conmgr_args - conmgr callback state
+ * IN arg - message_thread_state_t to signal
+ */
+static void _on_detach_signal(conmgr_callback_args_t conmgr_args, void *arg)
+{
+	message_thread_state_t *mts = arg;
+
+	if (conmgr_args.status == CONMGR_WORK_STATUS_CANCELLED)
+		return;
+
+	slurm_mutex_lock(&mts->lock);
+	detach_requested = true;
+	slurm_cond_broadcast(&mts->cond);
+	slurm_mutex_unlock(&mts->lock);
+}
+
 /**********************************************************************
  * sattach
  **********************************************************************/
@@ -124,6 +156,7 @@ int sattach(int argc, char **argv)
 	uint32_t jobid, stepid;
 	client_io_t *io;
 	char *io_key = NULL;
+	char *io_key_hash = NULL;
 
 	slurm_init(NULL);
 	log_init(xbasename(argv[0]), logopt, 0, NULL);
@@ -154,8 +187,12 @@ int sattach(int argc, char **argv)
 	jobid = opt.selected_step->step_id.job_id;
 	stepid = opt.selected_step->step_id.step_id;
 
-	totalview_jobid = NULL;
-	xstrfmtcat(totalview_jobid, "%u", jobid);
+	if (opt.selected_step->step_id.sluid)
+		totalview_jobid = sluid2str(opt.selected_step->step_id.sluid);
+	else {
+		totalview_jobid = NULL;
+		xstrfmtcat(totalview_jobid, "%u", jobid);
+	}
 	totalview_stepid = NULL;
 	xstrfmtcat(totalview_stepid, "%u", stepid);
 
@@ -166,12 +203,29 @@ int sattach(int argc, char **argv)
 	}
 
 	io_key = _generate_io_key();
+	if (!(io_key_hash = hash_g_compute_hex(io_key)))
+		fatal("%s: failed to compute IO key hash", __func__);
 	mts = _msg_thr_create(layout->node_cnt, layout->task_cnt);
 
 	io = client_io_handler_create(opt.fds, layout->task_cnt,
-				      layout->node_cnt, io_key,
+				      layout->node_cnt, io_key, io_key_hash,
 				      opt.labelio, NO_VAL, NO_VAL);
 	client_io_handler_start(io);
+
+	/*
+	 * Use conmgr solely to catch signals so a Ctrl-C (or termination)
+	 * detaches cleanly through the normal teardown path, which gracefully
+	 * shuts down the I/O connections (TLS close_notify) instead of dropping
+	 * them abruptly. conmgr_run() is non-blocking and processes signals from
+	 * a background thread.
+	 */
+	workerpool_init(0, SATTACH_WORKERPOOL_THREADS, NULL);
+	conmgr_init(0);
+	conmgr_add_work_signal(SIGINT, _on_detach_signal, mts);
+	conmgr_add_work_signal(SIGTERM, _on_detach_signal, mts);
+	conmgr_add_work_signal(SIGQUIT, _on_detach_signal, mts);
+	conmgr_add_work_signal(SIGHUP, _on_detach_signal, mts);
+	conmgr_run(false);
 
 	if (opt.pty) {
 		struct termios term;
@@ -199,12 +253,27 @@ int sattach(int argc, char **argv)
 		_mpir_dump_proctable();
 
 	_msg_thr_wait(mts);
+
+	/* Stop conmgr before tearing down the state its signal work references. */
+	conmgr_fini();
+	workerpool_fini();
+
 	_msg_thr_destroy(mts);
 	slurm_job_step_layout_free(layout);
+	/*
+	 * Force the IO servers closed rather than waiting for the remaining task
+	 * stdout/stderr. sattach is detaching, so it should exit promptly even
+	 * while the step (and its output) keeps running; without this,
+	 * client_io_handler_finish() would block until every remote stdout/stderr
+	 * stream reached EOF. srun, by contrast, only aborts on error and
+	 * otherwise waits for all output.
+	 */
+	client_io_handler_abort(io);
 	client_io_handler_finish(io);
 	client_io_handler_destroy(io);
 	_mpir_cleanup();
 	xfree(io_key);
+	xfree(io_key_hash);
 	log_fini();
 	slurm_fini();
 
@@ -428,9 +497,8 @@ static message_thread_state_t *_msg_thr_create(int num_nodes, int num_tasks)
 {
 	int sock = -1;
 	uint16_t port;
-	uint16_t *ports;
 	eio_obj_t *obj;
-	int i, rc;
+	int i;
 	message_thread_state_t *mts;
 
 	debug("Entering _msg_thr_create()");
@@ -443,13 +511,8 @@ static message_thread_state_t *_msg_thr_create(int num_nodes, int num_tasks)
 	mts->num_resp_port = _estimate_nports(num_nodes, 48);
 	mts->resp_port = xmalloc(sizeof(uint16_t) * mts->num_resp_port);
 	for (i = 0; i < mts->num_resp_port; i++) {
-		ports = slurm_get_srun_port_range();
-		if (ports)
-			rc = net_stream_listen_ports(&sock, &port, ports,
-						     false);
-		else
-			rc = net_stream_listen(&sock, &port);
-		if (rc < 0) {
+		if (slurm_init_msg_engine_srun_ports(&sock, &port) !=
+		    SLURM_SUCCESS) {
 			error("unable to initialize step launch"
 			      " listening socket: %m");
 			goto fail;
@@ -471,12 +534,18 @@ fail:
 
 static void _msg_thr_wait(message_thread_state_t *mts)
 {
-	/* Wait for all known running tasks to complete */
+	/*
+	 * Wait for all known running tasks to complete, or until a signal
+	 * requests a detach (_on_detach_signal() sets detach_requested and wakes
+	 * the cond).
+	 */
 	slurm_mutex_lock(&mts->lock);
-	while (bit_set_count(mts->tasks_exited)
-	       < bit_set_count(mts->tasks_started)) {
+	while (!detach_requested && (bit_set_count(mts->tasks_exited) <
+				     bit_set_count(mts->tasks_started))) {
 		slurm_cond_wait(&mts->cond, &mts->lock);
 	}
+	if (detach_requested)
+		verbose("Detaching on signal");
 	slurm_mutex_unlock(&mts->lock);
 }
 
@@ -515,8 +584,7 @@ _exit_handler(message_thread_state_t *mts, slurm_msg_t *exit_msg)
 	int i;
 	int rc;
 
-	if ((msg->step_id.job_id != opt.selected_step->step_id.job_id) ||
-	    (msg->step_id.step_id != opt.selected_step->step_id.step_id)) {
+	if (!verify_step_id(&msg->step_id, &opt.selected_step->step_id)) {
 		debug("Received MESSAGE_TASK_EXIT from wrong job: %ps",
 		      &msg->step_id);
 		return;
@@ -572,10 +640,12 @@ _handle_msg(void *arg, slurm_msg_t *msg)
 	case RESPONSE_LAUNCH_TASKS:
 		debug2("received task launch");
 		_launch_handler(mts, msg);
+		slurm_send_rc_msg(msg, SLURM_SUCCESS);
 		break;
 	case MESSAGE_TASK_EXIT:
 		debug2("received task exit");
 		_exit_handler(mts, msg);
+		slurm_send_rc_msg(msg, SLURM_SUCCESS);
 		break;
 	case SRUN_JOB_COMPLETE:
 		debug2("received job step complete message");
@@ -604,8 +674,7 @@ _mpir_init(int num_tasks)
 	}
 }
 
-static void
-_mpir_cleanup()
+static void _mpir_cleanup(void)
 {
 	int i;
 
@@ -616,8 +685,7 @@ _mpir_cleanup()
 	xfree(MPIR_proctable);
 }
 
-static void
-_mpir_dump_proctable()
+static void _mpir_dump_proctable(void)
 {
 	MPIR_PROCDESC *tv;
 	int i;

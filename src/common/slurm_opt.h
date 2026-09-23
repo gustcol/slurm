@@ -74,6 +74,7 @@ enum {
 	LONG_OPT_ACCTG_FREQ,
 	LONG_OPT_ALLOC_NODELIST,
 	LONG_OPT_ARGV,
+	LONG_OPT_ASYNC,
 	LONG_OPT_BATCH,
 	LONG_OPT_BCAST,
 	LONG_OPT_BCAST_EXCLUDE,
@@ -120,6 +121,7 @@ enum {
 	LONG_OPT_GRES_FLAGS,
 	LONG_OPT_HINT,
 	LONG_OPT_IGNORE_PBS,
+	LONG_OPT_IGNORE_SIGNALS,
 	LONG_OPT_INTERACTIVE,
 	LONG_OPT_JOBID,
 	LONG_OPT_KILL_INV_DEP,
@@ -133,6 +135,7 @@ enum {
 	LONG_OPT_MEM_BIND,
 	LONG_OPT_MEM_PER_CPU,
 	LONG_OPT_MEM_PER_GPU,
+	LONG_OPT_MEM_UPDATE,
 	LONG_OPT_MINCORES,
 	LONG_OPT_MINCPUS,
 	LONG_OPT_MINSOCKETS,
@@ -170,6 +173,7 @@ enum {
 	LONG_OPT_RESERVATION,
 	LONG_OPT_RESOURCES,
 	LONG_OPT_RESV_PORTS,
+	LONG_OPT_RUNTIME,
 	LONG_OPT_SEGMENT_SIZE,
 	LONG_OPT_SEND_LIBS,
 	LONG_OPT_SIGNAL,
@@ -226,7 +230,6 @@ typedef struct {
 	int minsockets;			/* --minsockets=n		*/
 	int mincores;			/* --mincores=n			*/
 	int minthreads;			/* --minthreads=n		*/
-	bool parsable;			/* --parsable			*/
 	char *propagate;		/* --propagate[=RLIMIT_CORE,...]*/
 	int requeue;			/* --requeue and --no-requeue	*/
 	bool test_only;			/* --test-only			*/
@@ -246,6 +249,7 @@ typedef struct {
 typedef struct {
 	uint16_t accel_bind_type;	/* --accel-bind			*/
 	char *alloc_nodelist;		/* grabbed from the environment	*/
+	bool async;			/* --async			*/
 	char *bcast_exclude;		/* --bcast-exclude */
 	char *bcast_file;		/* --bcast, copy executable to compute nodes */
 	bool bcast_flag;		/* --bcast, copy executable to compute nodes */
@@ -260,6 +264,7 @@ typedef struct {
 	char *epilog;			/* --epilog			*/
 	bool exact;			/* --exact			*/
 	bool exclusive;			/* --exclusive			*/
+	uint64_t ignore_signals; /* --ignore-signals		*/
 	bool interactive;		/* --interactive		*/
 	uint32_t jobid;			/* --jobid			*/
 	uint32_t array_task_id;		/* --jobid			*/
@@ -307,6 +312,16 @@ typedef struct {
 	srun_opt_t *srun_opt;
 
 	slurm_opt_state_t *state;
+
+	/*
+	 * Heterogeneous job component these options describe.
+	 *
+	 * This is not an option. The clients set it as they parse, and srun's
+	 * _opt_copy() carries it with the rest of the struct, so every saved
+	 * component keeps the index it was parsed for. A client that submits
+	 * one job at a time leaves it at zero.
+	 */
+	int het_job_inx;
 
 	void (*help_func)(void);	/* Print --help info		*/
 	void (*usage_func)(void);	/* Print --usage info		*/
@@ -386,6 +401,8 @@ typedef struct {
 	uint64_t mem_per_cpu;		/* --mem-per-cpu		*/
 	uint64_t mem_per_gpu;		/* --mem-per-gpu		*/
 	uint64_t pn_min_memory;		/* --mem			*/
+	uint16_t mem_update_margin; /* --mem-update (margin %)	*/
+	uint16_t mem_update_delay; /* --mem-update (delay min)	*/
 	uint16_t oom_kill_step;		/* --oom-kill-step=0,1		*/
 	uint64_t pn_min_tmp_disk;	/* --tmp			*/
 	char *prefer;			/* --prefer			*/
@@ -394,6 +411,7 @@ typedef struct {
 	char *gres;			/* --gres			*/
 	char *container;		/* --container			*/
 	char *container_id;		/* --container-id		*/
+	char *runtime; /* --runtime			*/
 	char *context;			/* --context			*/
 	bool contiguous;		/* --contiguous			*/
 	char *nodefile;			/* --nodefile			*/
@@ -445,6 +463,7 @@ typedef struct {
 	char *efname;			/* error file name		*/
 	char *ifname;			/* input file name		*/
 	char *ofname;			/* output file name		*/
+	bool parsable; /* --parsable */
 
 } slurm_opt_t;
 

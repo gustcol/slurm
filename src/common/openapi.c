@@ -34,6 +34,7 @@
 \*****************************************************************************/
 
 #include "src/common/data.h"
+#include "src/common/http.h"
 #include "src/common/openapi.h"
 #include "src/common/xassert.h"
 #include "src/common/xmalloc.h"
@@ -82,6 +83,13 @@ typedef struct {
 	char *at;
 } merge_path_strings_t;
 
+#define APPEND_REL_PATH_ARGS_MAGIC 0xa33bafaf
+
+typedef struct {
+	int magic; /* APPEND_REL_PATH_ARGS_MAGIC */
+	data_t *dst;
+} append_rel_path_args_t;
+
 extern const char *openapi_type_format_to_format_string(
 	openapi_type_format_t format)
 {
@@ -127,6 +135,16 @@ extern openapi_type_format_t openapi_string_to_type_format(const char *str)
 			return openapi_types[i].format;
 
 	return OPENAPI_FORMAT_INVALID;
+}
+
+extern data_type_t openapi_type_to_data_type(openapi_type_t type)
+{
+	for (int i = 0; i < ARRAY_SIZE(openapi_types); i++) {
+		if (openapi_types[i].type == type)
+			return openapi_types[i].data_type;
+	}
+
+	return DATA_TYPE_NONE;
 }
 
 extern data_type_t openapi_type_format_to_data_type(
@@ -213,8 +231,24 @@ extern data_t *openapi_fork_rel_path_list(data_t *relative_path, int index)
 	return ppath;
 }
 
+static int _on_append_rel_path(const char *entry, bool template, void *arg)
+{
+	append_rel_path_args_t *args = arg;
+
+	xassert(args->magic == APPEND_REL_PATH_ARGS_MAGIC);
+	xassert(!template);
+
+	(void) data_set_string(data_list_append(args->dst), entry);
+	return SLURM_SUCCESS;
+}
+
 extern int openapi_append_rel_path(data_t *relative_path, const char *sub_path)
 {
+	append_rel_path_args_t args = {
+		.magic = APPEND_REL_PATH_ARGS_MAGIC,
+		.dst = relative_path,
+	};
+
 	if (data_get_type(relative_path) != DATA_TYPE_LIST)
 		return ESLURM_DATA_EXPECTED_LIST;
 
@@ -226,7 +260,7 @@ extern int openapi_append_rel_path(data_t *relative_path, const char *sub_path)
 	if (sub_path[0] == OPENAPI_PATH_REL[0])
 		sub_path = &sub_path[1];
 
-	return data_list_split_str(relative_path, sub_path, OPENAPI_PATH_SEP);
+	return url_path_walk(sub_path, false, _on_append_rel_path, &args);
 }
 
 extern int openapi_error_log_foreach(void *x, void *arg)

@@ -75,11 +75,10 @@ extern void build_active_feature_bitmap(job_record_t *job_ptr,
 extern bitstr_t *build_active_feature_bitmap2(char *reboot_features);
 
 /*
- * build_node_details - sets addresses for allocated nodes
+ * build_node_details - sets node_cnt
  * IN job_ptr - pointer to a job record
- * IN new_alloc - set if new job allocation, cleared if state recovery
  */
-extern void build_node_details(job_record_t *job_ptr, bool new_alloc);
+extern void build_node_details(job_record_t *job_ptr);
 
 /*
  * deallocate_nodes - for a given job, deallocate its nodes and make
@@ -91,8 +90,9 @@ extern void build_node_details(job_record_t *job_ptr, bool new_alloc);
  * IN suspended - true if job was already suspended (node's run_job_cnt
  *	already decremented);
  * IN preempted - true if job is being preempted
+ * RET true if job is COMPLETED (batch_requeue_fini called), otherwise false
  */
-extern void deallocate_nodes(job_record_t *job_ptr, bool timeout,
+extern bool deallocate_nodes(job_record_t *job_ptr, bool timeout,
 			     bool suspended, bool preempted);
 
 /* Remove nodes from consideration for allocation based upon "mcs" by

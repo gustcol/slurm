@@ -1,8 +1,9 @@
 ############################################################################
 # Copyright (C) SchedMD LLC.
 ############################################################################
-import atf
 import pytest
+
+import atf
 
 # import re
 
@@ -22,12 +23,6 @@ def setup():
         "Name", {"r1": {"File": resource_file}, "r2": {"Type": "a"}}, source="gres"
     )
     atf.require_slurm_running()
-
-
-@pytest.fixture(scope="function", autouse=True)
-def cleanup_test():
-    yield
-    atf.cancel_all_jobs(quiet=True)
 
 
 def test_gres_alloc_dealloc_file():

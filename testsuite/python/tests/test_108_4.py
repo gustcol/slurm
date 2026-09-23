@@ -1,8 +1,9 @@
 ############################################################################
 # Copyright (C) SchedMD LLC.
 ############################################################################
-import atf
 import pytest
+
+import atf
 
 # import re
 
@@ -13,7 +14,7 @@ def setup():
     atf.require_slurm_running()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def batch_job():
     """Submit a batch job and wait for it to start running"""
     job_id = atf.submit_job_sbatch(fatal=True)

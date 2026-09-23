@@ -1,23 +1,26 @@
 ############################################################################
 # Copyright (C) SchedMD LLC.
 ############################################################################
-import pytest
-import atf
 import datetime
 import logging
+
+import pytest
+
+import atf
+
+pytestmark = pytest.mark.slow
 
 
 @pytest.fixture(scope="module", autouse=True)
 def setup():
-    atf.require_nodes(4)
+    atf.require_nodes(3)
     atf.require_slurm_running()
 
 
 @pytest.fixture(scope="function", autouse=True)
 def get_and_down_nodes():
     logging.info("Getting the necessary 3 nodes:")
-    nodes = atf.run_job_nodes("-N3 true", fatal=True)
-
+    nodes = list(atf.get_nodes().keys())
     logging.info("Setting ALL nodes Down:")
     atf.run_command(
         "scontrol update nodename=ALL state=down reason=test_resv_overlap",
@@ -57,8 +60,46 @@ def get_and_down_nodes():
     )
 
 
+@pytest.mark.xfail(
+    atf.get_version("sbin/slurmctld") < (26, 5),
+    reason="Ticket 24758: DST-aware reoccurring reservation overlap check added in 26.05",
+)
+def test_overlap_DST(get_and_down_nodes):
+    """Verify that DST changes are respected when checking for overlapping"""
+    nodes = get_and_down_nodes
+
+    logging.info(f"Resuming only node {nodes[0]}:")
+    atf.run_command(
+        f"scontrol update nodename={nodes[0]} state=resume",
+        user=atf.properties["slurm-user"],
+        fatal=True,
+    )
+    atf.repeat_until(
+        lambda: atf.get_node_parameter(nodes[0], "state"),
+        lambda state: state == ["IDLE"],
+        fatal=True,
+    )
+
+    logging.info(f"Creating resv1: {atf.get_node_parameter(nodes[0], 'state')}")
+    rc = atf.run_command(
+        f"scontrol create reservation ReservationName=resv1 StartTime={datetime.date.today().year + 1}-04-22T15:00:00 nodecnt=1 duration=00:15:00 user={atf.properties['test-user']} flags=DAILY",
+        user=atf.properties["slurm-user"],
+    )
+    assert rc["exit_code"] == 0, "resv1 should be created"
+
+    logging.info("Ensuring that resv2 cannot be created after resv1:")
+    rc = atf.run_command(
+        f"scontrol create reservation ReservationName=resv2 StartTime={datetime.date.today().year + 1}-11-15T15:00:00 nodecnt=1 duration=00:15:00 user={atf.properties['test-user']}",
+        user=atf.properties["slurm-user"],
+        xfail=True,
+    )
+    assert (
+        rc["exit_code"] != 0
+    ), f"resv2 should NOT be created after resv1 because {nodes[0]} should be used only by resv1"
+
+
 @pytest.mark.parametrize("reocurring_flag", ["HOURLY", "DAILY", "WEEKLY"])
-def test_overlap_weeks(request, get_and_down_nodes, reocurring_flag):
+def test_overlap_weeks(get_and_down_nodes, reocurring_flag):
     """Verify that reservations don't overlap nodes if they are have a start time difference greater than a week"""
 
     nodes = get_and_down_nodes
@@ -116,7 +157,7 @@ def test_overlap_weeks(request, get_and_down_nodes, reocurring_flag):
 
 
 @pytest.mark.parametrize("reocurring_flag", ["HOURLY", "DAILY", "WEEKLY"])
-def test_overlap_weeks_reverse(request, get_and_down_nodes, reocurring_flag):
+def test_overlap_weeks_reverse(get_and_down_nodes, reocurring_flag):
     """Verify that recurring reservations don't overlap nodes if they are have a start time difference greater than a week"""
 
     nodes = get_and_down_nodes
@@ -174,7 +215,7 @@ def test_overlap_weeks_reverse(request, get_and_down_nodes, reocurring_flag):
 
 
 @pytest.mark.parametrize("reocurring_flag", ["HOURLY", "DAILY", "WEEKLY"])
-def test_overlap_reocurring(request, get_and_down_nodes, reocurring_flag):
+def test_overlap_reocurring(get_and_down_nodes, reocurring_flag):
     """Verify that recurring reservations don't overlap when the start at 1 recurring period"""
 
     nodes = get_and_down_nodes
@@ -241,7 +282,7 @@ def test_overlap_reocurring(request, get_and_down_nodes, reocurring_flag):
 
 
 @pytest.mark.parametrize("reocurring_flag", ["HOURLY", "DAILY", "WEEKLY"])
-def test_overlap_reocurring_week(request, get_and_down_nodes, reocurring_flag):
+def test_overlap_reocurring_week(get_and_down_nodes, reocurring_flag):
     """Verify that recurring reservations don't overlap if they are have a start time difference greater than a week"""
 
     nodes = get_and_down_nodes
@@ -295,7 +336,7 @@ def test_overlap_reocurring_week(request, get_and_down_nodes, reocurring_flag):
 
 
 @pytest.mark.parametrize("reocurring_flag", ["HOURLY", "DAILY", "WEEKLY"])
-def test_overlap_replacing(request, get_and_down_nodes, reocurring_flag):
+def test_overlap_replacing(get_and_down_nodes, reocurring_flag):
     """Verify that reservations don't overlap when replacing nodes"""
 
     nodes = get_and_down_nodes
@@ -314,14 +355,14 @@ def test_overlap_replacing(request, get_and_down_nodes, reocurring_flag):
 
     logging.info("Creating resv1:")
     rc = atf.run_command(
-        f"scontrol create reservation ReservationName=resv1 StartTime=NOW+1minutes nodecnt=1 duration=00:15:00 user={atf.properties['test-user']} flags={reocurring_flag},REPLACE_DOWN,PURGE_COMP=1",
+        f"scontrol create reservation ReservationName=resv1 StartTime=NOW nodecnt=1 duration=00:15:00 user={atf.properties['test-user']} flags={reocurring_flag},REPLACE_DOWN,PURGE_COMP=1",
         user=atf.properties["slurm-user"],
     )
     assert rc["exit_code"] == 0, "resv1 should be created"
 
     logging.info("Ensuring that resv2 cannot be created yet:")
     rc = atf.run_command(
-        f"scontrol create reservation ReservationName=resv2 StartTime=NOW+1minutes nodecnt=1 duration=00:15:00 user={atf.properties['test-user']} flags={reocurring_flag},REPLACE_DOWN,PURGE_COMP=3",
+        f"scontrol create reservation ReservationName=resv2 StartTime=NOW nodecnt=1 duration=00:15:00 user={atf.properties['test-user']} flags={reocurring_flag},REPLACE_DOWN,PURGE_COMP=3",
         user=atf.properties["slurm-user"],
         xfail=True,
     )
@@ -351,7 +392,7 @@ def test_overlap_replacing(request, get_and_down_nodes, reocurring_flag):
 
     logging.info("Creating resv2:")
     rc2 = atf.run_command(
-        f"scontrol create reservation ReservationName=resv2 StartTime=NOW+1minutes nodecnt=1 duration=00:15:00 user={atf.properties['test-user']} flags={reocurring_flag},REPLACE_DOWN,PURGE_COMP=3",
+        f"scontrol create reservation ReservationName=resv2 StartTime=NOW nodecnt=1 duration=00:15:00 user={atf.properties['test-user']} flags={reocurring_flag},REPLACE_DOWN,PURGE_COMP=3",
         user=atf.properties["slurm-user"],
     )
     assert rc2["exit_code"] == 0, "resv2 should be created"
@@ -399,7 +440,14 @@ def test_overlap_replacing(request, get_and_down_nodes, reocurring_flag):
         fatal=True,
     )
 
-    logging.info("Waiting until resv1 is INACTIVE (should be purged 1 minute)...")
+    logging.info("Forcing resv1 to INACTIVE state by skipping to next occurrence")
+    atf.run_command(
+        "scontrol update ReservationName=resv1 skip",
+        user=atf.properties["slurm-user"],
+        fatal=True,
+    )
+
+    logging.info("Waiting until resv1 is INACTIVE...")
     atf.repeat_until(
         lambda: atf.get_reservation_parameter("resv1", "State"),
         lambda state: state == "INACTIVE",
@@ -414,7 +462,7 @@ def test_overlap_replacing(request, get_and_down_nodes, reocurring_flag):
     assert not atf.repeat_until(
         lambda: atf.get_reservation_parameter("resv2", "Nodes"),
         lambda rnodes: rnodes != nodes[1],
-        timeout=60,
+        timeout=31,
     )
 
     logging.info(f"Resuming node {nodes[2]}:")
@@ -457,7 +505,7 @@ def test_overlap_replacing(request, get_and_down_nodes, reocurring_flag):
         ("WEEKEND", "WEEKEND"),
     ],
 )
-def test_overlap_weekdays(request, get_and_down_nodes, reocurring_flag, week_flag):
+def test_overlap_weekdays(get_and_down_nodes, reocurring_flag, week_flag):
     """Verify that recurring reservations with weekdays and weekends handle overlapping properly with other reocurrings"""
 
     nodes = get_and_down_nodes
@@ -513,9 +561,7 @@ def test_overlap_weekdays(request, get_and_down_nodes, reocurring_flag, week_fla
 @pytest.mark.parametrize(
     "resv1_flag,resv2_flag", [("WEEKEND", "WEEKDAY"), ("WEEKDAY", "WEEKEND")]
 )
-def test_no_overlap_weekday_weekend(
-    request, get_and_down_nodes, resv1_flag, resv2_flag
-):
+def test_no_overlap_weekday_weekend(get_and_down_nodes, resv1_flag, resv2_flag):
     """Verify that recurring reservations with weekdays and weekends handle overlapping properly between them"""
 
     nodes = get_and_down_nodes

@@ -530,9 +530,10 @@ extern void parse_command_line(int argc, char **argv)
 		params.opt_local = true;
 
 	while (1) {		/* now cycle through the command line */
-		c = getopt_long(argc, argv,
-				"aA:bBcC:DeE:f:F:g:hi:I:j:k:K:lLM:nN:o:pPq:r:s:S:Ttu:UvVW:x:X",
-				long_options, &option_index);
+		c = getopt_long(
+			argc, argv,
+			"aA:bBcC:DeE:f:F:g:hi:I:j:k:K:lLM:nN:o:pPq:r:R:s:S:Ttu:UvVW:x:X",
+			long_options, &option_index);
 		if (c == -1)
 			break;
 		switch (c) {
@@ -1271,7 +1272,7 @@ static void _print_env(slurmdb_job_rec_t *job)
  * At this point, we have already selected the desired data,
  * so we just need to print it for the user.
  */
-extern void do_list(int argc, char **argv)
+extern void do_list(data_parser_t *parser)
 {
 	list_itr_t *itr = NULL;
 	list_itr_t *itr_step = NULL;
@@ -1280,9 +1281,8 @@ extern void do_list(int argc, char **argv)
 	slurmdb_job_cond_t *job_cond = params.job_cond;
 
 	if (params.mimetype) {
-		DATA_DUMP_CLI_SINGLE(OPENAPI_SLURMDBD_JOBS_RESP, jobs, argc,
-				     argv, acct_db_conn, params.mimetype,
-				     params.data_parser, errno);
+		errno = data_parser_dump_cli_single(
+			DATA_PARSER_OPENAPI_SLURMDBD_JOBS_RESP, jobs, parser);
 		return;
 	}
 
@@ -1310,7 +1310,8 @@ extern void do_list(int argc, char **argv)
 		if (!(job_cond->flags & JOBCOND_FLAG_NO_STEP)) {
 			itr_step = list_iterator_create(job->steps);
 			while ((step = list_next(itr_step))) {
-				if (step->end == 0)
+				if ((step->end == 0) &&
+				    (job->state != JOB_RESIZING))
 					step->end = job->end;
 				print_fields(JOBSTEP, step);
 			}

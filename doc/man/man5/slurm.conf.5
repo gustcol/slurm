@@ -1,4 +1,4 @@
-.TH "slurm.conf" "5" "Slurm Configuration File" "Slurm 26.05" "Slurm Configuration File"
+.TH "slurm.conf" "5" "Slurm Configuration File" "Slurm 26.11" "Slurm Configuration File"
 
 .SH "NAME"
 slurm.conf \- Slurm configuration file
@@ -222,16 +222,15 @@ Then "gres/gpu:tesla" and "gres/gpu:volta" will track only jobs that explicitly
 request those two GPU types, while "gres/gpu" will track allocated GPUs of any
 type ("tesla", "volta" or any other GPU type).
 
-Given a configuration of
-"AccountingStorageTRES=gres/gpu:tesla,gres/gpu:volta"
-Then "gres/gpu:tesla" and "gres/gpu:volta" will track jobs that explicitly
-request those GPU types.
-If a job requests GPUs, but does not explicitly specify the GPU type, then
-its resource allocation will be accounted for as either "gres/gpu:tesla" or
-"gres/gpu:volta", although the accounting may not match the actual GPU type
-allocated to the job and the GPUs allocated to the job could be heterogeneous.
-In an environment containing various GPU types, use of a job_submit plugin
-may be desired in order to force jobs to explicitly specify some GPU type.
+Tracking only typed GRES (e.g. "gres/gpu:tesla,gres/gpu:volta") can lead to
+unintuitive behavior where the untyped counterpart (e.g. "gres/gpu") is
+inconsistently recognized as a valid resource name. In this case, if a job
+requests the untyped version, then its resource allocation will be recorded
+as a specific type, which may not match the actual type allocated to the job if
+multiple different types are allocated. Thus it is recommended to always track
+the untyped counterpart for any typed GRES that are tracked. In addition, you
+may wish to use a job_submit plugin to force jobs to explicitly specify some
+GRES type.
 
 \fBNOTE\fR: Setting gres/gpu will also set gres/gpumem and gres/gpuutil.
 gres/gpumem and gres/gpuutil can be set individually when gres/gpu is not set.
@@ -498,12 +497,30 @@ If not set, the default key file is jwt_hs256.key in \fIStateSaveLocation\fR.
 .IP
 
 .TP
+\fBuse_jwt_client_ids\fR
+Allow JWT tokens to contain full identity information. When enabled, JWT tokens
+must contain uid and gid fields. They must also include a id claim with a JSON
+object that includes gecos, dir, shell, and either gids (array) or groups
+(dict) elements to provide complete user identity information. This bypasses
+slurmctld system lookups for user information when valid claims are present
+in the JWT. (For auth/jwt.)
+.IP
+
+.TP
+\fBuse_jwt_client_ids_only\fR
+When this flag is set, auth/jwt authentication will fail if complete identity
+information is not available from JWT claims.
+This option implies \fBuse_jwt_client_ids\fR. (For auth/jwt.)
+.IP
+
+.TP
 \fBuserclaimfield\fR=
-Use an alternative claim field for the Slurm UserName \fBsun\fR field. This
+Use an alternative claim field for the Slurm UserName (\fBsun\fR) field. This
 option is designed to allow compatibility with tokens generated outside of
 Slurm. (This field may also be known as a grant.)
-.NR
+
 Default: (disabled)
+
 .RE
 .IP
 
@@ -551,6 +568,16 @@ nss_slurm, the user information can be managed on the compute nodes by
 slurmstepd. This would allow the cluster to operate in an environment where
 only the login nodes have access to LDAP/OS user information.
 See <https://slurm.schedmd.com/nss_slurm.html> for more information.
+
+\fBNOTE\fR: Some Slurm capabilities require user authentication but are not
+covered by \fBuse_client_ids\fR, including:
+.RS
+.TP
+\[bu] Partition configuration with \fBAllowGroups\fR
+.IP
+.TP
+\[bu] The \fBAllowUserBoot\fR parameter in \fBhelpers.conf\fR(5)
+.RE
 .RE
 .IP
 
@@ -561,7 +588,9 @@ components.
 All Slurm daemons and commands must be terminated prior to changing
 the value of \fBAuthType\fR and later restarted.
 Changes to this value will interrupt outstanding job steps and prevent them
-from completing.
+from completing, so no jobs should be running when this is changed.
+See <https://slurm.schedmd.com/authentication.html> for more information.
+
 Acceptable values at present:
 .RS
 .TP
@@ -1312,7 +1341,7 @@ the job didn't specify \-\-cpus\-per\-task and \-\-cpus\-per\-gpu.
 
 .TP
 \fBDefMemPerCPU\fR
-Default real memory size available per usable allocated CPU in megabytes.
+Default real memory size available per usable allocated CPU in mebibytes.
 Used to avoid over\-subscribing memory and causing paging.
 \fBDefMemPerCPU\fR would generally be used if individual processors
 are allocated to jobs (\fBSelectType=select/cons_tres\fR).
@@ -1370,7 +1399,7 @@ $ sacct \-j $SLURM_JOB_ID \-X \-o jobid%7,reqtres%35,alloctres%35
 
 .TP
 \fBDefMemPerGPU\fR
-Default real memory size available per allocated GPU in megabytes.
+Default real memory size available per allocated GPU in mebibytes.
 The default value is 0 (unlimited).
 Please note a best effort attempt is made to predict which GPUs on the system
 will be used, but this could change between job submission and start time,
@@ -1383,7 +1412,7 @@ mutually exclusive.
 
 .TP
 \fBDefMemPerNode\fR
-Default real memory size available per allocated node in megabytes.
+Default real memory size available per allocated node in mebibytes.
 Used to avoid over\-subscribing memory and causing paging.
 \fBDefMemPerNode\fR would generally be used if whole nodes
 are allocated to jobs (\fBSelectType=select/linear\fR) and
@@ -1393,6 +1422,32 @@ The default value is 0 (unlimited).
 Also see \fBDefMemPerCPU\fR, \fBDefMemPerGPU\fR and \fBMaxMemPerCPU\fR.
 \fBDefMemPerCPU\fR, \fBDefMemPerGPU\fR and \fBDefMemPerNode\fR are
 mutually exclusive.
+.IP
+
+.TP
+\fBDefRuntimePlugin\fR
+Identifies the default runtime plugin loaded by slurmstepd for job tasks. This
+may be overridden per job with the \fB\-\-runtime\fR option. The plugin only
+runs a task inside a container when the job requests one (via
+\fB\-\-container\fR); otherwise the task is executed directly. The default
+value is \fBruntime/oci\fR.
+
+\fBNOTE\fR: This option selects the runtime plugin interface only; the OCI
+runtime binary is configured separately in \fBoci.conf\fR(5) (see also
+\fBscrun\fR(1)). For job isolation through namespaces, see \fBNamespaceType\fR.
+
+Acceptable values at present include:
+.IP
+.RS
+.TP 20
+\fBruntime/none\fR
+\fB\-\-container\fR requests are ignored; job tasks are executed directly by
+slurmstepd.
+.IP
+.TP
+\fBruntime/oci\fR
+Job tasks are run within an OCI runtime.
+.RE
 .IP
 
 .TP
@@ -1475,10 +1530,10 @@ partition limits are altered. This is the default.
 
 .TP
 \fBEpilog\fR
-Pathname of a script to execute as user root on every node when a user's job
-completes (e.g. "/usr/local/slurm/epilog"). If it is not an absolute path name
-(i.e. it does not start with a slash), it will be searched for in the same
-directory as the slurm.conf file. A glob pattern (See \fBglob\fR (7)) may also
+Pathname of a program to execute as user root on every node when a user's job
+completes (e.g. "/usr/local/slurm/epilog"). If it is not an absolute pathname
+(i.e. it does not start with a slash), it must be relative to the directory
+containing the slurm.conf file. A glob pattern (See \fBglob\fR (7)) may also
 be used to run more than one epilog script (e.g. "/etc/slurm/epilog.d/*").
 When more than one epilog script is configured, they are executed in reverse
 alphabetical order (z-a -> Z-A -> 9-0). The Epilog script(s) may be used
@@ -1498,13 +1553,15 @@ this option on multiple lines.\fR
 .TP
 \fBEpilogMsgTime\fR
 The number of microseconds that the slurmctld daemon requires to process
-an epilog completion message from the slurmd daemons. This parameter can
-be used to prevent a burst of epilog completion messages from being sent
-at the same time which should help prevent lost messages and improve
-throughput for large jobs.
+an epilog completion message from the slurmd daemons.
+For jobs spanning more than 64 nodes, each host delays its message
+based on its index in the job's node list and this value, preventing
+a burst of simultaneous RPCs that could result in lost messages.
 The default value is 2000 microseconds.
-For a 1000 node job, this spreads the epilog completion messages out over
-two seconds.
+The maximum value is 1000000 (1 second). Values exceeding the maximum
+will be reset to the default.
+For a 1000 node job, the default value will spread the epilog completion
+messages out over two seconds.
 .IP
 
 .TP
@@ -1678,8 +1735,8 @@ The default value is zero, which disables execution.
 .TP
 \fBHealthCheckNodeState\fR
 Identify what node states should execute the \fBHealthCheckProgram\fR.
-Multiple state values may be specified with a comma separator.
-The default value is ANY to execute on nodes in any state.
+Multiple state values may be specified with a comma separator, except for the
+*_ONLY states. The default value is ANY to execute on nodes in any state.
 .IP
 .RS
 .TP 12
@@ -1716,8 +1773,13 @@ Run on nodes in the MIXED state (some CPUs idle and other CPUs allocated).
 .IP
 
 .TP
+\fBREBOOT_ONLY\fR
+Run only after a node reboot. This state is mutually exclusive with any other state.
+.IP
+
+.TP
 \fBSTART_ONLY\fR
-Run only at slurmd startup.
+Run only at slurmd startup. This state is mutually exclusive with any other state.
 .RE
 .IP
 
@@ -1739,14 +1801,40 @@ This program will be killed if it does not terminate normally within
 60 seconds.
 This program will also be executed when the slurmd daemon is first started and
 before it registers with the slurmctld daemon. If \fBHealthCheckNodeState\fR is
-\fBSTART_ONLY\fR it will be executed only when the slurmd daemon is first
-started.
+\fBSTART_ONLY\fR or \fBREBOOT_ONLY\fR, it will be executed only when the slurmd
+daemon is first started or when slurmd reports back after a reboot.
 By default, no program will be executed.
+
+Environment variables provided to the script:
+.IP
+.RS
+.TP
+\fBSLURMD_NODENAME\fR
+Node name.
+.IP
+.TP
+\fBSLURM_NODE_IS_HEALTHY\fR
+The controller's evaluation of the node's current health; "yes" if healthy,
+"no" if unhealthy (down, drained, draining, failing, or in maintenance), or
+unset if health information is not available (during startup execution before
+node registration or if the node doesn't support this option).
+This allows the program to get this information without querying
+\fBscontrol\fR or \fBsinfo\fR.
+.RE
+.IP
+
+.TP
+\fBHealthCheckTimeout\fR
+Time in seconds that \fBHealthCheckProgram\fR is allowed to run. The default
+value is 60. \fBHealthCheckTimeout\fR should be less than
+\fBHealthCheckInterval\fR; an error is logged otherwise. A value of 0 is not
+allowed and is reset to default. The maximum value is 65535.
 .IP
 
 .TP
 \fBHttpParserType\fR
 Specify the http_parser implementation that will be used. Default is
+\fIhttp_parser/llhttp_parser\fR if found, otherwise
 \fIhttp_parser/libhttp_parser\fR.
 Acceptable values at present:
 .IP
@@ -1754,6 +1842,11 @@ Acceptable values at present:
 .TP
 \fBhttp_parser/libhttp_parser\fR
 Use the libhttp_parser based plugin.
+.IP
+
+.TP
+\fBhttp_parser/llhttp_parser\fR
+Use the llhttp based plugin.
 .RE
 .IP
 
@@ -1949,6 +2042,7 @@ with \fBjobacct_gather/linux\fR plugin.
 \fBJobCompHost\fR
 The name of the machine hosting the job completion database.
 Only used for database type storage plugins, ignored otherwise.
+Can be a UNIX socket, e.g., "unix:/path/to/socket".
 .IP
 
 .TP
@@ -2032,6 +2126,11 @@ Optional comma-separated list for \fBjobcomp/elasticsearch\fR:
 .IP
 
 .TP
+\fBsend_comment\fR
+Sends the job comment as part of jobcomp messages.
+.IP
+
+.TP
 \fBsend_script\fR
 Sends the job script as part of jobcomp messages.
 .IP
@@ -2085,6 +2184,11 @@ Instruct the delivery report callback to requeue messages that failed delivery
 because their time waiting for successful delivery reached the \fBlibrdkafka\fR
 property \fBmessage.timeout.ms\fR.
 Defaults to not set (don't requeue and thus discard these messages).
+.IP
+
+.TP
+\fBsend_comment\fR
+Sends the job comment as part of jobcomp messages.
 .IP
 
 .TP
@@ -2311,6 +2415,14 @@ Translate PBS job submission options to Slurm equivalent (if possible).
 .TP
 \fBrequire_timelimit\fR
 Force job submissions to specify a timelimit.
+.IP
+
+.TP
+\fBresilience\fR
+Opt jobs into adaptive resilience on node failure when the job comment
+contains the token "resilience" or the job is submitted to a partition
+listed in \fBSchedulerParameters=resilience_partitions\fR. See the
+\fBresilience_min_health\fR \fBSchedulerParameters\fR option.
 .RE
 .IP
 
@@ -2410,12 +2522,6 @@ completion. This setting will only take effect after reconfiguring, and will
 only take effect for newly launched jobs.
 .IP
 
-.TP 24
-\fBmem_sort\fR
-Sort NUMA memory at step start. User can override this default with
-SLURM_MEM_BIND environment variable or \-\-mem\-bind=nosort command line option.
-.IP
-
 .TP
 \fBmpir_use_nodeaddr\fR
 When launching tasks Slurm creates entries in MPIR_proctable that are used by
@@ -2445,6 +2551,14 @@ Lock the slurmstepd process's current and future memory in RAM.
 .IP
 
 .TP
+\fBsrun_exclusive_allocation\fR
+Have \fBsrun \-\-exclusive\fR default to the \fB\-\-exclusive=allocation\fR
+option. This disables the implicit \fB\-\-exact\fR that exclusive adds for srun.
+Users can still specify \fBsrun \-\-exclusive \-\-exact\fR to get the
+standard behavior.
+.IP
+
+.TP
 \fBtest_exec\fR
 Have srun verify existence of the executable program along with user
 execute permission on the node where srun was called before attempting to
@@ -2469,6 +2583,24 @@ RLIMIT_RSS is set, as is done for tasks running in regular steps.
 .IP
 
 .TP
+\fBLicenseParameters\fR
+Parameters to control the license behavior. By default no parameters are set.
+Multiple parameters may be specified in a comma\-separated list.
+Currently supported options are:
+.IP
+.RS
+.TP 8
+\fBRemoteFuzzyMatch\fR
+Allow jobs to be submitted with a shorthand for remote licenses that omits
+the server name. For example, "matlab@licenseServer" can be requested with
+"matlab". Requests including the server name will always be recognized.
+If a local (slurm.conf-defined) license exists, it will prefer to match that.
+If multiple servers exist with the same license name, the fuzzy match fails
+and an exact match (with the server name) must be used.
+.IP
+.RE
+
+.TP
 \fBLicenses\fR
 Specification of licenses (or other resources available on all
 nodes of the cluster) which can be allocated to jobs.
@@ -2484,18 +2616,35 @@ not explicitly listed in the job submission specification.
 
 .TP
 \fBLogTimeFormat\fR
-Format of the timestamp in slurmctld and slurmd log files. Accepted
-format values include "iso8601", "iso8601_ms", "rfc5424", "rfc5424_ms",
-"rfc3339", "clock", "short" and "thread_id". The values ending in "_ms" differ
-from the ones without in that fractional seconds with millisecond precision are
-printed. The default value is "iso8601_ms". The "rfc5424" formats are the same
-as the "iso8601" formats except that the timezone value is also shown.
-The "clock" format shows a timestamp in microseconds retrieved
-with the C standard clock() function. The "short" format is a short
-date and time format. The "thread_id" format shows the timestamp
-in the C standard ctime() function form without the year but
-including the microseconds, the daemon's process ID and the current thread name
-and ID.
+Comma\-separated list controlling the timestamp in slurmctld and slurmd log
+files. Give at most one timestamp format, optionally followed by any of the
+flags.
+
+Accepted format values are "iso8601", "iso8601_ms", "rfc5424", "rfc5424_ms",
+"rfc5424_us", "rfc3339", "clock", "short", and "omit". The values ending in
+"_ms" differ from the ones without in that fractional seconds with millisecond
+precision are printed, and "rfc5424_us" prints them with microsecond precision,
+which is the most RFC 5424 allows. The default value is "iso8601_ms". The
+"rfc5424" formats are the same as the "iso8601" formats except that the
+timezone value is also shown. The "clock" format shows a timestamp in
+microseconds retrieved with the C standard clock() function. The "short" format
+is a short date and time format. The "omit" format writes no timestamp at all,
+which is useful when logging through a service such as systemd's journal that
+records its own timestamps.
+
+Accepted flag values are "thread_id". The "thread_id" adds the daemon's process
+ID and the current thread name and ID after the timestamp. The timestamp itself
+is whichever format was given. It is not affected by "omit", which drops only
+the timestamp, so "omit,thread_id" prefixes each log line with the process and
+thread alone. Flags are disabled by default.
+
+\fBNOTE\fR: "thread_id" is also still accepted as a timestamp format value,
+which prints a short date and time, then the microsecond count, the process ID,
+and the current thread name and ID. The microsecond count is left justified in
+a six character field rather than zero padded, so it is not a well formed
+fractional second. It is kept as is so that existing configurations keep
+printing what they always have. Given beside a timestamp format it names the
+flag instead, so that format is printed with the process and thread after it.
 .IP
 
 .TP
@@ -2644,7 +2793,7 @@ Also see \fBFirstJobId\fR.
 
 .TP
 \fBMaxMemPerCPU\fR
-Maximum real memory size available per allocated CPU in megabytes.
+Maximum real memory size available per allocated CPU in mebibytes.
 Used to avoid over\-subscribing memory and causing paging.
 \fBMaxMemPerCPU\fR would generally be used if individual processors
 are allocated to jobs (\fBSelectType=select/cons_tres\fR).
@@ -2664,7 +2813,7 @@ submit LUA plugin instead to enforce auto\-adjustments to your specific needs.
 .TP
 \fBMaxMemPerNode\fR
 Maximum real memory size available per allocated node in a job allocation in
-megabytes. Used to avoid over\-subscribing memory and causing paging.
+mebibytes. Used to avoid over\-subscribing memory and causing paging.
 \fBMaxMemPerNode\fR would generally be used if whole nodes
 are allocated to jobs (\fBSelectType=select/linear\fR) and
 resources are over\-subscribed (\fBOverSubscribe=yes\fR or
@@ -2745,10 +2894,33 @@ necessitate higher values.
 .IP
 
 .TP
+\fBMetricsAuthUsers\fR
+Controls which users are allowed to query metrics plugin endpoints.
+\fBSlurmUser\fR and \fBroot\fR are always allowed. When set, it will ignore
+\fBPrivateData\fR and/or \fBMetricsParameters=ignore_private_data\fR, allowing
+users in the list to query the metrics endpoints.
+This option enables JWT authentication for querying metrics endpoints.
+.IP
+
+.TP
+\fBMetricsParameters\fR
+Parameters related to metrics plugins. Multiple parameters may be comma
+separated. Currently supported parameters include:
+.IP
+.RS
+.TP
+\fBignore_private_data\fR
+Causes metrics plugins to ignore \fBPrivateData\fR when set, and allows
+all users global access to query metrics endpoints without authentication.
+This option will be ignored if \fBMetricsAuthUsers\fR is set.
+.RE
+.IP
+
+.TP
 \fBMetricsType\fR
 Specify the metrics plugin to be used to dump statistics from the slurmctld
-socket. Gathering of metrics is disabled when PrivateData is set. Refer to the
-Metrics Guide for further details: <https://slurm.schedmd.com/metrics.html>
+socket. Refer to the Metrics Guide for further details:
+<https://slurm.schedmd.com/metrics.html>
 
 Configurable values at present are:
 .IP
@@ -2902,15 +3074,23 @@ preemptor job, even if the preemptor job requested fewer resources than that.
 These reserved nodes aren't available to other jobs during that backfill
 cycle, even if the other jobs could fit on the nodes. Therefore, jobs may
 preempt more resources during a single backfill iteration than they requested.
-.br
+
 \fBNOTE\fR:
-For heterogeneous job to be considered for preemption all components
-must be eligible for preemption. When a heterogeneous job is to be preempted
-the first identified component of the job with the highest order PreemptMode
-(\fBSUSPEND\fR (highest), \fBREQUEUE\fR, \fBCANCEL\fR (lowest)) will be
-used to set the PreemptMode for all components. The \fBGraceTime\fR and user
-warning signal for each component of the heterogeneous job remain unique.
-Heterogeneous jobs are excluded from GANG scheduling operations.
+For a heterogeneous job to be considered for preemption, all components
+must be eligible for preemption; \fBPreemptType\fR determines which jobs are
+eligible. Heterogeneous jobs are excluded from GANG scheduling operations,
+including \fBPreemptMode=SUSPEND\fR: a component whose \fBPreemptMode\fR
+resolves to \fBSUSPEND\fR is treated as \fBPreemptMode=OFF\fR.
+When a heterogeneous job is to be preempted, the first component found with
+\fBPreemptMode=REQUEUE\fR sets the mode for all components; if there is none,
+the first component found with \fBPreemptMode=CANCEL\fR does. The selected
+mode is applied to every component. If no component resolves to \fBREQUEUE\fR
+or \fBCANCEL\fR, the job is not preempted.
+The \fBGraceTime\fR and user warning signal for each component of the
+heterogeneous job remain unique. A heterogeneous job is never suspended as a
+preemptee, and it will never preempt a job whose resolved \fBPreemptMode\fR is
+\fBSUSPEND\fR.
+See <https://slurm.schedmd.com/preempt.html#hetjob> for more details.
 .IP
 .RS
 .TP 12
@@ -2935,8 +3115,8 @@ allows the resuming of suspended jobs. In order to use gang scheduling, the
 \fBNOTE:\fR
 If \fBGANG\fR scheduling is enabled with
 \fBPreemptType=preempt/partition_prio\fR, the controller will ignore
-\fBPreemptExemptTime\fR and the following \fBPreemptParameters\fR:
-\fBreorder_count\fR, \fBstrict_order\fR, and \fByoungest_first\fR.
+the following \fBPreemptParameters\fR: \fBreorder_count\fR, \fBstrict_order\fR,
+and \fByoungest_first\fR.
 
 \fBNOTE\fR:
 Gang scheduling is performed independently for each partition, so
@@ -2951,7 +3131,20 @@ jobs(s). You must configure the partition's \fIOverSubscribe\fR setting to
 In any case, time\-slicing won't happen between jobs on different partitions.
 
 \fBNOTE\fR:
-Heterogeneous jobs are excluded from GANG scheduling operations.
+A heterogeneous job is excluded from GANG scheduling operations, including
+\fBPreemptMode=SUSPEND\fR. A heterogeneous job component whose
+\fBPreemptMode\fR resolves to \fBSUSPEND\fR is treated as
+\fBPreemptMode=OFF\fR. If no component resolves to \fBREQUEUE\fR or
+\fBCANCEL\fR, the job is not preempted.
+
+\fBNOTE\fR:
+A heterogeneous job is also excluded from oversubscription while \fBGANG\fR is
+enabled, because GANG scheduling cannot time\-slice it out of a shared row.
+It is never placed on cores already allocated to another job, not even in its
+own partition's oversubscription rows.
+No other job is placed on its cores while it runs.
+Such a job may therefore remain pending where a non\-heterogeneous job would
+start.
 
 \fBNOTE\fR:
 In case of overlapping partitions. If the node is allocated job that allows
@@ -2975,7 +3168,12 @@ them. Therefore the \fBSUSPEND\fR preemption mode always needs the \fBGANG\fR
 option to be specified at the cluster level. Also, because the suspended jobs
 will still use memory on the allocated nodes, Slurm needs to be able to track
 memory resources to be able to suspend jobs.
-.br
+
+\fBNOTE\fR: A heterogeneous job is excluded from GANG scheduling operations, so
+it is never suspended as a preemptee, and it never preempts a job whose
+resolved \fBPreemptMode\fR is \fBSUSPEND\fR. See the heterogeneous job
+\fBNOTE\fRs under the \fBGANG\fR option above.
+
 When suspending jobs, Slurm sends the SIGTSTP signal, waits the time specified
 by \fBPreemptParameters=suspend_grace_time\fR (default is 2 seconds), then
 sends the SIGSTOP signal. The SIGCONT signal is sent when resuming jobs.
@@ -3026,7 +3224,8 @@ If set, jobs may be preempted to reclaim licenses. Otherwise jobs requesting
 busy licenses will have to wait even if they have preemption priority.
 The logic to support this option is only available in the select/cons_tres
 plugin. Jobs that use OR in the license request are not eligible to preempt
-other jobs to reclaim licenses.
+other jobs to reclaim licenses, and preemption is never used to reclaim
+Hierarchical Resources (HRES).
 .IP
 
 .TP
@@ -3115,8 +3314,7 @@ See the \fBsacctmgr\fR man page to configure the options for \fBpreempt/qos\fR.
 \fBPreemptExemptTime\fR
 Global option for minimum run time for all jobs before they can be considered
 for preemption. Any QOS PreemptExemptTime takes precedence over the global
-option. This is only honored for \fBPreemptMode=REQUEUE\fR and
-\fBPreemptMode=CANCEL\fR.
+option.
 .br
 A time of \-1 disables the option, equivalent to 0. Acceptable time formats
 include "minutes", "minutes:seconds", "hours:minutes:seconds", "days\-hours",
@@ -3453,6 +3651,10 @@ The default values are 0.
 This controls what type of information is hidden from regular users.
 By default, all information is visible to all users.
 User \fBSlurmUser\fR and \fBroot\fR can always view all information.
+This option, when set, causes metrics plugins endpoints to be restricted (plus
+enable JWT authentication for querying) and available only for \fBSlurmUser\fR
+and \fBroot\fR, unless \fBMetricsAuthUsers\fR or
+\fBMetricsParameters=ignore_private_data\fR are configured.
 Multiple values may be specified with a comma separator.
 Acceptable values include:
 .IP
@@ -3552,8 +3754,8 @@ Uses Process Group IDs.
 .TP
 \fBProlog\fR
 Pathname of a program for the slurmd to execute whenever it is asked to run a
-job step from a new job allocation. If it is not an absolute path name (i.e. it
-does not start with a slash), it will be searched for in the same directory as
+job step from a new job allocation. If it is not an absolute pathname (i.e. it
+does not start with a slash), it must be relative to the directory containing
 the slurm.conf file. A glob pattern (See \fBglob\fR (7)) may also be used to
 specify more than one program to run (e.g. "/etc/slurm/prolog.d/*"). When more
 than one prolog script is configured, they are executed in reverse alphabetical
@@ -3611,12 +3813,12 @@ Currently supported options are:
 .RS
 .TP 8
 \fBAlloc\fR
-If set, the Prolog script will be executed at job allocation. By default,
-Prolog is executed just before the task is launched. Therefore, when salloc
-is started, no Prolog is executed. Alloc is useful for preparing things
-before a user starts to use any allocated resources.
-In particular, this flag is needed on a Cray system when cluster compatibility
-mode is enabled.
+If set, the Prolog script will always be executed at job allocation. Otherwise,
+the Prolog is executed just before the first task is launched, which includes
+batch and interactive steps (see \fBLaunchParameters=use_interactive_step\fR).
+Alloc can be useful for preparing things before a user starts to use any
+allocated resources. In particular, this flag is needed on a Cray system
+when cluster compatibility mode is enabled.
 
 \fBNOTE\fR: Use of the Alloc flag will increase the time required to start jobs.
 .IP
@@ -3629,25 +3831,29 @@ This container may be used for user processes not launched under Slurm control,
 for example pam_slurm_adopt may place processes launched through a direct user
 login into this container. If using pam_slurm_adopt, then ProcTrackType must be
 set to \fBproctrack/cgroup\fR.
-Setting the Contain implicitly sets the Alloc flag.
+
+Setting the Contain flag implicitly sets the Alloc flag.
 .IP
 
 .TP
 \fBDeferBatch\fR
 If set, slurmctld will wait until the prolog completes on all allocated
-nodes before sending the batch job launch request. With just the Alloc flag,
-slurmctld will launch the batch step as soon as the first node in the job
-allocation completes the prolog.
+nodes before sending the batch job launch request.
+If just the Alloc flag is set, slurmctld will launch the batch step as soon as
+the job's batch node completes the prolog.
+
+Setting the DeferBatch flag implicitly sets the Alloc flag.
 .IP
 
 .TP
 \fBNoHold\fR
-If set, the Alloc flag should also be set. This will allow for salloc to not
-block until the prolog is finished on each node. The blocking will happen when
-steps reach the slurmd and before any execution has happened in the step.
-This is a much faster way to work and if using srun to launch your tasks you
-should use this flag. This flag cannot be combined with the Contain or X11
-flags.
+This will allow for salloc to not block until the prolog is finished on each
+node. The blocking will happen when steps reach the slurmd and before any
+execution has happened in the step. This is a much faster way to work and if
+using srun to launch your tasks you should use this flag. This flag cannot be
+combined with the Contain or X11 flags.
+
+Setting the NoHold flag implicitly sets the Alloc flag.
 .IP
 
 .TP
@@ -3655,14 +3861,15 @@ flags.
 When a batch job fails to launch due to a Prolog failure, always requeue it
 automatically even if the job requested no requeues.
 
-\fB\fBNOTE\fR: Setting this flag implicitly sets the Alloc flag.\fR
+Setting the ForceRequeueOnFail flag implicitly sets the Alloc flag.
 .IP
 
 .TP
 \fBRunInJob\fR
 Make the Prolog/Epilog run in the extern slurmstepd. This will contain it in one
 of on the job's processes. This will contain it in the cgroup if configured.
-Setting the RunInJob flag implicitly sets the Contain and Alloc flag.
+
+Setting the RunInJob flag implicitly sets the Contain and Alloc flags.
 .IP
 
 .TP
@@ -3678,7 +3885,8 @@ a significant penalty to job throughput on each node.
 \fBX11\fR
 Enable Slurm's built\-in X11 forwarding capabilities.
 This is incompatible with \fBProctrackType=proctrack/linuxproc\fR.
-Setting the X11 flag implicitly enables both Contain and Alloc flags as well.
+
+Setting the X11 flag implicitly sets the Contain and Alloc flags.
 .RE
 .IP
 
@@ -3714,6 +3922,9 @@ this option on multiple lines.\fR
 .TP
 \fBPropagatePrioProcess\fR
 Controls the scheduling priority (nice value) of user spawned tasks.
+
+\fBNOTE\fR: This has limited functionality if used in combination with cgroups
+(\fBproctrack/cgroup\fR or \fBtask/cgroup\fR).
 .IP
 .RS
 .TP 5
@@ -3843,6 +4054,7 @@ Program to be executed on each compute node to reboot it. Invoked on each node
 once it becomes idle after the command "scontrol reboot" is executed by
 an authorized user or a job is submitted with the "\-\-reboot" option.
 After rebooting, the node is returned to normal use.
+This can alternatively be set to the name of a \fBPowerAction\fR.
 See \fBResumeTimeout\fR to configure the time you expect a reboot to finish in.
 A node will be marked DOWN if it doesn't reboot within \fBResumeTimeout\fR.
 .IP
@@ -3894,7 +4106,7 @@ Separate multiple exit code by a comma and/or specify numeric ranges using a
 "\-" separator (e.g. "RequeueExit=1\-9,18")
 Jobs will be put back in to pending state and later scheduled again.
 Restarted jobs will have the environment variable \fBSLURM_RESTART_COUNT\fP
-set to the number of times the job has been restarted.
+incremented.
 .IP
 
 .TP
@@ -3905,7 +4117,7 @@ Separate multiple exit code by a comma and/or specify numeric ranges using a
 "\-" separator (e.g. "RequeueExitHold=10\-12,16")
 These jobs are put in the \fBJOB_SPECIAL_EXIT\fP exit state.
 Restarted jobs will have the environment variable \fBSLURM_RESTART_COUNT\fP
-set to the number of times the job has been restarted.
+incremented.
 .IP
 
 .TP
@@ -3913,6 +4125,7 @@ set to the number of times the job has been restarted.
 The program that will be executed when nodes fail to resume to by
 \fBResumeTimeout\fR. The argument to the program will be the names of the failed
 nodes (using Slurm's hostlist expression format).
+It can alternatively be set to the name of a \fBPowerAction\fR.
 Programs will be killed if they run longer than the largest configured, global
 or partition, \fBResumeTimeout\fR or \fBSuspendTimeout\fR.
 .IP
@@ -3924,7 +4137,8 @@ remain idle for an extended period of time.
 This is typically accomplished by reducing voltage and frequency or powering
 the node down.
 \fBResumeProgram\fR is the program that will be executed when a node
-in power save mode is assigned work to perform.
+in power save mode is assigned work to perform. It can alternatively be set to
+the name of a \fBPowerAction\fR.
 For reasons of reliability, \fBResumeProgram\fR may execute more than once
 for a node when the \fBslurmctld\fR daemon crashes and is restarted.
 If \fBResumeProgram\fR is unable to restore a node to service with a responding
@@ -4748,6 +4962,30 @@ similar to \fBPrologFlags=ForceRequeueOnFail\fR.
 .IP
 
 .TP
+\fBresilience_min_health\fR=#
+Minimum percentage (1\-100) of nodes that must be up for a running batch job
+that opted into adaptive resilience to be shrunk onto its surviving nodes
+when one of its allocated nodes fails. Below this threshold the job is
+requeued or killed as it would be without adaptive resilience. A job that
+was shrunk keeps running with the reason \fBResilienceRecovery\fR.
+When \fBpermit_job_expansion\fR is also set, a shrunk job is grown back onto
+the nodes of its original allocation as they become idle again, one node at a
+time and at most every 30 seconds, through an allocation\-only job named
+"resilience\-regrow\-<jobid>" that is merged into the job in the same way as
+a job started with \-\-dependency=expand:<jobid>. Steps already running are
+not extended onto the regained nodes; the job script has to launch new steps
+to use them.
+The default value is 70.
+.IP
+
+.TP
+\fBresilience_partitions\fR=<\fIpartitions\fR>
+Comma separated list of partitions whose batch jobs are opted into adaptive
+resilience by the \fBjob_submit/resilience\fR plugin. Requires
+\fBJobSubmitPlugins=resilience\fR.
+.IP
+
+.TP
 \fBsalloc_wait_nodes\fR
 If defined, the salloc command will wait until all allocated nodes are ready for
 use (i.e. booted) before the command returns. By default, salloc will return as
@@ -4910,8 +5148,9 @@ Acceptable values include
 The resources (cores, memory, GPUs and all other trackable resources) within
 a node are individually allocated as consumable resources.
 Note that whole nodes can be allocated to jobs for selected
-partitions by using the \fIOverSubscribe=Exclusive\fR option.
-See the partition \fBOverSubscribe\fR parameter for more information.
+partitions by using the partition \fBExclusive\fR parameter (e.g.
+\fBExclusive=NODE\fR).
+See \fBExclusive\fR and \fBOverSubscribe\fR for more information.
 This is the default value.
 .IP
 
@@ -4927,24 +5166,33 @@ nodes is not recommended and may result in valid job allocation requests being
 rejected. The linear plugin is not designed to track generic resources on a
 node. In cases where generic resources (such as GPUs) need to be tracked,
 the cons_tres plugin should be used instead.
+
+\fBNOTE\fR: This plugin enforces partition \fBOverSubscribe\fR limits
+differently than \fBselect/cons_tres\fR.  A limit on the number of jobs sharing
+resources (e.g. \fBFORCE:2\fR) will be compared against all jobs running on the
+involved nodes, including jobs started through an overlapping partition.
 .RE
 .IP
 
 .TP
 \fBSelectTypeParameters\fR
-The permitted values of \fBSelectTypeParameters\fR depend upon the
-configured value of \fBSelectType\fR.
-The only supported options for \fBSelectType=select/linear\fR are
-\fBCR_ONE_TASK_PER_CORE\fR and
-\fBCR_Memory\fR, which treats memory as a consumable resource and
-prevents memory over subscription with job preemption or gang scheduling.
-By default \fBSelectType=select/linear\fR allocates whole nodes to jobs without
-considering their memory consumption.
-By default \fBSelectType=select/cons_tres\fR uses \fBCR_Core_Memory\fR, which
-allocates Core to jobs while considering their memory consumption.
+Controls how the \fBSelectType\fR algorithm will allocate nodes to jobs.
+Multiple comma\-separated options may be provided as long as no conflicts
+described below are present. The permitted values depend upon the configured
+value of \fBSelectType\fR.
 
-The following options are supported by the \fBSelectType=select/cons_tres\fR
-plugin:
+By default \fBSelectType=select/linear\fR allocates whole nodes to jobs without
+considering their memory consumption. The only supported options for
+\fBselect/linear\fR are \fBCR_ONE_TASK_PER_CORE\fR (described below) and
+\fBCR_Memory\fR, which treats memory as a consumable resource and
+prevents memory oversubscription with job preemption or gang scheduling.
+
+By default \fBSelectType=select/cons_tres\fR uses \fBCR_Core_Memory\fR, which
+allocates cores to jobs while considering their memory consumption.
+
+Any one of the following options may be used with the \fBselect/cons_tres\fR
+plugin to determine whether CPU resources are consumed by socket, core, or
+logical CPU, and whether memory is consumed:
 .IP
 .RS
 .TP
@@ -4953,7 +5201,7 @@ CPUs are consumable resources.
 Configure the number of \fBCPUs\fR on each node, which may be equal to the
 count of cores or hyper\-threads on the node depending upon the desired minimum
 resource allocation.
-The node's \fBBoards\fR, \fBSockets\fR, \fBCoresPerSocket\fR and
+The node's \fBBoards\fR, \fBSockets\fR, \fBCoresPerSocket\fR, and
 \fBThreadsPerCore\fR may optionally be configured and result in job
 allocations which have improved locality; however doing so will prevent
 more than one job from being allocated on each core.
@@ -4961,14 +5209,8 @@ more than one job from being allocated on each core.
 
 .TP
 \fBCR_CPU_Memory\fR
-CPUs and memory are consumable resources.
-Configure the number of \fBCPUs\fR on each node, which may be equal to the
-count of cores or hyper\-threads on the node depending upon the desired minimum
-resource allocation.
-The node's \fBBoards\fR, \fBSockets\fR, \fBCoresPerSocket\fR and
-\fBThreadsPerCore\fR may optionally be configured and result in job
-allocations which have improved locality; however doing so will prevent
-more than one job from being allocated on each core.
+CPUs and memory are consumable resources. Refer to \fBCR_CPU\fR for details of
+how CPUs are consumed.
 Setting a value for \fBDefMemPerCPU\fR is strongly recommended.
 .IP
 
@@ -4979,27 +5221,45 @@ On nodes with hyper\-threads, each thread is counted as a CPU to
 satisfy a job's resource requirement, but multiple jobs are not
 allocated threads on the same core.
 The count of CPUs allocated to a job is rounded up to account for every
-CPU on an allocated core. This will also impact total allocated memory when
--\-mem\-per\-cpu is used to be multiply of total number of CPUs on allocated cores.
+CPU on an allocated core, which may also impact total allocated memory
+if it is derived from \fB\-\-mem\-per\-cpu\fR.
 .IP
 
 .TP
 \fBCR_Core_Memory\fR
-Cores and memory are consumable resources.
-On nodes with hyper\-threads, each thread is counted as a CPU to
-satisfy a job's resource requirement, but multiple jobs are not
-allocated threads on the same core.
-The count of CPUs allocated to a job may be rounded up to account for every
-CPU on an allocated core.
+Cores and memory are consumable resources. Refer to \fBCR_Core\fR for details of
+how cores are consumed.
 Setting a value for \fBDefMemPerCPU\fR is strongly recommended.
 .IP
+
+.TP
+\fBCR_Socket\fR
+Sockets are consumable resources.
+On nodes with multiple cores, each core or thread is counted as a CPU
+to satisfy a job's resource requirement, but multiple jobs are not
+allocated resources on the same socket.
+.IP
+
+.TP
+\fBCR_Socket_Memory\fR
+Sockets and memory are consumable resources. Refer to \fBCR_Socket\fR for
+details of how sockets are consumed.
+Setting a value for \fBDefMemPerCPU\fR is strongly recommended.
+.RE
+
+.IP
+Any number of the following options may be used with the \fBselect/cons_tres\fR
+plugin to further adjust selection behavior:
+.IP
+.RS
 
 .TP
 \fBCR_ONE_TASK_PER_CORE\fR
 Allocate one task per core by default.
 Without this option, by default one task will be allocated per
 thread on nodes with more than one \fBThreadsPerCore\fR configured.
-\fBNOTE\fR: This option cannot be used with CR_CPU*.
+
+\fBNOTE\fR: This option cannot be used with \fBCR_CPU*\fR.
 .IP
 
 .TP
@@ -5008,8 +5268,8 @@ Allocate cores within a node using block distribution by default.
 This is a pseudo\-best\-fit algorithm that minimizes the number of
 boards and minimizes the number of sockets (within minimum boards)
 used for the allocation.
-This default behavior can be overridden specifying a particular
-"\-m" parameter with srun/salloc/sbatch.
+This default behavior can be overridden by specifying a particular
+\fB\-\-distribution\fR option at job submission.
 Without this option, cores will be allocated cyclically across the sockets.
 .IP
 
@@ -5021,7 +5281,7 @@ serial jobs as idle resources will tend to be highly fragmented, resulting
 in parallel jobs being distributed across many nodes.
 Note that node \fBWeight\fR takes precedence over how many idle resources are
 on each node.
-Also see the partition configuration parameter \fBLLN\fR
+Also see the partition configuration parameter \fBLLN\fR to
 use the least loaded nodes in selected partitions.
 .IP
 
@@ -5037,43 +5297,25 @@ If the job starts ten tasks across those two nodes without this option, it will
 start five tasks on each of the two nodes.
 With this option, eight tasks will be started on the first node and two tasks
 on the second node.
-This can be superseded by "NoPack" in srun's "\-\-distribution" option.
-CR_Pack_Nodes only applies when the "block" task distribution method is used.
+This only applies when the \fB\-\-distribution=block\fR option is used.
+This can be superseded by setting the \fBNoPack\fR distribution option.
 .IP
 
 .TP
 \fBLL_SHARED_GRES\fR
-When allocating resources for a shared GRES (gres/mps, gres/shard), prefer
-least loaded device (in terms of already allocated fraction). This way jobs are
-spread across GRES devices on the node, instead of the default behavior where
-the first available device is used.
-This option is only supported by select/cons_tres plugin.
-.IP
-
-.TP
-\fBCR_Socket\fR
-Sockets are consumable resources.
-On nodes with multiple cores, each core or thread is counted as a CPU
-to satisfy a job's resource requirement, but multiple jobs are not
-allocated resources on the same socket.
-.IP
-
-.TP
-\fBCR_Socket_Memory\fR
-Memory and sockets are consumable resources.
-On nodes with multiple cores, each core or thread is counted as a CPU
-to satisfy a job's resource requirement, but multiple jobs are not
-allocated resources on the same socket.
-Setting a value for \fBDefMemPerCPU\fR is strongly recommended.
+When allocating resources for a shared GRES (gres/mps, gres/shard), prefer the
+least loaded device (in terms of already allocated fraction).
+This way, jobs are spread across GRES devices on the node, instead of the
+default behavior where the first available device is used.
 .IP
 
 .TP
 \fBMULTIPLE_SHARING_GRES_PJ\fR
-By default, only one sharing gres per job is allowed on each node from shared
-gres requests. This allows multiple sharing gres' to be used on a single node
-to satisfy shared gres requirements per job.
-Example: If there are 10 shards to a gpu and 12 shards are requested, instead of
-being denied the job will be allocated with 2 gpus. 1 using 10 shards and the
+By default, only one sharing GRES per job is allowed on each node from shared
+GRES requests. This allows multiple sharing GRES to be used on a single node
+to satisfy shared GRES requirements per job.
+Example: If there are 10 shards to a GPU and 12 shards are requested, instead of
+being denied the job will be allocated with 2 GPUs: 1 using 10 shards and the
 other using 2 shards.
 .IP
 
@@ -5089,13 +5331,77 @@ Set \fB\-\-gres\-flags=one\-task\-per\-sharing\fR as the default in every job.
 This can be overridden with \fB\-\-gres\-flags=multiple\-tasks\-per\-sharing\fR.
 .IP
 
-.LP
-\fBNOTE\fR: If memory isn't configured as a consumable resource (CR_CPU,
-CR_Core or CR_Socket without _Memory) memory can be oversubscribed and will not
-be constrained by task/cgroup even if it is configured in cgroup.conf. In this
-case the \fI--mem\fR option is only used to filter out nodes with lower
-configured memory and does not take running jobs into account. For instance,
-two jobs requesting all the memory of a node can run at the same time.
+.TP
+\fBCR_NO_DIST_TOPO_BLOCK\fR
+Disable topology\-aware task distribution for steps. By default, when a
+topology plugin is configured, tasks are distributed to nodes following
+topology order. This option reverts to the standard bitmap order.
+.RE
+
+.IP
+\fBNOTE\fR: If memory isn't configured as a consumable resource (\fBCR_CPU\fR,
+\fBCR_Core\fR, or \fBCR_Socket\fR without \fB_Memory\fR), memory can be
+oversubscribed and will not be constrained by \fBtask/cgroup\fR even if it is
+configured in \fBcgroup.conf\fR. In this case the \fB\-\-mem\fR option is only
+used to filter out nodes with lower configured memory and does not take running
+jobs into account. For instance, two jobs requesting all the memory of a node
+can run at the same time.
+.IP
+
+.TP
+\fBSerializerParameters\fR
+Comma-separated list of flags applied to all serializer plugins.
+.IP
+.RS
+.TP 10
+\fBcompact\fR
+Use compact output with minimal whitespace.
+.IP
+
+.TP
+\fBpretty\fR
+Use human-readable output with indentation and newlines.
+This is the default.
+.IP
+
+.TP
+\fBcomplex\fR
+Include the special floating-point values "Infinity" and "NaN" directly.
+By default these are replaced with placeholder numbers to ensure broad
+compatibility with various parsers.
+.IP
+
+.TP
+\fBno_tag\fR
+Do not emit YAML tags.  These tags ensure accurate preservation of data types;
+when set, some types may be inferred incorrectly.
+.RE
+.IP
+
+.TP
+\fBSerializerPlugins\fR
+Comma-separated list of serializer plugins to load.
+Defaults to all serializer plugins found on the system.
+Acceptable values at present are:
+.IP
+.RS
+.TP 10
+\fBjson\fR
+Serialize to and from JSON.
+
+\fBNOTE\fR: This serializer is currently required for default Slurm deployments;
+omitting it from the list of plugins may cause daemons to fail at startup.
+.IP
+
+.TP
+\fByaml\fR
+Serialize to and from YAML.
+.IP
+
+.TP
+\fBurl\-encoded\fR
+Deserialize from URL-encoded form data. Parsing only; serialization to
+URL-encoded form is not supported.
 .RE
 .IP
 
@@ -5211,6 +5517,16 @@ Refer to the \fBRELOCATING CONTROLLERS\fR section if you need to change this.
 .IP
 
 .TP
+\fBSlurmctldHttpAuthParameters\fR
+Comma\-separated list of options controlling how the \fBslurmctld\fR HTTP
+listener authenticates incoming requests. Recognized keys are the same
+JWT\-related keys documented under \fBAuthAltParameters\fR. When set, an
+independent per\-daemon authentication keys are loaded from these parameters.
+Tokens presented to the \fBslurmctld\fR HTTP endpoints are verified against
+these configured keys rather than against \fBAuthAltParameters\fR.
+.IP
+
+.TP
 \fBSlurmctldLogFile\fR
 Fully qualified pathname of a file into which the \fBslurmctld\fR daemon's
 logs are written.
@@ -5243,7 +5559,13 @@ DNS, this step can be avoided by configuring this option.
 .IP
 
 .TP
-\fBconmgr_max_connections\fR=\fI<connection_count>\fR
+\fBconmgr_connect_timeout\fR=<\fIseconds\fR>
+Wait <\fIseconds\fR> before considering an outbound connection attempt to be
+timed out. Defaults to the value of \fBMessageTimeout\fR.
+.IP
+
+.TP
+\fBconmgr_max_connections\fR=<\fIconnection_count\fR>
 Specify the maximum number of connections to be processed at any given time.
 This does not influence the maximum number of pending connections as that is
 controlled by the kernel. Increasing this value will increase \fBslurmctld\fR's
@@ -5252,10 +5574,21 @@ increasing this value. Defaults to 512.
 .IP
 
 .TP
-\fBconmgr_threads\fR=\fI<thread_count>\fR
-The number of process threads in thread pool used for receiving and
-processing connections on the listening sockets. In most cases, you should
-decrease \fBconmgr_threads\fR to improve scheduling performance.
+\fBconmgr_quiesce_timeout\fR=<\fIseconds\fR>
+Wait <\fIseconds\fR> before considering quiesce to be timed out. Upon timeout,
+all (non-listening) active connections will be closed to allow the quiesce to
+start. Defaults to two times value of \fBMessageTimeout\fR.
+.IP
+
+.TP
+\fBconmgr_read_timeout\fR=<\fIseconds\fR>
+Wait <\fIseconds\fR> before considering a read from a file descriptor to be
+timed out. Defaults to the value of \fBMessageTimeout\fR.
+.IP
+
+.TP
+\fBconmgr_threads\fR=<\fIthread_count\fR>
+Alias for \fBworkerpool_threads\fR.
 .IP
 
 .TP
@@ -5264,45 +5597,20 @@ Use \fIpoll\fR(2) instead of \fIepoll\fR(7) for monitoring file descriptors.
 .IP
 
 .TP
-\fBconmgr_connect_timeout\fR=\fI<seconds>\fR
-Wait \fI<seconds>\fR before considering an outbound connection attempt to be
-timed out. Defaults to the value of \fBMessageTimeout\fR.
-.IP
-
-.TP
-\fBconmgr_read_timeout\fR=\fI<seconds>\fR
-Wait \fI<seconds>\fR before considering a read from a file descriptor to be
-timed out. Defaults to the value of \fBMessageTimeout\fR.
-.IP
-
-.TP
-\fBconmgr_quiesce_timeout\fR=\fI<seconds>\fR
-Wait \fI<seconds>\fR before considering quiesce to be timed out. Upon timeout,
-all (non-listening) active connections will be closed to allow the quiesce to
-start. Defaults to two times value of \fBMessageTimeout\fR.
-.IP
-
-.TP
-\fBconmgr_wait_write_delay\fR=\fI<seconds>\fR
+\fBconmgr_wait_write_delay\fR=<\fIseconds\fR>
 When waiting for kernel to flush outgoing buffer, poll kernel for changes every
-\fI<seconds>\fR for changes. Defaults to the value of \fBMessageTimeout\fR.
+<\fIseconds\fR> for changes. Defaults to the value of \fBMessageTimeout\fR.
 .IP
 
 .TP
-\fBconmgr_write_timeout\fR=\fI<seconds>\fR
-Wait \fI<seconds>\fR before considering a write from a file descriptor to be
+\fBconmgr_write_timeout\fR=<\fIseconds\fR>
+Wait <\fIseconds\fR> before considering a write from a file descriptor to be
 timed out. Defaults to the value of \fBMessageTimeout\fR.
 .IP
 
 .TP
 \fBdisable_triggers\fR
 Disable the ability to register new triggers.
-.IP
-
-.TP
-\fBenable_async_reply\fR
-Enable \fBslurmctld\fR to reply to incoming (supported) RPCs asynchronously
-without blocking a thread in the conmgr thread pool.
 .IP
 
 .TP
@@ -5331,10 +5639,42 @@ the top of the queue.
 .IP
 
 .TP
+\fBenable_stepmgr\fR
+Enable slurmstepd step management system wide. This enables job steps to be
+managed by a single extern slurmstepd associated with the job to manage steps.
+This is beneficial for jobs that submit many steps inside their allocations.
+\fBPrologFlags=contain\fR must be set.
+.IP
+
+.TP
 \fBidle_on_node_suspend\fR
 Mark nodes as idle, regardless of current state, when suspending nodes with
 \fBSuspendProgram\fR so that nodes will be eligible to be resumed at a later
 time.
+.IP
+
+.TP
+\fBmax_dbd_msg_action\fR
+Action used once MaxDBDMsgs is reached, options are 'discard' (default) and 'exit'.
+
+When 'discard' is specified and MaxDBDMsgs is reached we start by purging
+pending messages of types Step start and complete, and it reaches MaxDBDMsgs
+again Job start messages are purged. Job completes and node state changes
+continue to consume the empty space created from the purgings until MaxDBDMsgs
+is reached again at which no new message is tracked creating data loss and
+potentially runaway jobs.
+
+When 'exit' is specified and MaxDBDMsgs is reached the slurmctld will exit
+instead of discarding any messages. It will be impossible to start the
+slurmctld with this option where the slurmdbd is down and the slurmctld is
+tracking more than MaxDBDMsgs.
+.IP
+
+.TP
+\fBmax_powered_nodes\fR
+The max number of powered up nodes across the cluster. Once this is reached,
+jobs requesting additional nodes will not start, and "scontrol power up
+<nodes>" will fail.
 .IP
 
 .TP
@@ -5371,35 +5711,12 @@ nodes. Default is 0.
 .IP
 
 .TP
-\fBmax_powered_nodes\fR
-The max number of powered up nodes across the cluster. Once this is reached,
-jobs requesting additional nodes will not start, and "scontrol power up
-<nodes>" will fail.
-.IP
-
-.TP
-\fBmax_dbd_msg_action\fR
-Action used once MaxDBDMsgs is reached, options are 'discard' (default) and 'exit'.
-
-When 'discard' is specified and MaxDBDMsgs is reached we start by purging
-pending messages of types Step start and complete, and it reaches MaxDBDMsgs
-again Job start messages are purged. Job completes and node state changes
-continue to consume the empty space created from the purgings until MaxDBDMsgs
-is reached again at which no new message is tracked creating data loss and
-potentially runaway jobs.
-
-When 'exit' is specified and MaxDBDMsgs is reached the slurmctld will exit
-instead of discarding any messages. It will be impossible to start the
-slurmctld with this option where the slurmdbd is down and the slurmctld is
-tracking more than MaxDBDMsgs.
-.IP
-
-.TP
 \fBreboot_from_controller\fR
 Run the \fBRebootProgram\fR from the controller instead of on the slurmds. The
 RebootProgram will be passed a comma\-separated list of nodes to reboot as the
 first argument and if applicable the required features needed for reboot as the
-second argument.
+second argument. If \fBRebootProgram\fR is set to a \fBPowerAction\fR, this
+parameter is ignored in favor of the \fBPowerAction\fR Location.
 .IP
 
 .TP
@@ -5459,36 +5776,29 @@ The default value is 8192.
 .IP
 
 .TP
-\fBenable_stepmgr\fR
-Enable slurmstepd step management system wide. This enables job steps to be
-managed by a single extern slurmstepd associated with the job to manage steps.
-This is beneficial for jobs that submit many steps inside their allocations.
-\fBPrologFlags=contain\fR must be set.
-.IP
-
-.TP
-\fBuser_resv_delete\fR
-Allow any user able to run in a reservation to delete it.
-.IP
-
-.TP
-\fBthreadpool\fR=\fI<enabled|disabled>\fR
+\fBthreadpool\fR=<\fIenabled|disabled\fR>
 Enable or disable using the threadpool in slurmctld to avoid overhead of
 allocating new process threads by preserving previously created threads.
-The default value is "enabled".
+The default value is "enabled". Sites that wish to restore the prior
+behavior of allocating a new thread per request may set this to "disabled".
 .IP
 
 .TP
-\fBthreadpool_preallocate\fR=\fI<thread_count>\fR
+\fBthreadpool_preallocate\fR=<\fIthread_count\fR>
 The number of process threads to preallocate at startup for thread pool.
 The default value is 32.
 .IP
 
 .TP
-\fBthreadpool_preserve\fR=\fI<thread_count>\fR
+\fBthreadpool_preserve\fR=<\fIthread_count\fR>
 The number of idle process threads to maintain in thread pool before allowing
 threads to exit.
 The default value is 128.
+.IP
+
+.TP
+\fBuser_resv_delete\fR
+Allow any user able to run in a reservation to delete it.
 .IP
 
 .TP
@@ -5498,6 +5808,14 @@ system. On large systems this can cause considerable delay, this option permits
 the slurmctld to concurrently handle the lookup calls and can reduce system
 startup time considerably. The default value is 1. Maximum permitted value is
 64.
+.IP
+
+.TP
+\fBworkerpool_threads\fR=<\fIthread_count\fR>
+The number of process threads in the worker pool used for internal processing.
+In most cases, you should decrease \fBworkerpool_threads\fR to
+improve scheduling performance. Defaults to twice the number of CPUs available,
+with a minimum of 2 threads and up to a maximum default of 32 threads.
 .RE
 .IP
 
@@ -5514,8 +5832,7 @@ The port number that the Slurm controller, \fBslurmctld\fR, listens
 to for work. The default value is SLURMCTLD_PORT as established at system
 build time. If none is explicitly specified, it will be set to 6817.
 \fBSlurmctldPort\fR may also be configured to support a range of port
-numbers in order to accept larger bursts of incoming messages by specifying
-two numbers separated by a dash (e.g. \fBSlurmctldPort=6817\-6818\fR).
+numbers for existing legacy configurations.
 \fBNOTE\fR: Either \fBslurmctld\fR and \fBslurmd\fR daemons must not
 execute on the same nodes or the values of \fBSlurmctldPort\fR and
 \fBSlurmdPort\fR must be different.
@@ -5681,6 +5998,16 @@ Log errors and verbose informational messages and even more debugging messages
 .IP
 
 .TP
+\fBSlurmdHttpAuthParameters\fR
+Comma\-separated list of options controlling how the \fBslurmd\fR HTTP
+listener authenticates incoming requests. Recognized keys are the same
+JWT\-related keys documented under \fBAuthAltParameters\fR. When set, an
+independent per\-daemon authentication keys are loaded from these parameters.
+Tokens presented to the \fBslurmd\fR HTTP endpoints are verified against this
+context rather than against \fBAuthAltParameters\fR.
+.IP
+
+.TP
 \fBSlurmdLogFile\fR
 Fully qualified pathname of a file into which the \fBslurmd\fR daemon's
 logs are written.
@@ -5718,20 +6045,36 @@ Equivalent to the now deprecated FastSchedule=2 option.
 .IP
 
 .TP
-\fBconmgr_max_connections\fR=\fI<connection_count>\fR
+\fBconmgr_connect_timeout\fR=<\fIseconds\fR>
+Wait <\fIseconds\fR> before considering an outbound connection attempt to be
+timed out. Defaults to the value of \fBMessageTimeout\fR.
+.IP
+
+.TP
+\fBconmgr_max_connections\fR=<\fIconnection_count\fR>
 Specify the maximum number of connections to be processed at any given time.
 This does not influence the maximum number of pending connections as that is
 controlled by the kernel. Increasing this value will increase \fBslurmd\fR's
 memory footprint. Sites are advised to monitor memory consumption when
-increasing this value. Defaults to 150.
+increasing this value. Defaults to 512.
 .IP
 
 .TP
-\fBconmgr_threads\fR=\fI<thread_count>\fR
-The number of process threads in thread pool used for receiving and
-processing connections on the listening sockets. In most cases you should
-decrease \fBconmgr_threads\fR to improve scheduling performance.
-Default value is 6 threads.
+\fBconmgr_quiesce_timeout\fR=<\fIseconds\fR>
+Wait <\fIseconds\fR> before considering quiesce to be timed out. Upon timeout,
+all (non-listening) active connections will be closed to allow the quiesce to
+start. Defaults to two times value of \fBMessageTimeout\fR.
+.IP
+
+.TP
+\fBconmgr_read_timeout\fR=<\fIseconds\fR>
+Wait <\fIseconds\fR> before considering a read from a file descriptor to be
+timed out. Defaults to the value of \fBMessageTimeout\fR.
+.IP
+
+.TP
+\fBconmgr_threads\fR=<\fIthread_count\fR>
+Alias for \fBworkerpool_threads\fR.
 .IP
 
 .TP
@@ -5740,34 +6083,22 @@ Use \fIpoll\fR(2) instead of \fIepoll\fR(7) for monitoring file descriptors.
 .IP
 
 .TP
-\fBconmgr_connect_timeout\fR=\fI<seconds>\fR
-Wait \fI<seconds>\fR before considering an outbound connection attempt to be
-timed out. Defaults to the value of \fBMessageTimeout\fR.
-.IP
-
-.TP
-\fBconmgr_read_timeout\fR=\fI<seconds>\fR
-Wait \fI<seconds>\fR before considering a read from a file descriptor to be
-timed out. Defaults to the value of \fBMessageTimeout\fR.
-.IP
-
-.TP
-\fBconmgr_quiesce_timeout\fR=\fI<seconds>\fR
-Wait \fI<seconds>\fR before considering quiesce to be timed out. Upon timeout,
-all (non-listening) active connections will be closed to allow the quiesce to
-start. Defaults to two times value of \fBMessageTimeout\fR.
-.IP
-
-.TP
-\fBconmgr_wait_write_delay\fR=\fI<seconds>\fR
+\fBconmgr_wait_write_delay\fR=<\fIseconds\fR>
 When waiting for kernel to flush outgoing buffer, poll kernel for changes every
-\fI<seconds>\fR for changes. Defaults to the value of \fBMessageTimeout\fR.
+<\fIseconds\fR> for changes. Defaults to the value of \fBMessageTimeout\fR.
 .IP
 
 .TP
-\fBconmgr_write_timeout\fR=\fI<seconds>\fR
-Wait \fI<seconds>\fR before considering a write from a file descriptor to be
+\fBconmgr_write_timeout\fR=<\fIseconds\fR>
+Wait <\fIseconds\fR> before considering a write from a file descriptor to be
 timed out. Defaults to the value of \fBMessageTimeout\fR.
+.IP
+
+.TP
+\fBcontain_spank\fR
+If set and a namespace plugin is specified, the spank_user(),
+spank_task_post_fork(), and spank_task_exit() calls will be run inside the job's
+namespace.
 .IP
 
 .TP
@@ -5777,6 +6108,13 @@ where the socket level is too coarse, and the l3cache may provide better
 task distribution. (E.g., along CCX boundaries instead of socket boundaries.)
 Mutually exclusive with numa_node_as_socket.
 Requires hwloc v2.
+
+\fBNOTE\fR: When this parameter is set, the node definitions in slurm.conf
+(\fBSockets\fR or \fBSocketsPerBoard\fR, \fBCoresPerSocket\fR, and
+\fBThreadsPerCore\fR) must be updated to reflect the resulting topology as
+reported by \fBslurmd \-C \-\-parameters=l3cache_as_socket\fR, not the
+physical hardware layout. Failing to update these values will cause a
+mismatch between what slurmd detects and what the controller expects.
 .TP
 \fBnuma_node_as_socket\fR
 Use the hwloc NUMA Node to determine main hierarchy object to be used as socket.
@@ -5785,6 +6123,13 @@ as socket. This option may be useful for architectures likes AMD Epyc, where
 number of nodes per socket may be configured.
 Mutually exclusive with l3cache_as_socket.
 Requires hwloc v2.
+
+\fBNOTE\fR: When this parameter is set, the node definitions in slurm.conf
+(\fBSockets\fR or \fBSocketsPerBoard\fR, \fBCoresPerSocket\fR, and
+\fBThreadsPerCore\fR) must be updated to reflect the resulting topology as
+reported by \fBslurmd \-C \-\-parameters=numa_node_as_socket\fR, not the
+physical hardware layout. Failing to update these values will cause a
+mismatch between what slurmd detects and what the controller expects.
 .IP
 
 .TP
@@ -5793,10 +6138,9 @@ If set, the Slurmd will shut itself down when a reboot request is received.
 .IP
 
 .TP
-\fBcontain_spank\fR
-If set and a job_container plugin is specified, the spank_user(),
-spank_task_post_fork() and spank_task_exit() calls will be run inside the job
-container.
+\fBworkerpool_threads\fR=<\fIthread_count\fR>
+The number of process threads in the worker pool used for handling internal
+processing. Defaults to 6 threads.
 .RE
 .IP
 
@@ -5932,6 +6276,75 @@ slurmd can run jobs as the user that submitted them.
 .IP
 
 .TP
+\fBSlurmrestdParameters\fR
+Parameters specific to \fBslurmrestd\fR. Changes to this option take effect only
+when \fBslurmrestd\fR is restarted. Multiple options may be comma separated.
+.IP
+.RS
+.TP
+\fBconmgr_connect_timeout\fR=<\fIseconds\fR>
+Wait <\fIseconds\fR> before considering an outbound connection attempt to be
+timed out. Defaults to the value of \fBMessageTimeout\fR.
+.IP
+
+.TP
+\fBconmgr_max_connections\fR=<\fIconnection_count\fR>
+Specify the maximum number of connections to be processed at any given time.
+This does not influence the maximum number of pending connections as that is
+controlled by the kernel. Increasing this value will increase \fBslurmrestd\fR's
+memory footprint. Sites are advised to monitor memory consumption when
+increasing this value. Defaults to 124.
+
+\fBNOTE\fR: When set, this value takes precedence over the
+\fBSLURMRESTD_MAX_CONNECTIONS\fR environment variable and the
+\fB\-\-max\-connections\fR CLI flag.
+.IP
+
+.TP
+\fBconmgr_quiesce_timeout\fR=<\fIseconds\fR>
+Wait <\fIseconds\fR> before considering quiesce to be timed out. Upon timeout,
+all (non-listening) active connections will be closed to allow the quiesce to
+start. Defaults to two times the value of \fBMessageTimeout\fR.
+.IP
+
+.TP
+\fBconmgr_read_timeout\fR=<\fIseconds\fR>
+Wait <\fIseconds\fR> before considering a read from a file descriptor to be
+timed out. Defaults to the value of \fBMessageTimeout\fR.
+.IP
+
+.TP
+\fBconmgr_threads\fR=<\fIthread_count\fR>
+Alias for \fBworkerpool_threads\fR.
+.IP
+
+.TP
+\fBconmgr_use_poll\fR
+Use \fIpoll\fR(2) instead of \fIepoll\fR(7) for monitoring file descriptors.
+.IP
+
+.TP
+\fBconmgr_wait_write_delay\fR=<\fIseconds\fR>
+When waiting for the kernel to flush the outgoing buffer, poll the kernel for
+changes every <\fIseconds\fR>. Defaults to the value of \fBMessageTimeout\fR.
+.IP
+
+.TP
+\fBconmgr_write_timeout\fR=<\fIseconds\fR>
+Wait <\fIseconds\fR> before considering a write to a file descriptor to be
+timed out. Defaults to the value of \fBMessageTimeout\fR.
+.IP
+
+.TP
+\fBworkerpool_threads\fR=<\fIthread_count\fR>
+The number of process threads in the worker pool used for receiving and
+processing connections on the listening sockets. Defaults to twice the number of
+CPUs available to \fBslurmrestd\fR, with a minimum of 2 threads and up to a
+maximum default of 32 threads. In inetd mode, the default is always 2 threads.
+.RE
+.IP
+
+.TP
 \fBSlurmSchedLogFile\fR
 Fully qualified pathname of the scheduling event logging file.
 The syntax of this parameter is the same as for \fBSlurmctldLogFile\fR.
@@ -5953,6 +6366,74 @@ The scheduler logging level can be changed dynamically using \fBscontrol\fR.
 .IP
 
 .TP
+\fBSlurmstepdParameters\fR
+Parameters specific to \fBslurmstepd\fR.
+Multiple options may be comma separated.
+
+\fBNOTE\fR: \fBSlurmstepdParameters\fR is distinct from \fBSlurmdParameters\fR.
+Settings from \fBSlurmdParameters\fR are \fBnot\fR propagated to \fBslurmstepd\fR,
+so any conmgr tuning for \fBslurmstepd\fR must be configured here.
+.IP
+.RS
+.TP
+\fBconmgr_connect_timeout\fR=<\fIseconds\fR>
+Wait <\fIseconds\fR> before considering an outbound connection attempt to be
+timed out. Defaults to the value of \fBMessageTimeout\fR.
+.IP
+
+.TP
+\fBconmgr_max_connections\fR=<\fIconnection_count\fR>
+Specify the maximum number of connections to be processed at any given time.
+This does not influence the maximum number of pending connections as that is
+controlled by the kernel. Increasing this value will increase \fBslurmstepd\fR's
+memory footprint. Sites are advised to monitor memory consumption when
+increasing this value. Defaults to 150.
+.IP
+
+.TP
+\fBconmgr_quiesce_timeout\fR=<\fIseconds\fR>
+Wait <\fIseconds\fR> before considering quiesce to be timed out. Upon timeout,
+all (non-listening) active connections will be closed to allow the quiesce to
+start. Defaults to two times value of \fBMessageTimeout\fR.
+.IP
+
+.TP
+\fBconmgr_read_timeout\fR=<\fIseconds\fR>
+Wait <\fIseconds\fR> before considering a read from a file descriptor to be
+timed out. Defaults to the value of \fBMessageTimeout\fR.
+.IP
+
+.TP
+\fBconmgr_threads\fR=<\fIthread_count\fR>
+Alias for \fBworkerpool_threads\fR.
+.IP
+
+.TP
+\fBconmgr_use_poll\fR
+Use \fIpoll\fR(2) instead of \fIepoll\fR(7) for monitoring file descriptors.
+.IP
+
+.TP
+\fBconmgr_wait_write_delay\fR=<\fIseconds\fR>
+When waiting for kernel to flush outgoing buffer, poll kernel for changes every
+<\fIseconds\fR> for changes. Defaults to the value of \fBMessageTimeout\fR.
+.IP
+
+.TP
+\fBconmgr_write_timeout\fR=<\fIseconds\fR>
+Wait <\fIseconds\fR> before considering a write from a file descriptor to be
+timed out. Defaults to the value of \fBMessageTimeout\fR.
+.IP
+
+.TP
+\fBworkerpool_threads\fR=<\fIthread_count\fR>
+The number of process threads in the worker pool used for receiving and
+processing connections on the listening sockets.
+Defaults to 4 threads.
+.RE
+.IP
+
+.TP
 \fBSlurmUser\fR
 The name of the user that the \fBslurmctld\fR daemon executes as.
 For security purposes, a user other than "root" is recommended.
@@ -5963,7 +6444,7 @@ The default value is "root".
 
 .TP
 \fBSrunEpilog\fR
-Fully qualified pathname of an executable to be run by srun following
+Fully qualified pathname of a program for srun to execute following
 the completion of a job step. The command line arguments for the
 executable will be the command and arguments of the job step. This
 configuration parameter may be overridden by srun's \fB\-\-epilog\fR
@@ -6004,7 +6485,7 @@ srun \-N 200      will use 12 listening ports.
 
 .TP
 \fBSrunProlog\fR
-Fully qualified pathname of an executable to be run by srun prior to
+Fully qualified pathname of a program for srun to execute prior to
 the launch of a job step. The command line arguments for the
 executable will be the command and arguments of the job step. This
 configuration parameter may be overridden by srun's \fB\-\-prolog\fR
@@ -6040,6 +6521,9 @@ For example "nid[10\-20]:4" will prevent 4 powered up nodes in the set
 Multiple sets of nodes can be specified with or without counts in a comma
 separated list (e.g "nid[10\-20]:4,nid[80\-90]:2").
 By default no nodes are excluded.
+Nodes explicitly requested to power down, including nodes allocated from a
+partition configured with \fBPowerDownOnIdle=YES\fR, are not affected by this
+option.
 This value may be updated with scontrol.
 See \fBReconfigFlags=KeepPowerSaveSettings\fR for setting persistence.
 .IP
@@ -6050,6 +6534,9 @@ Specifies the partitions whose nodes are to not be placed in power save
 mode, even if the node remains idle for an extended period of time.
 Multiple partitions can be identified and separated by commas.
 By default no nodes are excluded.
+Nodes explicitly requested to power down, including nodes allocated from a
+partition configured with \fBPowerDownOnIdle=YES\fR, are not affected by this
+option.
 This value may be updated with scontrol.
 See \fBReconfigFlags=KeepPowerSaveSettings\fR for setting persistence.
 .IP
@@ -6058,9 +6545,12 @@ See \fBReconfigFlags=KeepPowerSaveSettings\fR for setting persistence.
 \fBSuspendExcStates\fR
 Specifies node states that are not to be powered down automatically.
 Valid states include CLOUD, DOWN, DRAIN, DYNAMIC_FUTURE, DYNAMIC_NORM, FAIL,
-INVALID_REG, MAINTENANCE, NOT_RESPONDING, PERFCTRS, PLANNED, and RESERVED.
+INVALID_REG, MAINTENANCE, NOT_RESPONDING, PLANNED, and RESERVED.
 By default, any of these states, if idle for \fBSuspendTime\fR, would be
 powered down.
+Nodes explicitly requested to power down, including nodes allocated from a
+partition configured with \fBPowerDownOnIdle=YES\fR, are not affected by this
+option.
 This value may be updated with scontrol.
 See \fBReconfigFlags=KeepPowerSaveSettings\fR for setting persistence.
 .IP
@@ -6068,11 +6558,11 @@ See \fBReconfigFlags=KeepPowerSaveSettings\fR for setting persistence.
 .TP
 \fBSuspendProgram\fR
 \fBSuspendProgram\fR is the program that will be executed when a node
-remains idle for an extended period of time.
+remains idle for an extended period of time. It can also be set to the name
+of a \fBPowerAction\fR.
 This program is expected to place the node into some power save mode.
 This can be used to reduce the frequency and voltage of a node or
 completely power the node off.
-The program executes as \fBSlurmUser\fR.
 The argument to the program will be the names of nodes to
 be placed into power savings mode (using Slurm's hostlist
 expression format).
@@ -6094,6 +6584,7 @@ The default value is 60 nodes per minute.
 \fBSuspendTime\fR
 Nodes which remain idle or down for this number of seconds will be placed into
 power save mode by \fBSuspendProgram\fR.
+This value can be overridden on a per\-partition or per\-node basis.
 Setting \fBSuspendTime\fR to anything but INFINITE (or \-1) will enable power
 save mode. INFINITE is the default.
 .IP
@@ -6212,6 +6703,12 @@ HPE fabric manager REST API authentication type
 \fBfm_authdir\fR
 Directory containing authentication info files (default /etc/fmsim
 for BASIC authentication, /etc/wlm-client-auth for OAUTH authentication).
+.IP
+
+.TP
+\fBfm_authdir_ctld\fR
+Directory containing authentication info files that slurmctld will use.
+Defaults to the value of \fBfm_authdir\fR.
 .IP
 
 .TP
@@ -6366,10 +6863,11 @@ For allocating unique channels within an NVIDIA IMEX domain.
 
 .TP
 \fBTaskEpilog\fR
-Fully qualified pathname of a program to be executed as the slurm job's user
-after termination of each task. Will run inside of the job's container if
-configured. Should not be used for policy enforcement.
-See \fBTaskProlog\fR for execution order details.
+Pathname of a program to be executed as the job's user after termination of each
+task. If it is not an absolute pathname (i.e. it does not start with a slash),
+it must be relative to the directory containing the slurm.conf file.
+Will run inside of the job's container if configured. Should not be used for
+policy enforcement. See \fBTaskProlog\fR for execution order details.
 .IP
 
 .TP
@@ -6482,11 +6980,12 @@ Set to Threads, Cores or Sockets (E.g. TaskPluginParam=autobind=threads).
 
 .TP
 \fBTaskProlog\fR
-Fully qualified pathname of a program to be executed as the slurm job's user
-prior to initiation of each task. Will run inside of the job's container if
-configured. Should not be used for policy enforcement.
-Besides the normal environment variables, this has SLURM_TASK_PID
-available to identify the process ID of the task being started.
+Pathname of a program to be executed as the job's user prior to initiation of
+each task. If it is not an absolute pathname (i.e. it does not start with a
+slash), it must be relative to the directory containing the slurm.conf file.
+Will run inside of the job's container if configured. Should not be used for
+policy enforcement. Besides the normal environment variables, this has
+SLURM_TASK_PID available to identify the process ID of the task being started.
 Standard output from this program can be used to control the environment
 variables and output for the user program.
 .IP
@@ -6673,15 +7172,24 @@ Default security policy is "20230317", which is FIPS compliant and includes TLS 
 
 .TP
 \fBTLSType\fR
-Specify the TLS implementation that will be used. Unset by default.
+Specify the TLS implementation that will be used.
+When set to a TLS plugin, RPC listening sockets reject connections that are not
+TLS wrapped. Refer to the TLS guide for more details:
+<https://slurm.schedmd.com/tls.html>
+Defaults to \fBtls/none\fR.
+.br
 Acceptable values at present:
 .IP
 .RS
 .TP
+\fBtls/none\fR
+No TLS. This is the default.
+.IP
+
+.TP
 \fBtls/s2n\fR
 Use the s2n TLS plugin. Requires additional configuration and causes significant
-processing overhead, but allows all Slurm communication to be encrypted. Refer
-to the TLS guide for more details: <https://slurm.schedmd.com/tls.html>
+processing overhead, but allows all Slurm communication to be encrypted.
 .RE
 .IP
 
@@ -6837,13 +7345,20 @@ MessageTimeout, otherwise it can lead to unexpected draining of nodes.
 .TP
 \fBUrlParserType\fR
 Specify the url_parser implementation that will be used. Default is
-\fIurl_parser/libhttp_parser\fR.
+\fIurl_parser/internal\fR if found, otherwise \fIurl_parser/libhttp_parser\fR.
 Acceptable values at present:
 .IP
 .RS
 .TP
 \fBurl_parser/libhttp_parser\fR
 Use the libhttp_parser based plugin.
+.IP
+
+.TP
+\fBurl_parser/internal\fR
+Use Slurm's internal url parser plugin.
+
+Note: required when \fBHttpParserType\fR=\fBhttp_parser/llhttp_parser\fR.
 .RE
 .IP
 
@@ -6887,9 +7402,9 @@ as resident set size). It is possible to enforce virtual memory limits for
 both jobs and job steps by limiting their virtual memory to some percentage
 of their real memory allocation. The \fBVSizeFactor\fR parameter specifies
 the job's or job step's virtual memory limit as a percentage of its real
-memory limit. For example, if a job's real memory limit is 500MB and
+memory limit. For example, if a job's real memory limit is 500MiB and
 VSizeFactor is set to 101 then the job will be killed if its real memory
-exceeds 500MB or its virtual memory exceeds 505MB (101 percent of the
+exceeds 500MiB or its virtual memory exceeds 505MiB (101 percent of the
 real memory limit).
 The default value is 0, which disables enforcement of virtual memory limits.
 The value may not exceed 65533 percent.
@@ -6976,17 +7491,12 @@ Multiple node names may be comma separated (e.g. "alpha,beta,gamma")
 and/or a simple node range expression may optionally be used to
 specify numeric ranges of nodes to avoid building a configuration
 file with large numbers of entries.
-The node range expression can contain one pair of square brackets
+The node range expression can contain one or more pairs of square brackets
 with a sequence of comma\-separated numbers and/or ranges of numbers
-separated by a "\-" (e.g. "linux[0\-64,128]", or "lx[15,18,32\-33]").
-Note that the numeric ranges can include one or more leading
-zeros to indicate the numeric portion has a fixed number of digits
+separated by a "\-" (e.g., "linux[0\-64,128]", "lx[15,18,32\-33]", or
+"rack[0\-63]_blade[0\-41]"). Note that the numeric ranges can include one or
+more leading zeros to indicate the numeric portion has a fixed number of digits
 (e.g. "linux[0000\-1023]").
-Multiple numeric ranges can be included in the expression
-(e.g. "rack[0\-63]_blade[0\-41]").
-If one or more numeric expressions are included, one of them
-must be at the end of the name (e.g. "unit[0\-31]rack" is invalid),
-but arbitrary names can always be used in a comma\-separated list.
 .LP
 The node configuration specified the following information:
 
@@ -7178,14 +7688,31 @@ The final field must specify a generic resources count.
 A suffix of "K", "M", "G", "T" or "P" may be used to multiply the number by
 1024, 1048576, 1073741824, etc. respectively.
 (e.g."Gres=gpu:tesla:1,gpu:kepler:1,bandwidth:lustre:no_consume:4G").
+If Gres is configured on a default node entry (\fBNodeName\fR=DEFAULT), you can
+set an empty string (Gres="") to configure no Gres on a subsequent entry.
 By default a node has no generic resources and its maximum count is
 that of an unsigned 64bit integer.
 Also see \fBFeatures\fR for Boolean flags to filter nodes using job constraints.
 .IP
 
 .TP
+\fBHRES\fR
+A JSON list of objects, each naming a hierarchical resource (\fIhres_name\fR)
+and one of its layers (\fIlayer_name\fR) that the node joins, as defined in
+\fBresources.yaml\fR(5). In mode 3 the layer must be a leaf layer and each
+resource may be listed only once.
+Only honored for dynamic nodes created with \fBscontrol create NodeName\fR or
+\fBslurmd \-Z \-\-conf\fR; it is ignored for nodes defined in slurm.conf.
+Malformed JSON makes the node creation fail. If a layer does not exist or
+cannot accept the node, an error is logged and the node is created without
+HRES membership. Deleting the node removes it from all layers.
+For example: HRES='[{"hres_name":"power","layer_name":"rack2"}]'.
+See <https://slurm.schedmd.com/hres.html> for more information.
+.IP
+
+.TP
 \fBMemSpecLimit\fR
-Amount of \fBRealMemory\fR, in megabytes, reserved for system use and not
+Amount of \fBRealMemory\fR, in mebibytes, reserved for system use and not
 available for user allocations. Must be less than the amount defined for
 \fBRealMemory\fR.
 If the task/cgroup plugin is configured and that plugin constrains memory
@@ -7230,7 +7757,7 @@ See \fBCPUs\fR.
 
 .TP
 \fBRealMemory\fR
-Size of real memory on the node in megabytes (e.g. "2048").
+Size of real memory on the node in mebibytes (e.g. "2048").
 The default value is 1. Lowering RealMemory with the goal of setting
 aside some amount for the OS and not available for job allocations
 will not work as intended if Memory is not set as a consumable
@@ -7265,12 +7792,18 @@ gres allocation.
 Number of physical processor sockets/chips on the node (e.g. "2").
 If Sockets is omitted, it will be inferred from
 \fBCPUs\fR, \fBCoresPerSocket\fR, and \fBThreadsPerCore\fR.
-\fBNOTE\fR: If you have multi\-core processors, you will likely
-need to specify these parameters.
-Sockets and SocketsPerBoard are mutually exclusive.
-If Sockets is specified when Boards is also used,
-Sockets is interpreted as SocketsPerBoard rather than total sockets.
+If you have multi\-core processors, you will likely need to specify these
+parameters. \fBSockets\fR and \fBSocketsPerBoard\fR are mutually exclusive.
+If \fBSockets\fR is specified when \fBBoards\fR is also used,
+\fBSockets\fR is interpreted as \fBSocketsPerBoard\fR rather than total sockets.
 The default value is 1.
+
+\fBNOTE\fR: If \fBSlurmdParameters=numa_node_as_socket\fR or
+\fBSlurmdParameters=l3cache_as_socket\fR is configured, the values for
+\fBSockets\fR, \fBCoresPerSocket\fR, and \fBThreadsPerCore\fR must match
+the virtual topology reported by \fBslurmd \-C\fR under that
+configuration, not the physical hardware layout. See the
+\fBSlurmdParameters\fR documentation for details.
 .IP
 
 .TP
@@ -7278,6 +7811,20 @@ The default value is 1.
 Number of physical processor sockets/chips on a baseboard.
 Sockets and SocketsPerBoard are mutually exclusive.
 The default value is 1.
+.IP
+
+.TP
+\fBSuspendTime\fR
+Nodes which remain idle or down for this number of seconds will be placed into
+power save mode by \fBSuspendProgram\fR.
+This value takes precedence over the partition\-level and global
+\fBSuspendTime\fR settings for the specified nodes.
+For nodes that are in multiple partitions with \fBSuspendTime\fR configured,
+the node\-level value takes precedence. If not set on the node, the partition
+and then global values are used.
+Setting \fBSuspendTime\fR to INFINITE will disable suspending of these nodes.
+Setting \fBSuspendTime\fR to anything but INFINITE (or \-1) will enable power
+save mode.
 .IP
 
 .TP
@@ -7377,7 +7924,7 @@ The default value is 1.
 
 .TP
 \fBTmpDisk\fR
-Total size of temporary disk storage in \fBTmpFS\fR in megabytes
+Total size of temporary disk storage in \fBTmpFS\fR in mebibytes
 (e.g. "16384"). \fBTmpFS\fR (for "Temporary File System")
 identifies the location which jobs should use for temporary storage.
 Note this does not indicate the amount of free
@@ -7600,8 +8147,10 @@ The default value is "NO".
 
 .TP
 \fBDefaultTime\fR
-Run time limit used for jobs that don't specify a value. If not set
-then MaxTime will be used.
+Run time limit used for jobs that don't specify a value. If not set, the
+default will be set to an applicable time limit, which may be from the
+partition (MaxTime) or from a QOS or association (MaxWall or GrpWall).
+Regardless, MaxTime will still be enforced.
 Format is the same as for MaxTime.
 .IP
 
@@ -7613,7 +8162,7 @@ the job didn't specify \-\-cpus\-per\-task and \-\-cpus\-per\-gpu.
 
 .TP
 \fBDefMemPerCPU\fR
-Default real memory size available per allocated CPU in megabytes.
+Default real memory size available per allocated CPU in mebibytes.
 Used to avoid over\-subscribing memory and causing paging.
 \fBDefMemPerCPU\fR would generally be used if individual processors
 are allocated to jobs (\fBSelectType=select/cons_tres\fR).
@@ -7625,7 +8174,7 @@ exclusive.
 
 .TP
 \fBDefMemPerGPU\fR
-Default real memory size available per allocated GPU in megabytes.
+Default real memory size available per allocated GPU in mebibytes.
 Please note a best effort attempt is made to predict which GPUs on the system
 will be used, but this could change between job submission and start time,
 causing \fBMaxMemPerNode\fR to potentially not work as expected for
@@ -7637,7 +8186,7 @@ exclusive.
 
 .TP
 \fBDefMemPerNode\fR
-Default real memory size available per allocated node in megabytes.
+Default real memory size available per allocated node in mebibytes.
 Used to avoid over\-subscribing memory and causing paging.
 \fBDefMemPerNode\fR would generally be used if whole nodes
 are allocated to jobs (\fBSelectType=select/linear\fR) and
@@ -7676,20 +8225,25 @@ root to execute jobs).
 .IP
 
 .TP
-\fBExclusiveTopo\fR
-If set to "YES," then only one job may be run on a single topology segment.
-This capability is also available on a per\-job basis by using the
-\fB\-\-exclusive=topo\fR option.
-.IP
+\fBExclusive\fR
+Controls partition\-level exclusivity together with \fBOverSubscribe\fR.
+Specify one of "NO", "NODE", "USER", or "TOPO".
+NODE allocates whole nodes and implies \fBOverSubscribe=NO\fR.
+USER allows only one user to have jobs on a node at a time (similar to
+\fB\-\-exclusive=user\fR).
+TOPO allows only one job per topology segment (similar to
+\fB\-\-exclusive=topo\fR) and implies \fBOverSubscribe=NO\fR.
+For node\-exclusive partitions, jobs receive all CPUs and generic resources on
+allocated nodes, but only as much memory as requested; use \fB\-\-mem=0\fR at
+submit time to request all memory on the node (notably when using gang
+scheduling and suspended jobs still occupy memory).
+If unset, no partition\-level exclusivity is added beyond \fBOverSubscribe\fR.
 
-.TP
-\fBExclusiveUser\fR
-If set to "YES" then nodes will be exclusively allocated to users.
-Multiple jobs may be run for the same user, but only one user can be active
-at a time.
-This capability is also available on a per\-job basis by using the
-\fB\-\-exclusive=user\fR option.
-.IP
+This replaces the deprecated options \fBOverSubscribe=EXCLUSIVE\fR,
+\fBExclusiveUser\fR, and \fBExclusiveTopo\fR.
+\fBExclusiveUser=YES\fR and \fBExclusiveTopo=YES\fR are mutually exclusive.
+If both deprecated options are set for the same partition, \fBExclusiveUser\fR
+will be ignored.
 
 .TP
 \fBGraceTime\fR
@@ -7705,10 +8259,16 @@ This is followed by the SIGCONT, SIGTERM and SIGKILL signal sequence upon
 reaching its new end time. This second set of signals is sent to both the
 tasks \fBand\fR the containing batch script, if applicable.
 See also the global \fBKillWait\fR configuration parameter.
-.br
+
 \fBNOTE\fR: This parameter does not apply to \fBPreemptMode=SUSPEND\fR.
 For setting the preemption grace time when using \fBPreemptMode=SUSPEND\fR,
 see \fBPreemptParameters=suspend_grace_time\fR.
+
+\fBNOTE\fR: A job selected for preemption that exits before \fBGraceTime\fR
+expires will be handled according to \fBPreemptMode\fR regardless of why
+it exited (most visible if \fBPreemptMode=REQUEUE\fR).  Slurm cannot
+distinguish between an exit caused by the preemption signal and an
+unrelated exit that occurs within \fBGraceTime\fR.
 .IP
 
 .TP
@@ -7753,7 +8313,7 @@ Also see \fBMaxCPUsPerNode\fR.
 
 .TP
 \fBMaxMemPerCPU\fR
-Maximum real memory size available per allocated CPU in megabytes.
+Maximum real memory size available per allocated CPU in mebibytes.
 Used to avoid over\-subscribing memory and causing paging.
 \fBMaxMemPerCPU\fR would generally be used if individual processors
 are allocated to jobs (\fBSelectType=select/cons_tres\fR).
@@ -7765,7 +8325,7 @@ Also see \fBDefMemPerCPU\fR and \fBMaxMemPerNode\fR.
 .TP
 \fBMaxMemPerNode\fR
 Maximum real memory size available per allocated node in a job allocation in
-megabytes. Used to avoid over\-subscribing memory and causing paging.
+mebibytes. Used to avoid over\-subscribing memory and causing paging.
 \fBMaxMemPerNode\fR would generally be used if whole nodes
 are allocated to jobs (\fBSelectType=select/linear\fR) and
 resources are over\-subscribed (\fBOverSubscribe=yes\fR or
@@ -7822,10 +8382,20 @@ memory as a consumable resource and the \fB\-\-mem\fR option
 should be used for job allocations.
 Sharing of resources is typically useful only when using gang scheduling
 (\fBPreemptMode=suspend,gang\fR).
-Possible values for \fBOverSubscribe\fR are "EXCLUSIVE", "FORCE", "YES", and "NO".
+Possible values for \fBOverSubscribe\fR are "FORCE", "YES", and "NO".
+Whole\-node exclusive partitions can be configured with \fBExclusive=node\fR
+(see above).
 Note that a value of "YES" or "FORCE" can negatively impact performance
 for systems with many thousands of running jobs.
 The default value is "NO".
+Enforcement of this parameter is more rudimentary if \fBselect/linear\fR is used.
+
+\fBNOTE\fR: A heterogeneous job is excluded from oversubscription in every
+partition while \fBGANG\fR is enabled, so it may remain pending where a
+non\-heterogeneous job would start.
+See the heterogeneous job \fBNOTE\fRs under the cluster\-wide
+\fBPreemptMode=GANG\fR description.
+
 For more information see the following web pages:
 .br
 .na
@@ -7840,18 +8410,6 @@ For more information see the following web pages:
 .IP
 .RS
 .TP 12
-\fBEXCLUSIVE\fR
-Allocates entire nodes to jobs even with \fBSelectType=select/cons_tres\fR
-configured.
-Jobs that run in partitions with \fBOverSubscribe=EXCLUSIVE\fR will have
-exclusive access to all allocated nodes.
-These jobs are allocated all CPUs and GRES on the nodes, but they are only
-allocated as much memory as they ask for. This is by design to support gang
-scheduling, because suspended jobs still reside in memory. To request all the
-memory on a node, use \fB\-\-mem=0\fR at submit time.
-.IP
-
-.TP
 \fBFORCE\fR
 Makes all resources (except GRES) in the partition available for
 oversubscription without any means for users to disable it.
@@ -7943,45 +8501,42 @@ allocated at least one job.
 These nodes will not power down until they transition from COMPLETING to IDLE.
 If set to "NO" then power saving will operate as configured for the partition.
 The default value is "NO".
-See <https://slurm.schedmd.com/power_save.html> and
-<https://slurm.schedmd.com/elastic_computing.html> for more details.
+See <https://slurm.schedmd.com/power_save.html> for more details.
 
 \fBNOTE\fR:
 The following will cause a transition from COMPLETING to IDLE:
 .br
 Completing all running jobs without additional jobs being allocated.
 .br
-ExclusiveUser=YES and after all running jobs complete but before another user's
-job is allocated.
+\fBExclusive=USER\fR and after all running jobs complete but before another
+user's job is allocated.
 .br
-OverSubscribe=EXCLUSIVE and after the running job completes but before another
+\fBExclusive=NODE\fR and after the running job completes but before another
 job is allocated.
 
 \fBNOTE\fR:
+Nodes allocated from this partition will still be sent a power down request even
+if they are excluded from automatic power save mode by \fBSuspendExcNodes\fR,
+\fBSuspendExcParts\fR, or \fBSuspendExcStates\fR.
+
+\fBNOTE\fR:
 Nodes are still subject to powering down when being IDLE for \fBSuspendTime\fR
-when PowerDownOnIdle is set to NO.</p>
+when \fBPowerDownOnIdle\fR is set to "NO".
 
 Also see \fBSuspendTime\fR.
 .IP
 
 .TP
 \fBPreemptMode\fR
-Mechanism used to preempt jobs or enable gang scheduling for this
-partition when \fBPreemptType=preempt/partition_prio\fR is configured.
+Mechanism used to preempt jobs running in this partition when
+\fBPreemptType=preempt/partition_prio\fR is configured.
 This partition\-specific \fBPreemptMode\fR configuration parameter will
-override the cluster\-wide \fBPreemptMode\fR for this partition.
-It can be set to OFF to disable preemption and gang scheduling for this
-partition.
+override the cluster\-wide \fBPreemptMode\fR for jobs in this partition.
+It can be set to OFF to prevent jobs in this partition from being preempted.
 See also \fBPriorityTier\fR and the above description of the cluster\-wide
 \fBPreemptMode\fR parameter for further details.
 .br
-The \fBGANG\fR option is used to enable gang scheduling independent of
-whether preemption is enabled (i.e. independent of the \fBPreemptType\fR
-setting). It can be specified in addition to a \fBPreemptMode\fR setting with
-the two options comma separated (e.g. \fBPreemptMode=SUSPEND,GANG\fR).
-.br
-See <https://slurm.schedmd.com/preempt.html> and
-<https://slurm.schedmd.com/gang_scheduling.html> for more details.
+See <https://slurm.schedmd.com/preempt.html> for more details.
 
 \fBNOTE\fR:
 For performance reasons, the backfill scheduler reserves whole nodes for jobs,
@@ -7991,45 +8546,24 @@ preemptor job, even if the preemptor job requested fewer resources than that.
 These reserved nodes aren't available to other jobs during that backfill
 cycle, even if the other jobs could fit on the nodes. Therefore, jobs may
 preempt more resources during a single backfill iteration than they requested.
-.br
+
 \fBNOTE\fR:
-For heterogeneous job to be considered for preemption all components
-must be eligible for preemption. When a heterogeneous job is to be preempted
-the first identified component of the job with the highest order PreemptMode
-(\fBSUSPEND\fR (highest), \fBREQUEUE\fR, \fBCANCEL\fR (lowest)) will be
-used to set the PreemptMode for all components. The \fBGraceTime\fR and user
-warning signal for each component of the heterogeneous job remain unique.
-Heterogeneous jobs are excluded from GANG scheduling operations.
+For a heterogeneous job to be considered for preemption, all components must be
+eligible for preemption, and a component whose \fBPreemptMode\fR resolves to
+\fBSUSPEND\fR is treated as \fBPreemptMode=OFF\fR.
+See the heterogeneous job \fBNOTE\fR under the cluster\-wide \fBPreemptMode\fR
+description above, and
+<https://slurm.schedmd.com/preempt.html#hetjob>.
 .IP
 .RS
 .TP 12
 \fBOFF\fR
-Disables job preemption and gang scheduling.
+Disables job preemption.
 .IP
 
 .TP
 \fBCANCEL\fR
 The preempted job will be cancelled.
-.IP
-
-.TP
-\fBGANG\fR
-Enables gang scheduling (time slicing) of jobs in the same partition, and
-allows the resuming of suspended jobs.
-
-\fBNOTE\fR:
-Gang scheduling is performed independently for each partition, so
-if you only want time\-slicing by \fBOverSubscribe\fR, without any preemption,
-then configuring partitions with overlapping nodes is not recommended.
-On the other hand, if you want to use \fBPreemptType=preempt/partition_prio\fR
-to allow jobs from higher PriorityTier partitions to Suspend jobs from lower
-PriorityTier partitions you will need overlapping partitions, and
-\fBPreemptMode=SUSPEND,GANG\fR to use the Gang scheduler to resume the suspended
-jobs(s).
-In any case, time\-slicing won't happen between jobs on different partitions.
-.br
-\fBNOTE\fR:
-Heterogeneous jobs are excluded from GANG scheduling operations.
 .IP
 
 .TP
@@ -8047,6 +8581,11 @@ option to be specified at the cluster level. Also, because the suspended jobs
 will still use memory on the allocated nodes, Slurm needs to be able to track
 memory resources to be able to suspend jobs.
 
+\fBNOTE\fR: A heterogeneous job is excluded from GANG scheduling operations, so
+it is never suspended as a preemptee, and it never preempts a job whose
+resolved \fBPreemptMode\fR is \fBSUSPEND\fR. See the heterogeneous job
+\fBNOTE\fRs under the cluster\-wide \fBPreemptMode=GANG\fR description.
+
 If the preemptees and preemptor are on different partitions then the preempted
 jobs will remain suspended until the preemptor ends.
 .br
@@ -8058,6 +8597,12 @@ will the suspended jobs will be resumed by the Gang scheduler.
 .br
 \fBNOTE\fR: Suspended jobs will not release GRES. Higher priority jobs will not
 be able to preempt to gain access to GRES.
+.IP
+
+.TP
+\fBPRIORITY\fR
+Allow preemption only if the preemptor's job priority is higher than the
+preemptee's job priority.
 .RE
 .IP
 
@@ -8121,12 +8666,8 @@ is either 65533 or INFINITE.
 
 .TP
 \fBRootOnly\fR
-Specifies if only user ID zero (i.e. user \fIroot\fR) may allocate resources
-in this partition. User root may allocate resources for any other user,
-but the request must be initiated by user root.
-This option can be useful for a partition to be managed by some
-external entity (e.g. a higher\-level job manager) and prevents
-users from directly using those resources.
+Specifies if only user ID zero (i.e. user \fIroot\fR) or SlurmUser may allocate
+resources in this partition.
 Possible values are "YES" and "NO".
 The default value is "NO".
 .IP
@@ -8140,12 +8681,6 @@ Supported values are \fBCR_Core\fR, \fBCR_Core_Memory\fR, \fBCR_Socket\fR and
 Use requires the system\-wide \fBSelectTypeParameters\fR value be set to
 any of the four supported values previously listed; otherwise, the
 partition\-specific value will be ignored.
-.IP
-
-.TP
-\fBShared\fR
-The \fBShared\fR configuration parameter has been replaced by the
-\fBOverSubscribe\fR parameter described above.
 .IP
 
 .TP
@@ -8192,6 +8727,8 @@ power save mode by \fBSuspendProgram\fR.
 For nodes that are in multiple partitions with this option set,
 the highest time will take effect. If not set on any partition, the node will
 use the \fBSuspendTime\fR value set for the entire cluster.
+A \fBSuspendTime\fR value set on a \fBNodeName\fR line takes precedence over
+this partition\-level value.
 Setting \fBSuspendTime\fR to INFINITE will disable suspending of nodes in this
 partition.
 Setting \fBSuspendTime\fR to anything but INFINITE (or \-1) will enable power
@@ -8228,7 +8765,47 @@ By default, jobs are billed against the total number of allocated CPUs
 (TRESBillingWeights="CPU=1").
 
 Refer to the TRES page for more details: <https://slurm.schedmd.com/tres.html>
-.RE
+.IP
+
+.SH "POWERACTION CONFIGURATION"
+The PowerAction configuration creates a named program to execute a node
+reboot, power up (Resume), or power down (Suspend). A \fBPowerAction\fR name
+may be used in place of a program path for \fBResumeProgram\fR,
+\fBResumeFailProgram\fR, \fBSuspendProgram\fR, or \fBRebootProgram\fR, and can
+be selected for individual requests with the "action" option to "scontrol
+power" and "scontrol reboot".
+.LP
+.nf
+PowerAction=<name> Location=<slurmctld|slurmd> Program="<path> [arguments...]"
+.fi
+.LP
+It includes the following parameters:
+
+.TP
+\fBPowerAction\fR
+Unique name for the action. This is the name referenced by \fBResumeProgram\fR,
+\fBResumeFailProgram\fR, \fBSuspendProgram\fR, \fBRebootProgram\fR, or the
+"action" option to scontrol.
+.IP
+
+.TP
+\fBLocation\fR
+Specifies where to run the program, supporting values "slurmd" and
+"slurmctld". A value of "slurmctld" runs the program on the controller as
+\fBSlurmUser\fR. A value of "slurmd" runs the program on each affected compute
+node as \fBSlurmdUser\fR.
+
+\fBNOTE\fR: Power up actions must use "slurmctld", since powered down nodes
+cannot run a "slurmd" action.
+.IP
+
+.TP
+\fBProgram\fR
+Program to perform the task of power up, power down, or reboot.
+Arguments to be passed to the program can be included in this field.
+Slurm passes the affected node name(s) as an argument after any user-specified
+arguments. With \fBLocation=slurmd\fR, \fBSLURM_NODE_NAME\fR is also set in the
+environment.
 .IP
 
 .SH "PROLOG AND EPILOG SCRIPTS"
@@ -8284,6 +8861,11 @@ environment variables.
 .TP
 \fBSLURM_JOB_ID\fR
 Job ID.
+.IP
+
+.TP
+\fBSLURM_JOB_SLUID\fR
+Job SLUID.
 .IP
 
 .TP
@@ -8397,8 +8979,8 @@ PartitionName=long Nodes=dev[9\-17] MaxTime=120 AllowGroups=admin
 The "include" key word can be used with modifiers within the specified
 pathname. These modifiers would be replaced with cluster name or other
 information depending on which modifier is specified. If the included file
-is not an absolute path name (i.e. it does not start with a slash), it will
-searched for in the same directory as the slurm.conf file.
+is not an absolute pathname (i.e. it does not start with a slash), it must be
+relative to the directory containing the slurm.conf file.
 
 .TP
 \fB%c\fR
@@ -8457,6 +9039,15 @@ The file must be accessible by the primary and backup control machines.
 Must be executable by user \fBSlurmUser\fR.
 Must not be writable by regular users.
 The file must be accessible by the primary and backup control machines.
+.IP
+
+.TP
+\fBPowerAction\fR
+If \fBLocation=slurmd\fR, then the \fBProgram\fR must be executable by user
+\fBSlurmdUser\fR and be accessible on all compute nodes.
+
+If \fBLocation=slurmctld\fR, then the \fBProgram\fR must be executable by user
+\fBSlurmUser\fR and be accessible by the primary and backup control machines.
 .IP
 
 .TP

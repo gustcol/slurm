@@ -77,6 +77,7 @@ typedef struct {
 					 stepd_step_rec_t *step, pid_t pid,
 					 uint32_t task_id);
 	cgroup_acct_t *(*task_get_acct_data) (uint32_t taskid);
+	cgroup_acct_t *(*job_get_acct_data)(void);
 	long int (*get_acct_units)	(void);
 	bool (*has_feature) (cgroup_ctl_feature_t f);
 	char *(*get_scope_path)(void);
@@ -109,11 +110,12 @@ static const char *syms[] = {
 	"cgroup_p_has_pid",
 	"cgroup_p_constrain_get",
 	"cgroup_p_constrain_set",
-        "cgroup_p_constrain_apply",
+	"cgroup_p_constrain_apply",
 	"cgroup_p_step_start_oom_mgr",
 	"cgroup_p_step_stop_oom_mgr",
 	"cgroup_p_task_addto",
 	"cgroup_p_task_get_acct_data",
+	"cgroup_p_job_get_acct_data",
 	"cgroup_p_get_acct_units",
 	"cgroup_p_has_feature",
 	"cgroup_p_get_scope_path",
@@ -144,8 +146,8 @@ static bool cg_conf_exist = true;
 static char scope_path[PATH_MAX] = "";
 
 /* local functions */
-static void _cgroup_conf_fini();
-static void _clear_slurm_cgroup_conf();
+static void _cgroup_conf_fini(void);
+static void _clear_slurm_cgroup_conf(void);
 static void _pack_cgroup_conf(buf_t *buffer);
 static int _unpack_cgroup_conf(buf_t *buffer);
 static void _read_slurm_cgroup_conf(void);
@@ -160,7 +162,7 @@ static int _defunct_option(void **dest, slurm_parser_enum_t type,
 	return 0;
 }
 
-static void _cgroup_conf_fini()
+static void _cgroup_conf_fini(void)
 {
 	slurm_rwlock_wrlock(&cg_conf_lock);
 
@@ -200,6 +202,7 @@ static void _init_slurm_cgroup_conf(void)
 	slurm_cgroup_conf.constrain_devices = false;
 	slurm_cgroup_conf.constrain_ram_space = false;
 	slurm_cgroup_conf.constrain_swap_space = false;
+	slurm_cgroup_conf.cgroup_job_id_paths = false;
 	slurm_cgroup_conf.enable_controllers = false;
 	slurm_cgroup_conf.enable_extra_controllers = NULL;
 	slurm_cgroup_conf.ignore_systemd = false;
@@ -252,6 +255,7 @@ static void _pack_cgroup_conf(buf_t *buffer)
 	packstr(slurm_cgroup_conf.enable_extra_controllers, buffer);
 	packbool(slurm_cgroup_conf.signal_children_processes, buffer);
 	pack64(slurm_cgroup_conf.systemd_timeout, buffer);
+	packbool(slurm_cgroup_conf.cgroup_job_id_paths, buffer);
 }
 
 static int _unpack_cgroup_conf(buf_t *buffer)
@@ -297,6 +301,7 @@ static int _unpack_cgroup_conf(buf_t *buffer)
 	safe_unpackstr(&slurm_cgroup_conf.enable_extra_controllers, buffer);
 	safe_unpackbool(&slurm_cgroup_conf.signal_children_processes, buffer);
 	safe_unpack64(&slurm_cgroup_conf.systemd_timeout, buffer);
+	safe_unpackbool(&slurm_cgroup_conf.cgroup_job_id_paths, buffer);
 
 	return SLURM_SUCCESS;
 
@@ -314,6 +319,7 @@ static void _read_slurm_cgroup_conf(void)
 {
 	s_p_options_t options[] = {
 		{"CgroupAutomount", S_P_BOOLEAN, _defunct_option},
+		{"CgroupJobIdPaths", S_P_BOOLEAN},
 		{"CgroupMountpoint", S_P_STRING},
 		{"CgroupSlice", S_P_STRING},
 		{"ConstrainCores", S_P_BOOLEAN},
@@ -374,6 +380,9 @@ static void _read_slurm_cgroup_conf(void)
 			slurm_cgroup_conf.cgroup_slice = tmp_str;
 			tmp_str = NULL;
 		}
+
+		(void) s_p_get_boolean(&slurm_cgroup_conf.cgroup_job_id_paths,
+				       "CgroupJobIdPaths", tbl);
 
 		/* Cores constraints related conf items */
 		(void) s_p_get_boolean(&slurm_cgroup_conf.constrain_cores,
@@ -603,6 +612,8 @@ extern list_t *cgroup_get_conf_list(void)
 	add_key_pair(cgroup_conf_l, "CgroupMountpoint", "%s",
 		     cg_conf->cgroup_mountpoint);
 	add_key_pair(cgroup_conf_l, "CgroupSlice", "%s", cg_conf->cgroup_slice);
+	add_key_pair_bool(cgroup_conf_l, "CgroupJobIdPaths",
+			  cg_conf->cgroup_job_id_paths);
 	add_key_pair_bool(cgroup_conf_l, "ConstrainCores",
 			  cg_conf->constrain_cores);
 	add_key_pair_bool(cgroup_conf_l, "ConstrainRAMSpace",
@@ -1070,6 +1081,17 @@ extern cgroup_acct_t *cgroup_g_task_get_acct_data(uint32_t taskid)
 	return (*(ops.task_get_acct_data))(taskid);
 }
 
+extern cgroup_acct_t *cgroup_g_job_get_acct_data(void)
+{
+	xassert(plugin_inited != PLUGIN_NOT_INITED);
+
+	if (plugin_inited == PLUGIN_NOOP) {
+		return NULL;
+	}
+
+	return (*(ops.job_get_acct_data))();
+}
+
 extern long int cgroup_g_get_acct_units(void)
 {
 	xassert(plugin_inited != PLUGIN_NOT_INITED);
@@ -1121,7 +1143,7 @@ extern int cgroup_g_is_task_empty(uint32_t taskid)
 	return (*(ops.is_task_empty))(taskid);
 }
 
-extern int cgroup_g_bpf_fsopen()
+extern int cgroup_g_bpf_fsopen(void)
 {
 	xassert(plugin_inited != PLUGIN_NOT_INITED);
 
@@ -1151,7 +1173,7 @@ extern int cgroup_g_bpf_create_token(int fd)
 	return (*(ops.bpf_create_token))(fd);
 }
 
-extern int cgroup_g_bpf_get_token()
+extern int cgroup_g_bpf_get_token(void)
 {
 	xassert(plugin_inited != PLUGIN_NOT_INITED);
 	if (plugin_inited == PLUGIN_NOOP)

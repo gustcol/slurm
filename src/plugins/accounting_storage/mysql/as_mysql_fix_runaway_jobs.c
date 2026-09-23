@@ -138,6 +138,12 @@ extern int as_mysql_fix_runaway_jobs(mysql_conn_t *mysql_conn, uint32_t uid,
 		goto bail;
 	}
 
+	if (as_mysql_validate_cluster_name(first_job->cluster) !=
+	    SLURM_SUCCESS) {
+		rc = ESLURM_INVALID_CLUSTER_NAME;
+		goto bail;
+	}
+
 	/*
 	 * Temporarily use mysql_conn->cluster_name for potentially non local
 	 * cluster name, change back before return
@@ -189,7 +195,7 @@ extern int as_mysql_fix_runaway_jobs(mysql_conn_t *mysql_conn, uint32_t uid,
 
 	query = xstrdup_printf("UPDATE \"%s_%s\" SET time_end="
 			       "GREATEST(time_start, time_eligible, time_submit), "
-			       "state=%d WHERE time_end=0 && id_job IN (%s);",
+			       "state=%d WHERE time_end=0 and id_job IN (%s);",
 			       mysql_conn->cluster_name, job_table,
 			       end_state, job_ids);
 
@@ -202,11 +208,15 @@ extern int as_mysql_fix_runaway_jobs(mysql_conn_t *mysql_conn, uint32_t uid,
 		goto bail;
 	}
 
-	/* Set rollup to the last day of the previous month of the first
-	 * runaway job */
-	rc = _first_job_roll_up(mysql_conn, first_job->submit);
-	if (rc != SLURM_SUCCESS)
-		error("Failed to fix runaway jobs");
+	if (!(slurmdbd_conf->flags & DBD_CONF_FLAG_DISABLE_ROLLUPS)) {
+		/*
+		 * Set rollup to the last day of the previous month of the first
+		 * runaway job.
+		 */
+		rc = _first_job_roll_up(mysql_conn, first_job->submit);
+		if (rc != SLURM_SUCCESS)
+			error("Failed to fix runaway jobs");
+	}
 
 bail:
 	xfree(job_ids);

@@ -46,7 +46,10 @@ extern uint32_t slurm_daemon;
 #define IS_SLURMSTEPD SLURM_BIT(5)
 #define IS_SACKD SLURM_BIT(6)
 #define IS_SLURMRESTD SLURM_BIT(7)
-#define IS_ANY_DAEMON 0xFFFFFFFF
+#define IS_ANY_DAEMON 0x0000FFFF
+
+#define WITH_STEPMGR SLURM_BIT(16)
+#define WITH_ANY_DAEMON_FLAG 0xFFFF0000
 
 /*
  * Determine if calling process is in bitmask of daemons
@@ -61,6 +64,7 @@ extern bool run_in_daemon(uint32_t daemons);
 #define running_in_slurmd_stepd() run_in_daemon(IS_SLURMD | IS_SLURMSTEPD)
 #define running_in_slurmrestd() run_in_daemon(IS_SLURMRESTD)
 #define running_in_slurmstepd() run_in_daemon(IS_SLURMSTEPD)
+#define running_with_stepmgr() run_in_daemon(WITH_STEPMGR)
 
 #define error_in_daemon(fmt, ...)		\
 do {						\
@@ -69,5 +73,18 @@ do {						\
 	else					\
 		verbose(fmt, ##__VA_ARGS__);	\
 } while (false)
+
+/*
+ * Log a condition an administrator needs to act on but a client can not.
+ * Daemons warn() as the condition persists for the life of the daemon while
+ * clients only debug2() to avoid repeating it on every invocation.
+ */
+#define warning_in_daemon(fmt, ...) \
+	do { \
+		if (running_in_daemon()) \
+			warning(fmt, ##__VA_ARGS__); \
+		else \
+			debug2(fmt, ##__VA_ARGS__); \
+	} while (false)
 
 #endif

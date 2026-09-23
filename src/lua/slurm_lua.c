@@ -36,7 +36,6 @@
 #include <dlfcn.h>
 #include <limits.h>
 #include <stdio.h>
-#include "config.h"
 
 #include "slurm/slurm.h"
 #include "slurm/slurm_errno.h"
@@ -49,6 +48,7 @@
 #include "src/common/data.h"
 #include "src/common/log.h"
 #include "src/common/parse_time.h"
+#include "src/common/sluid.h"
 #include "src/common/slurm_protocol_defs.h"
 #include "src/common/xstring.h"
 #include "src/lua/slurm_lua.h"
@@ -68,8 +68,6 @@ typedef struct {
 } dump_data_foreach_args_t;
 
 static void *lua_handle = NULL;
-
-#ifdef HAVE_LUA
 
 #if LUA_VERSION_NUM >= 502
 #define LUA_ERROR_BACKTRACE
@@ -779,6 +777,7 @@ extern int slurm_lua_job_record_field(lua_State *L, const job_record_t *job_ptr,
 				      const char *name)
 {
 	int i;
+	char sluid_str[SLUID_STR_BYTES];
 
 	if (!job_ptr) {
 		error("_job_rec_field: job_ptr is NULL");
@@ -816,6 +815,13 @@ extern int slurm_lua_job_record_field(lua_State *L, const job_record_t *job_ptr,
 		lua_pushstring(L, job_ptr->comment);
 	} else if (!xstrcmp(name, "container")) {
 		lua_pushstring(L, job_ptr->container);
+	} else if (!xstrcmp(name, "core_spec")) {
+		if (job_ptr->details &&
+		    (job_ptr->details->core_spec != NO_VAL16) &&
+		    !(job_ptr->details->core_spec & CORE_SPEC_THREAD))
+			lua_pushnumber(L, job_ptr->details->core_spec);
+		else
+			lua_pushnil(L);
 	} else if (!xstrcmp(name, "cpus_per_tres")) {
 		lua_pushstring(L, job_ptr->cpus_per_tres);
 	} else if (!xstrcmp(name, "delay_boot")) {
@@ -862,6 +868,17 @@ extern int slurm_lua_job_record_field(lua_State *L, const job_record_t *job_ptr,
 		lua_pushnumber(L, job_ptr->group_id);
 	} else if (!xstrcmp(name, "job_id")) {
 		lua_pushnumber(L, job_ptr->job_id);
+	} else if (!xstrcmp(name, "sluid")) {
+		print_sluid(job_ptr->db_index, sluid_str, sizeof(sluid_str));
+		lua_pushstring(L, sluid_str);
+	} else if (!xstrcmp(name, "original_sluid")) {
+		if (job_ptr->step_id.sluid) {
+			print_sluid(job_ptr->step_id.sluid, sluid_str,
+				    sizeof(sluid_str));
+			lua_pushstring(L, sluid_str);
+		} else {
+			lua_pushnil(L);
+		}
 	} else if (!xstrcmp(name, "job_state")) {
 		lua_pushnumber(L, job_ptr->job_state);
 	} else if (!xstrcmp(name, "licenses")) {
@@ -1023,6 +1040,14 @@ extern int slurm_lua_job_record_field(lua_State *L, const job_record_t *job_ptr,
 	} else if (!xstrcmp(name, "submit_time")) {
 		if (job_ptr->details)
 			lua_pushnumber(L, job_ptr->details->submit_time);
+		else
+			lua_pushnil(L);
+	} else if (!xstrcmp(name, "thread_spec")) {
+		if (job_ptr->details &&
+		    (job_ptr->details->core_spec != NO_VAL16) &&
+		    (job_ptr->details->core_spec & CORE_SPEC_THREAD))
+			lua_pushnumber(L, job_ptr->details->core_spec &
+						  ~CORE_SPEC_THREAD);
 		else
 			lua_pushnil(L);
 	} else if (!xstrcmp(name, "time_limit")) {
@@ -1212,7 +1237,6 @@ fini_error:
 	}
 	return rc;
 }
-#endif
 
 /*
  *  Init function to dlopen() the appropriate Lua libraries, and
@@ -1223,9 +1247,14 @@ extern int slurm_lua_init(void)
 {
 	slurm_lua_fini();
 
+	char *tried_libs = NULL, *pos = NULL;
 	char *const lua_libs[] = {
-		"liblua.so",
-#if LUA_VERSION_NUM == 504
+#if LUA_VERSION_NUM == 505
+		"liblua-5.5.so",
+		"liblua5.5.so",
+		"liblua5.5.so.0",
+		"liblua.so.5.5",
+#elif LUA_VERSION_NUM == 504
 		"liblua-5.4.so",
 		"liblua5.4.so",
 		"liblua5.4.so.0",
@@ -1240,12 +1269,13 @@ extern int slurm_lua_init(void)
 		"liblua5.2.so",
 		"liblua5.2.so.0",
 		"liblua.so.5.2",
-#else
+#elif LUA_VERSION_NUM == 501
 		"liblua-5.1.so",
 		"liblua5.1.so",
 		"liblua5.1.so.0",
 		"liblua.so.5.1",
 #endif
+		"liblua.so",
 		NULL
 	};
 	int i = 0;
@@ -1255,18 +1285,20 @@ extern int slurm_lua_init(void)
 	 *   ensure symbols from liblua are available to libs opened
 	 *   by any lua scripts.
 	 */
-	if (!LUA_VERSION_NUM) {
-		fatal("Slurm wasn't configured against any LUA lib but you are trying to use it like it was.  Please check config.log and reconfigure against liblua.  Make sure you have lua devel installed.");
-	}
-
 	while (lua_libs[i] &&
-	       !(lua_handle = dlopen(lua_libs[i], RTLD_NOW | RTLD_GLOBAL)))
+	       !(lua_handle = dlopen(lua_libs[i], RTLD_NOW | RTLD_GLOBAL))) {
+		xstrfmtcatat(tried_libs, &pos, "%s%s (%s)", (pos ? ", " : ""),
+			     lua_libs[i], dlerror());
 		i++;
+	}
 
 	if (!lua_handle) {
-		error("Failed to open liblua.so: %s", dlerror());
+		error("Failed to open liblua (compiled against " LUA_VERSION
+		      "), tried: %s", tried_libs);
+		xfree(tried_libs);
 		return SLURM_ERROR;
 	}
+	xfree(tried_libs);
 
 	/* Load any serializer plugins for JSON/YAML conversions */
 	serializer_g_init();
@@ -1426,8 +1458,11 @@ static int _dump_string(lua_State *L, char **ptr, const int index,
 	    luaL_callmeta(L, index, "__tostring"))
 		str = lua_tolstring(L, index, &len);
 
-	/* Only log string if it was set and was a sane length */
-	if (!str || (len <= 0) || (len >= MAX_VAL)) {
+	/*
+	 * Only log string if it was set and was a sane length.
+	 * Allow empty string (len == 0).
+	 */
+	if (!str || (len >= MAX_VAL)) {
 		log_flag(SCRIPT, "%s: invalid string", label);
 		return ESLURM_LUA_INVALID_CONVERSION_TYPE;
 	}

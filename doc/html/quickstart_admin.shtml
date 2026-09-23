@@ -28,14 +28,14 @@
 </ul>
 
 <h2 id="overview">Overview<a class="slurm_link" href="#overview"></a></h2>
-<p>Please see the <a href="quickstart.html">Quick Start User Guide</a> for a
-general overview.</p>
 
-<p>Also see <a href="platforms.html">Platforms</a> for a list of supported
-computer platforms.</p>
+<p>See also:</p>
 
-<p>For information on performing an upgrade, please see the
-<a href="upgrades.html">Upgrade Guide</a>.</p>
+<ul>
+<li><a href="quickstart.html">Quick Start User Guide</a></li>
+<li><a href="platforms.html">Platforms</a></li>
+<li><a href="upgrades.html">Upgrade Guide</a></li>
+</ul>
 
 <h2 id="quick_start">Super Quick Start
 <a class="slurm_link" href="#quick_start"></a>
@@ -192,7 +192,8 @@ package of the same name.</td>
 </tr>
 <tr>
 <td><code>slurmrestd</code>(<a href="#restd">restd node</a>)</td>
-<td><i><a href="related_software.html#httpparser">http_parser</a></i>
+<td><i><a href="related_software.html#httpparser">http_parser</a></i> or
+	<i><a href="related_software.html#llhttp">llhttp</a></i>
 <br><i><a href="related_software.html#json">json-c</a></i>
 <br><i><a href="related_software.html#yaml">yaml</a></i> (optional)
 <br><i><a href="related_software.html#jwt">jwt</a></i> (optional)
@@ -707,7 +708,7 @@ Partition and node specifications use node range expressions to identify
 nodes in a concise fashion. This configuration file defines a 1154-node cluster
 for Slurm, but it might be used for a much larger cluster by just changing a few
 node range expressions. Specify the minimum processor count (CPUs), real memory
-space (RealMemory, megabytes), and temporary disk space (TmpDisk, megabytes) that
+space (RealMemory, mebibytes), and temporary disk space (TmpDisk, mebibytes) that
 a node should have to be considered available for use. Any node lacking these
 minimum configuration values will be considered DOWN and not scheduled.
 Note that a more extensive sample configuration file is provided in

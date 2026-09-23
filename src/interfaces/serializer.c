@@ -37,12 +37,15 @@
 
 #include "src/common/list.h"
 #include "src/common/log.h"
+#include "src/common/pack.h"
 #include "src/common/read_config.h"
+#include "src/common/run_in_daemon.h"
 #include "src/common/timers.h"
 #include "src/common/xassert.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
 
+#include "src/interfaces/data_parser.h"
 #include "src/interfaces/serializer.h"
 
 /* Define slurm-specific aliases for use by plugins, see slurm_xlator.h. */
@@ -51,6 +54,8 @@ strong_alias(serialize_g_data_to_string, slurm_serialize_g_data_to_string);
 strong_alias(serialize_g_string_to_data, slurm_serialize_g_string_to_data);
 strong_alias(serializer_g_fini, slurm_serializer_g_fini);
 strong_alias(serializer_required, slurm_serializer_required);
+strong_alias(serialize_g_parse, slurm_serialize_g_parse);
+strong_alias(serialize_g_dump, slurm_serialize_g_dump);
 
 #define SERIALIZER_MAJOR_TYPE "serializer"
 #define SERIALIZER_MIME_TYPES_SYM "mime_types"
@@ -60,9 +65,15 @@ strong_alias(serializer_required, slurm_serializer_required);
 typedef struct {
 	int (*init)(serializer_flags_t flags);
 	void (*fini)(void);
-	int (*data_to_string)(char **dest, size_t *length, const data_t *src,
+	int (*data_to_string)(char **dest, size_t *length, data_t *src,
 			      serializer_flags_t flags);
 	int (*string_to_data)(data_t **dest, const char *src, size_t length);
+	int (*dump)(serialize_dump_state_t **state_ptr, data_parser_t *parser,
+		    data_parser_type_t type, void *src, ssize_t src_bytes,
+		    buf_t *dst, serializer_flags_t flags);
+	int (*parse)(serialize_parse_state_t **state_ptr, data_parser_t *parser,
+		     data_parser_type_t type, void *dst, ssize_t dst_bytes,
+		     buf_t *src);
 } funcs_t;
 
 typedef struct {
@@ -76,6 +87,8 @@ static const char *syms[] = {
 	"serialize_p_fini",
 	"serialize_p_data_to_string",
 	"serialize_p_string_to_data",
+	"serialize_p_dump",
+	"serialize_p_parse",
 };
 
 /* serializer plugin state */
@@ -116,32 +129,62 @@ static serializer_flags_t _parse_flag(const char *flag)
 	return SER_FLAGS_NONE;
 }
 
-static int _parse_config(const char *config, serializer_flags_t *flags)
+/*
+ * Parse comma-separated serializer flags into *flags.
+ *
+ * Parsing always yields a layout a plugin can render: an unknown flag is
+ * dropped, and as compact and pretty select the same layout, the last named
+ * wins. serializer/json xassert()s when handed both.
+ *
+ * Warn rather than reject: a flag only changes how output is rendered, while
+ * rejecting takes down every daemon and client initializing a serializer,
+ * none of them near the configuration at fault.
+ *
+ * src names where the flags came from, as the same flags arrive from both
+ * slurm.conf and the environment.
+ */
+static void _parse_config(const char *config, serializer_flags_t *flags,
+			  const char *src)
 {
-	int rc = SLURM_SUCCESS;
 	char *token = NULL, *save_ptr = NULL;
 	char *toklist = xstrdup(config);
 
 	token = strtok_r(toklist, ",", &save_ptr);
 	while (token) {
-		serializer_flags_t flag = SER_FLAGS_NONE;
+		serializer_flags_t flag = _parse_flag(token);
 
-		if (!token[0])
-			continue;
+		if (flag == SER_FLAGS_NONE) {
+			warning_in_daemon(
+				"Ignoring unknown %s flag \"%s\" in \"%s\"",
+				src, token, config);
+		} else {
+			/* A layout flag, and a different one is already set */
+			if ((flag & SER_FLAGS_LAYOUT_MASK) &&
+			    (*flags & SER_FLAGS_LAYOUT_MASK & ~flag)) {
+				warning_in_daemon(
+					"%s flag \"%s\" overrides the layout already selected in \"%s\"",
+					src, token, config);
+				*flags &= ~SER_FLAGS_LAYOUT_MASK;
+			}
 
-		if ((flag = _parse_flag(token)) == SER_FLAGS_NONE) {
-			debug("%s: Unknown flag \"%s\" in \"%s\"",
-			      __func__, token, config);
-			rc = EINVAL;
+			*flags |= flag;
 		}
-
-		*flags |= flag;
 
 		token = strtok_r(NULL, ",", &save_ptr);
 	}
 	xfree(toklist);
+}
 
-	return rc;
+/* Parse SerializerParameters comma-separated flags, SER_FLAGS_NONE if unset */
+static serializer_flags_t _conf_flags(void)
+{
+	serializer_flags_t flags = SER_FLAGS_NONE;
+	const char *params = slurm_conf.serializer_params;
+
+	if (params && params[0])
+		_parse_config(params, &flags, "SerializerParameters");
+
+	return flags;
 }
 
 static int _find_serializer_full_type(void *x, void *key)
@@ -189,8 +232,8 @@ static plugin_mime_type_t *_find_serializer(const char *mime_type)
 			       (void *) mime_type);
 }
 
-extern int serialize_g_data_to_string(char **dest, size_t *length,
-				      const data_t *src, const char *mime_type,
+extern int serialize_g_data_to_string(char **dest, size_t *length, data_t *src,
+				      const char *mime_type,
 				      serializer_flags_t flags)
 {
 	DEF_TIMERS;
@@ -254,25 +297,95 @@ extern const char *resolve_mime_type(const char *mime_type,
 	return pmt->mime_type;
 }
 
-static int _register_mime_types(list_t *mime_types_list, size_t plugin_index,
-				const char **mime_type)
+/*
+ * Report a MIME type that went to an earlier plugin.
+ *
+ * Two plugins Slurm ships claiming one type is a packaging decision that an
+ * administrator can not act on, and a serializer initializes in every daemon
+ * and on every step, so only warn when SerializerPlugins named the plugins and
+ * editing that list is a real fix. Every plugin is explicitly named whenever
+ * SerializerPlugins is set, as load_plugins() then builds the plugin list from
+ * that string alone.
+ *
+ * slurmstepd is never sent SerializerPlugins (see slurmstepd_init.c), so it
+ * always takes the quiet path no matter what is configured.
+ */
+static void _log_skipped_mime_type(const char *mime_type, size_t holder,
+				   size_t skipped)
 {
+	if (slurm_conf.serializer_plugins && slurm_conf.serializer_plugins[0])
+		warning_in_daemon(
+			"SerializerPlugins: MIME type \"%s\" is served by serializer plugin %s: skipping plugin %s",
+			mime_type, plugins->types[holder],
+			plugins->types[skipped]);
+	else
+		log_flag(DATA, "MIME type \"%s\" served by serializer plugin %s: skipping plugin %s",
+			 mime_type, plugins->types[holder],
+			 plugins->types[skipped]);
+}
+
+static const char *_register_mime_types(list_t *mime_types_list,
+					size_t plugin_index,
+					const char **mime_type)
+{
+	const char *first = NULL;
+
 	while (*mime_type) {
-		plugin_mime_type_t *pmt = xmalloc(sizeof(*pmt));
+		plugin_mime_type_t *pmt;
 
-		pmt->index = plugin_index;
-		pmt->mime_type = *mime_type;
-		pmt->magic = PMT_MAGIC;
+		/*
+		 * Only one plugin may serve a MIME type. Keep the plugin that
+		 * already claimed it and skip this one for that type only: a
+		 * plugin may lose one MIME type and still serve another.
+		 */
+		if ((pmt = list_find_first(mime_types_list,
+					   _find_serializer_full_type,
+					   (void *) *mime_type))) {
+			_log_skipped_mime_type(*mime_type, pmt->index,
+					       plugin_index);
+		} else {
+			pmt = xmalloc(sizeof(*pmt));
+			pmt->index = plugin_index;
+			pmt->mime_type = *mime_type;
+			pmt->magic = PMT_MAGIC;
 
-		list_append(mime_types_list, pmt);
+			list_append(mime_types_list, pmt);
 
-		log_flag(DATA, "registered serializer plugin %s for %s",
-			 plugins->types[plugin_index], pmt->mime_type);
+			log_flag(DATA, "registered serializer plugin %s for %s",
+				 plugins->types[plugin_index], pmt->mime_type);
+
+			/*
+			 * First mime_type successfully registered is the
+			 * primary. A plugin that loses mime_types[0] to
+			 * another plugin has its next type promoted.
+			 */
+			if (!first)
+				first = *mime_type;
+		}
 
 		mime_type++;
 	}
 
-	return SLURM_SUCCESS;
+	return first;
+}
+
+/*
+ * Is the plugin at plugin_index the one serving mime_type?
+ *
+ * Only one plugin may serve a MIME type and the first to register it wins, so
+ * ownership must be resolved from the registration list and not from the
+ * plugin name: a plugin skipped for a type must not be handed that type's
+ * configuration, which it would never apply to anything.
+ *
+ * Only plugins [0, plugin_index] have registered while serializer_g_init() is
+ * still walking the list, which is enough: a plugin not holding the type by
+ * its own iteration lost it to an earlier one and can never gain it back.
+ */
+static bool _serves_mime_type(size_t plugin_index, const char *mime_type)
+{
+	const plugin_mime_type_t *pmt = _find_serializer(mime_type);
+
+	return (pmt && ((size_t) pmt->index == plugin_index));
 }
 
 extern const char **get_mime_type_array(void)
@@ -289,8 +402,8 @@ extern const char **get_mime_type_array(void)
 
 extern int serializer_g_init(void)
 {
-	int rc = SLURM_SUCCESS;
-	serializer_flags_t flags = SER_FLAGS_NONE;
+	int rc = SLURM_SUCCESS, mi = 0;
+	serializer_flags_t conf_flags = SER_FLAGS_NONE;
 
 	slurm_mutex_lock(&init_mutex);
 	if (plugins) {
@@ -301,7 +414,8 @@ extern int serializer_g_init(void)
 	xassert(!should_not_change);
 
 	xassert(sizeof(funcs_t) == sizeof(void *) * ARRAY_SIZE(syms));
-	rc = load_plugins(&plugins, SERIALIZER_MAJOR_TYPE, NULL, NULL, syms,
+	rc = load_plugins(&plugins, SERIALIZER_MAJOR_TYPE,
+			  slurm_conf.serializer_plugins, NULL, syms,
 			  ARRAY_SIZE(syms));
 
 	if (rc)
@@ -313,10 +427,13 @@ extern int serializer_g_init(void)
 
 	xrecalloc(mime_array, (plugins->count + 1), sizeof(*mime_array));
 
+	conf_flags = _conf_flags();
+
 	for (size_t i = 0; plugins && (i < plugins->count) && !rc; i++) {
-		const char *config = NULL;
-		const char **mime_types;
+		const char *config = NULL, *config_src = NULL;
+		const char **mime_types = NULL, *mime_type = NULL;
 		const funcs_t *func_ptr = plugins->functions[i];
+		serializer_flags_t flags = conf_flags;
 
 		xassert(plugins->handles[i] != PLUGIN_INVALID_HANDLE);
 
@@ -326,31 +443,42 @@ extern int serializer_g_init(void)
 			fatal_abort("%s: unable to load %s from plugin",
 				    __func__, SERIALIZER_MIME_TYPES_SYM);
 
-		/* First mime_type is always considered primary */
-		mime_array[i] = mime_types[0];
+		if ((mime_type = _register_mime_types(mime_types_list, i,
+						      mime_types)))
+			mime_array[mi++] = mime_type;
 
-		_register_mime_types(mime_types_list, i, mime_types);
-
-		if (!xstrcmp(plugins->types[i], MIME_TYPE_JSON_PLUGIN)) {
-			if (running_in_slurmrestd())
-				config = getenv("SLURMRESTD_JSON");
-			if (!config)
-				config = getenv(ENV_CONFIG_JSON);
+		if (_serves_mime_type(i, MIME_TYPE_JSON)) {
+			if (running_in_slurmrestd()) {
+				config_src = "SLURMRESTD_JSON";
+				config = getenv(config_src);
+			}
+			if (!config) {
+				config_src = ENV_CONFIG_JSON;
+				config = getenv(config_src);
+			}
+		} else if (_serves_mime_type(i, MIME_TYPE_YAML)) {
+			if (running_in_slurmrestd()) {
+				config_src = "SLURMRESTD_YAML";
+				config = getenv(config_src);
+			}
+			if (!config) {
+				config_src = ENV_CONFIG_YAML;
+				config = getenv(config_src);
+			}
 		}
 
-		if (!xstrcmp(plugins->types[i], MIME_TYPE_YAML_PLUGIN)) {
-			if (running_in_slurmrestd())
-				config = getenv("SLURMRESTD_YAML");
-			if (!config)
-				config = getenv(ENV_CONFIG_YAML);
+		/* Env vars override SerializerParameters flags for this plugin */
+		if (config && config[0]) {
+			flags = SER_FLAGS_NONE;
+			_parse_config(config, &flags, config_src);
 		}
-
-		if (config && config[0] && (rc = _parse_config(config, &flags)))
-			fatal("Unable to parse serializer \"%s\" flags: %s",
-			      config, slurm_strerror(rc));
 
 		rc = (*func_ptr->init)(flags);
 	}
+
+	if (!rc && !_find_serializer(MIME_TYPE_JSON))
+		warning_in_daemon("No serializer plugin loaded for %s.",
+				  MIME_TYPE_JSON);
 
 	slurm_mutex_unlock(&init_mutex);
 
@@ -391,4 +519,67 @@ extern void serializer_g_fini(void)
 	FREE_NULL_PLUGINS(plugins);
 	slurm_mutex_unlock(&init_mutex);
 #endif
+}
+
+extern int serialize_g_parse(serialize_parse_state_t **state_ptr,
+			     data_parser_t *parser, data_parser_type_t type,
+			     void *dst, ssize_t dst_bytes, buf_t *src,
+			     const char *mime_type)
+{
+	DEF_TIMERS;
+	int rc = EINVAL;
+	const funcs_t *func_ptr = NULL;
+	plugin_mime_type_t *pmt = NULL;
+
+	xassert(dst);
+	xassert(dst_bytes > 0);
+	xassert(!src || (src->magic == BUF_MAGIC));
+
+	pmt = _find_serializer(mime_type);
+	if (!pmt)
+		return ESLURM_DATA_UNKNOWN_MIME_TYPE;
+
+	xassert(pmt->magic == PMT_MAGIC);
+	func_ptr = plugins->functions[pmt->index];
+
+	START_TIMER;
+	rc = (*func_ptr->parse)(state_ptr, parser, type, dst, dst_bytes, src);
+	END_TIMER2(__func__);
+
+	return rc;
+}
+
+extern int serialize_g_dump(serialize_dump_state_t **state_ptr,
+			    data_parser_t *parser, data_parser_type_t type,
+			    void *src, ssize_t src_bytes, buf_t *dst,
+			    const char *mime_type, serializer_flags_t flags)
+{
+	DEF_TIMERS;
+	int rc;
+	const funcs_t *func_ptr;
+	plugin_mime_type_t *pmt = NULL;
+
+	xassert(src);
+	xassert(src_bytes > 0);
+	/*
+	 * A NULL dst is the caller abandoning an incomplete dump, which always
+	 * releases state_ptr. Only the plugin can release the state, so this
+	 * must dispatch instead of rejecting the call, and there is no buffer
+	 * to verify until there is a buffer.
+	 */
+	xassert(!dst || (dst->magic == BUF_MAGIC));
+
+	pmt = _find_serializer(mime_type);
+	if (!pmt)
+		return ESLURM_DATA_UNKNOWN_MIME_TYPE;
+
+	xassert(pmt->magic == PMT_MAGIC);
+	func_ptr = plugins->functions[pmt->index];
+
+	START_TIMER;
+	rc = (*func_ptr->dump)(state_ptr, parser, type, src, src_bytes, dst,
+			       flags);
+	END_TIMER2(__func__);
+
+	return rc;
 }

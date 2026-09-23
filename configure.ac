@@ -42,6 +42,23 @@ case "$host" in
 			[Define slurm_ prefix function aliases for plugins]) ;;
 esac
 
+dnl Select ld emulation when invoking ld --format=binary directly.
+dnl FreeBSD's lld requires an explicit -m <emulation>; leave empty elsewhere.
+dnl Ensure configure substitutes into make_ref.include
+LD_EMULATION=""
+case "$host" in
+	x86_64-*-freebsd*)      LD_EMULATION="-m elf_amd64"    ;;
+	amd64-*-freebsd*)       LD_EMULATION="-m elf_amd64"    ;;
+	aarch64-*-freebsd*)     LD_EMULATION="-m aarch64elf"   ;;
+	powerpc64le-*-freebsd*) LD_EMULATION="-m elf64lppc"    ;;
+	powerpc64-*-freebsd*)   LD_EMULATION="-m elf64ppc"     ;;
+	riscv64-*-freebsd*)     LD_EMULATION="-m elf64lriscv"  ;;
+	*)                      LD_EMULATION=""                ;;
+esac
+AC_SUBST([LD_EMULATION])
+AC_MSG_CHECKING([ld emulation flag])
+AC_MSG_RESULT([$LD_EMULATION])
+
 dnl Checks for programs.
 dnl
 AC_PROG_CC
@@ -258,6 +275,26 @@ X_AC_CGROUP
 X_AC_BPF
 X_AC_DBUS
 
+dnl sockaddr length fields (BSD-style)
+AC_CHECK_MEMBERS([struct sockaddr.sa_len], [], [],
+  [[#include <sys/types.h>
+    #include <sys/socket.h>]])
+
+AC_CHECK_MEMBERS([struct sockaddr_in.sin_len], [], [],
+  [[#include <sys/types.h>
+    #include <sys/socket.h>
+    #include <netinet/in.h>]])
+
+AC_CHECK_MEMBERS([struct sockaddr_in6.sin6_len], [], [],
+  [[#include <sys/types.h>
+    #include <sys/socket.h>
+    #include <netinet/in.h>]])
+
+AC_CHECK_MEMBERS([struct sockaddr_un.sun_len], [], [],
+  [[#include <sys/types.h>
+    #include <sys/socket.h>
+    #include <sys/un.h>]])
+
 #
 #  Tests for Check
 #
@@ -403,7 +440,6 @@ AC_CONFIG_FILES([Makefile
 		 etc/Makefile
 		 src/Makefile
 		 src/api/Makefile
-		 src/bcast/Makefile
 		 src/common/Makefile
 		 src/conmgr/Makefile
 		 src/curl/Makefile
@@ -433,6 +469,7 @@ AC_CONFIG_FILES([Makefile
 		 src/plugins/acct_gather_profile/hdf5/sh5util/Makefile
 		 src/plugins/acct_gather_profile/influxdb/Makefile
 		 src/plugins/auth/Makefile
+		 src/plugins/auth/common/Makefile
 		 src/plugins/auth/jwt/Makefile
 		 src/plugins/auth/munge/Makefile
 		 src/plugins/auth/none/Makefile
@@ -454,15 +491,18 @@ AC_CONFIG_FILES([Makefile
 		 src/plugins/cli_filter/lua/Makefile
 		 src/plugins/cli_filter/syslog/Makefile
 		 src/plugins/cli_filter/user_defaults/Makefile
+		 src/plugins/compress/Makefile
+		 src/plugins/compress/none/Makefile
+		 src/plugins/compress/lz4/Makefile
 		 src/plugins/cred/Makefile
 		 src/plugins/cred/common/Makefile
 		 src/plugins/cred/munge/Makefile
 		 src/plugins/cred/none/Makefile
 		 src/plugins/data_parser/Makefile
-		 src/plugins/data_parser/v0.0.42/Makefile
 		 src/plugins/data_parser/v0.0.43/Makefile
 		 src/plugins/data_parser/v0.0.44/Makefile
 		 src/plugins/data_parser/v0.0.45/Makefile
+		 src/plugins/data_parser/v0.0.46/Makefile
 		 src/plugins/gpu/Makefile
 		 src/plugins/gpu/common/Makefile
 		 src/plugins/gpu/generic/Makefile
@@ -483,9 +523,10 @@ AC_CONFIG_FILES([Makefile
 		 src/plugins/hash/sha3/Makefile
 		 src/plugins/http_auth/Makefile
 		 src/plugins/http_auth/local/Makefile
-		 src/plugins/http_auth/jwt/Makefile
 		 src/plugins/http_parser/Makefile
+		 src/plugins/http_parser/common/Makefile
 		 src/plugins/http_parser/libhttp_parser/Makefile
+		 src/plugins/http_parser/llhttp_parser/Makefile
 		 src/plugins/job_submit/Makefile
 		 src/plugins/job_submit/all_partitions/Makefile
 		 src/plugins/job_submit/defaults/Makefile
@@ -494,6 +535,7 @@ AC_CONFIG_FILES([Makefile
 		 src/plugins/job_submit/partition/Makefile
 		 src/plugins/job_submit/pbs/Makefile
 		 src/plugins/job_submit/require_timelimit/Makefile
+		 src/plugins/job_submit/resilience/Makefile
 		 src/plugins/job_submit/throttle/Makefile
 		 src/plugins/jobacct_gather/Makefile
 		 src/plugins/jobacct_gather/cgroup/Makefile
@@ -535,6 +577,9 @@ AC_CONFIG_FILES([Makefile
 		 src/plugins/proctrack/cgroup/Makefile
 		 src/plugins/proctrack/linuxproc/Makefile
 		 src/plugins/proctrack/pgid/Makefile
+		 src/plugins/runtime/Makefile
+		 src/plugins/runtime/none/Makefile
+		 src/plugins/runtime/oci/Makefile
 		 src/plugins/sched/Makefile
 		 src/plugins/sched/backfill/Makefile
 		 src/plugins/sched/builtin/Makefile
@@ -561,7 +606,10 @@ AC_CONFIG_FILES([Makefile
 		 src/plugins/topology/common/Makefile
 		 src/plugins/topology/flat/Makefile
 		 src/plugins/topology/ring/Makefile
+		 src/plugins/topology/torus3d/Makefile
 		 src/plugins/topology/tree/Makefile
+		 src/plugins/url_parser/Makefile
+		 src/plugins/url_parser/internal/Makefile
 		 src/sacct/Makefile
 		 src/sackd/Makefile
 		 src/sacctmgr/Makefile
@@ -599,8 +647,8 @@ AC_CONFIG_FILES([Makefile
 		 src/stepmgr/Makefile
 		 src/strigger/Makefile
 		 src/sview/Makefile
+		 src/swait/Makefile
 		 testsuite/Makefile
-		 testsuite/testsuite.conf.sample
 		 testsuite/expect/Makefile
 		 testsuite/slurm_unit/Makefile
 		 testsuite/slurm_unit/backfill/Makefile

@@ -125,9 +125,7 @@ static int _get_stepmgr_steps(void *x, void *arg)
 	}
 
 	job_step_info_request_msg_t req_data = {0};
-	req_data.step_id.job_id = sji->step_id.job_id;
-	req_data.step_id.step_id = NO_VAL;
-	req_data.step_id.step_het_comp = NO_VAL;
+	req_data.step_id = sji->step_id;
 
 	req_msg.msg_type = REQUEST_JOB_STEP_INFO;
 	req_msg.data = &req_data;
@@ -155,8 +153,8 @@ static int _get_stepmgr_steps(void *x, void *arg)
 			ctld_resp->job_step_count = new_rec_cnt;
 
 			xfree(stepmgr_resp->job_steps);
-			xfree(stepmgr_resp);
 		}
+		slurm_free_job_step_info_response_msg(stepmgr_resp);
 	}
 
 	return SLURM_SUCCESS;
@@ -302,7 +300,7 @@ _load_fed_steps(slurm_msg_t *req_msg, job_step_info_response_msg_t **resp,
 				orig_msg->job_step_count = new_rec_cnt;
 			}
 			xfree(new_msg->job_steps);
-			xfree(new_msg);
+			slurm_free_job_step_info_response_msg(new_msg);
 		}
 		xfree(step_resp);
 	}
@@ -379,8 +377,10 @@ extern int slurm_find_step_ids_by_container_id(uint16_t show_flags, uid_t uid,
 	req_msg.data = &req;
 
 	if (slurm_send_recv_controller_msg(&req_msg, &resp_msg,
-					   working_cluster_rec))
-		return errno;
+					   working_cluster_rec)) {
+		rc = errno;
+		goto fini;
+	}
 
 	switch (resp_msg.msg_type) {
 	case RESPONSE_STEP_BY_CONTAINER_ID:
@@ -397,6 +397,8 @@ extern int slurm_find_step_ids_by_container_id(uint16_t show_flags, uid_t uid,
 	}
 
 	slurm_free_msg_data(resp_msg.msg_type, resp_msg.data);
+fini:
+	xfree(req.container_id);
 
 	return rc;
 }

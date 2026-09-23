@@ -65,6 +65,7 @@
 #include "src/common/setproctitle.h"
 #include "src/common/spank.h"
 #include "src/common/uid.h"
+#include "src/common/workerpool.h"
 #include "src/common/xassert.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
@@ -75,7 +76,7 @@
 
 #define THREAD_COUNT 3
 
-static void _open_pty();
+static void _open_pty(void);
 static int _kill_job(conmgr_fd_t *con, int signal);
 static void _notify_started(void);
 static void _try_start(void);
@@ -182,7 +183,7 @@ static int _send_pty(conmgr_fd_t *con, slurm_msg_t *req_msg)
 	return rc;
 }
 
-static void _daemonize_logs()
+static void _daemonize_logs(void)
 {
 	/*
 	 * Default to syslog since scrun anchor should only ever be run in
@@ -222,12 +223,17 @@ static void _daemonize_logs()
 	update_logging();
 }
 
-static void _tear_down(conmgr_callback_args_t conmgr_args, void *arg)
+static void _tear_down(const bool shutdown, void *arg)
 {
 	bool need_kill = false, need_stop = false;
 	int rc = SLURM_SUCCESS;
 
 	xassert(!arg);
+
+	if (shutdown) {
+		debug("%s: skipping due to workerpool shutdown", __func__);
+		return;
+	}
 
 	read_lock_state();
 	if (state.status >= CONTAINER_ST_STOPPED) {
@@ -283,7 +289,7 @@ static int _send_delete_confirmation(void *x, void *arg)
 }
 
 /* stopping job is async: this is the final say if the job has stopped */
-static void _check_if_stopped(conmgr_callback_args_t conmgr_args, void *arg)
+static void _check_if_stopped(const bool shutdown, void *arg)
 {
 	int ptm = -1;
 	bool stopped = false;
@@ -292,6 +298,11 @@ static void _check_if_stopped(conmgr_callback_args_t conmgr_args, void *arg)
 	list_t *delete_requests;
 
 	xassert(!arg);
+
+	if (shutdown) {
+		debug("%s: skipping due to workerpool shutdown", __func__);
+		return;
+	}
 
 	read_lock_state();
 	debug2("%s: status=%s job_completed=%c staged_out=%c",
@@ -374,13 +385,18 @@ static void _check_if_stopped(conmgr_callback_args_t conmgr_args, void *arg)
 	conmgr_request_shutdown();
 }
 
-static void _finish_job(conmgr_callback_args_t conmgr_args, void *arg)
+static void _finish_job(const bool shutdown, void *arg)
 {
 	int rc;
 	slurm_step_id_t step_id;
 	bool existing_allocation;
 
 	xassert(!arg);
+
+	if (shutdown) {
+		debug("%s: skipping due to workerpool shutdown", __func__);
+		return;
+	}
 
 	read_lock_state();
 	xassert(state.status >= CONTAINER_ST_STOPPING);
@@ -419,15 +435,20 @@ done:
 	state.job_completed = true;
 	unlock_state();
 
-	conmgr_add_work_fifo(_check_if_stopped, NULL);
+	workerpool_enqueue_normal(_check_if_stopped, NULL);
 }
 
-static void _stage_out(conmgr_callback_args_t conmgr_args, void *arg)
+static void _stage_out(const bool shutdown, void *arg)
 {
 	int rc;
 	bool staged_in;
 
 	xassert(!arg);
+
+	if (shutdown) {
+		debug("%s: skipping due to workerpool shutdown", __func__);
+		return;
+	}
 
 	read_lock_state();
 	xassert(state.status >= CONTAINER_ST_STOPPING);
@@ -456,7 +477,7 @@ static void _stage_out(conmgr_callback_args_t conmgr_args, void *arg)
 	state.staged_out = true;
 	unlock_state();
 
-	conmgr_add_work_fifo(_finish_job, NULL);
+	workerpool_enqueue_normal(_finish_job, NULL);
 }
 
 /* cleanup anchor and shutdown */
@@ -504,7 +525,7 @@ extern void stop_anchor(int status)
 	}
 	unlock_state();
 
-	conmgr_add_work_fifo(_stage_out, NULL);
+	workerpool_enqueue_normal(_stage_out, NULL);
 
 	debug2("%s: end", __func__);
 }
@@ -653,6 +674,7 @@ static void _queue_send_console_socket(void)
 	struct sockaddr_un addr = {
 		.sun_family = AF_UNIX,
 	};
+	socklen_t addrlen;
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
 
 	fd_set_nonblocking(fd);
@@ -663,13 +685,16 @@ static void _queue_send_console_socket(void)
 		fatal("console socket address too long: %s",
 		      state.console_socket);
 
-	if ((connect(fd, (struct sockaddr *) &addr, sizeof(addr))) < 0)
+	addrlen = sockaddr_fixlen((struct sockaddr *) &addr,
+				  (socklen_t) sizeof(addr));
+	if ((connect(fd, (struct sockaddr *) &addr, addrlen)) < 0)
 		fatal("%s: [%s] Unable to connect() to console socket: %m",
 		      __func__, addr.sun_path);
 
-	if ((rc = conmgr_process_fd(CON_TYPE_RAW, fd, fd, &events, CON_FLAG_NONE,
-				    (slurm_addr_t *) &addr, sizeof(addr),
-				    NULL, NULL)))
+	if ((rc = conmgr_process_fd(CON_TYPE_RAW, &conmgr_timeouts_disabled, fd,
+				    fd, &events, CON_FLAG_NONE,
+				    (slurm_addr_t *) &addr, addrlen, NULL,
+				    NULL)))
 		fatal("%s: [%s] unable to initialize console socket: %s",
 		      __func__, addr.sun_path, slurm_strerror(rc));
 
@@ -845,7 +870,7 @@ static int _kill_job(conmgr_fd_t *con, int signal)
 	unlock_state();
 
 	if ((step_id.job_id != NO_VAL) && (status <= CONTAINER_ST_STOPPING)) {
-		rc = slurm_kill_job(step_id.job_id, signal, KILL_FULL_JOB);
+		rc = slurm_kill_job(step_id, signal, KILL_FULL_JOB);
 
 		debug("%s: [%s] slurm_kill_job(%pI, Signal[%d]=%s, 0) = %s",
 		      __func__, (con ? conmgr_fd_get_name(con) : "self"),
@@ -898,12 +923,12 @@ static int _delete(conmgr_fd_t *con, slurm_msg_t *req_msg)
 
 	rc = _queue_delete_request(con, req_msg);
 
-	conmgr_add_work_fifo(_tear_down, NULL);
+	workerpool_enqueue_normal(_tear_down, NULL);
 
 	return rc;
 }
 
-static void _set_proctitle()
+static void _set_proctitle(void)
 {
 	char *thread_name = NULL;
 
@@ -991,7 +1016,7 @@ rwfail:
 	fatal("Unable to send PID to parent: %m");
 }
 
-static void _cleanup_pidfile()
+static void _cleanup_pidfile(void)
 {
 	xassert(!state.needs_lock);
 
@@ -1012,7 +1037,7 @@ static void _cleanup_pidfile()
  * to be compatible with docker pidfile parsing. Defers actually writing the
  * pidfile too.
  */
-static void _open_pidfile()
+static void _open_pidfile(void)
 {
 	int rc = SLURM_SUCCESS;
 	xassert(!state.needs_lock);
@@ -1061,7 +1086,7 @@ cleanup:
 	      __func__, state.pid_file, slurm_strerror(rc));
 }
 
-static void _populate_pidfile()
+static void _populate_pidfile(void)
 {
 	int rc = SLURM_SUCCESS;
 	char *pid_str = NULL;
@@ -1087,13 +1112,18 @@ rwfail:
 	      __func__, state.pid_file, slurm_strerror(rc));
 }
 
-extern void on_allocation(conmgr_callback_args_t conmgr_args, void *arg)
+extern void on_allocation(const bool shutdown, void *arg)
 {
 	bool queue_try_start = false;
 	int rc;
 	pid_t pid;
 
 	xassert(!arg);
+
+	if (shutdown) {
+		debug("%s: skipping due to workerpool shutdown", __func__);
+		return;
+	}
 
 	write_lock_state();
 	if (state.step_id.job_id == NO_VAL) {
@@ -1132,6 +1162,7 @@ extern void on_allocation(conmgr_callback_args_t conmgr_args, void *arg)
 					  sizeof(pid))))
 		fatal("%s: unable to send pid: %s",
 		      __func__, slurm_strerror(rc));
+	conmgr_unquiesce_fd(state.startup_con);
 
 	conmgr_queue_close_fd(state.startup_con);
 	unlock_state();
@@ -1348,7 +1379,7 @@ static void *_on_startup_con(conmgr_callback_args_t conmgr_args, void *arg)
 	unlock_state();
 
 	if (queue) {
-		conmgr_add_work_fifo(on_allocation, NULL);
+		workerpool_enqueue_normal(on_allocation, NULL);
 	}
 
 	return &state;
@@ -1448,8 +1479,9 @@ static int _anchor_child(int pipe_fd[2])
 	state.pid = getpid();
 	_populate_pidfile();
 
-	/* must init conmgr after calling fork() in _daemonize() */
-	conmgr_init(0, THREAD_COUNT, 0);
+	/* must init conmgr/workerpool after calling fork() in _daemonize() */
+	workerpool_init(0, THREAD_COUNT, NULL);
+	conmgr_init(0);
 
 	change_status_force(CONTAINER_ST_CREATING);
 
@@ -1478,22 +1510,22 @@ static int _anchor_child(int pipe_fd[2])
 	/* TODO: only 1 unix socket for now */
 	list_append(socket_listen,
 		    xstrdup_printf("unix:%s", state.anchor_socket));
-	if ((rc = conmgr_create_listen_sockets(CON_TYPE_RPC, CON_FLAG_NONE,
-					       socket_listen, &conmgr_events,
-					       NULL)))
+	if ((rc = conmgr_create_listen_sockets(NULL, CON_TYPE_RPC,
+					       CON_FLAG_NONE, socket_listen,
+					       &conmgr_events, NULL)))
 		fatal("%s: unable to initialize listeners: %s",
 		      __func__, slurm_strerror(rc));
 	debug("%s: listening on unix:%s", __func__, state.anchor_socket);
 
 	conmgr_add_work_signal(SIGCHLD, _catch_sigchld, &state);
 
-	if ((rc = conmgr_process_fd(CON_TYPE_RAW, pipe_fd[1], pipe_fd[1],
-				    &conmgr_startup_events, CON_FLAG_NONE, NULL,
-				    0, NULL, NULL)))
+	if ((rc = conmgr_process_fd(CON_TYPE_RAW, &conmgr_timeouts_disabled, -1,
+				    pipe_fd[1], &conmgr_startup_events,
+				    CON_FLAG_QUIESCE, NULL, 0, NULL, NULL)))
 		fatal("%s: unable to initialize RPC listener: %s",
 		      __func__, slurm_strerror(rc));
 
-	conmgr_add_work_fifo(get_allocation, NULL);
+	workerpool_enqueue_normal(get_allocation, NULL);
 
 	if ((spank_rc = spank_init_post_opt())) {
 		fatal("%s: plugin stack post-option processing failed: %s",
@@ -1521,6 +1553,7 @@ static int _anchor_child(int pipe_fd[2])
 #endif
 	FREE_NULL_LIST(socket_listen);
 	conmgr_fini();
+	workerpool_fini();
 
 	return rc;
 }
@@ -1539,8 +1572,8 @@ extern int spawn_anchor(void)
 		fatal("%s: failed to initialize plugin stack: %s",
 		      __func__, slurm_strerror(rc));
 
-	if (pipe(pipe_fd))
-		fatal("pipe() failed: %m");
+	if (pipe2(pipe_fd, O_CLOEXEC))
+		fatal("pipe2() failed: %m");
 	xassert(pipe_fd[0] > STDERR_FILENO);
 	xassert(pipe_fd[1] > STDERR_FILENO);
 
@@ -1552,8 +1585,10 @@ extern int spawn_anchor(void)
 
 		rc = _wait_create_pid(pipe_fd[0], child);
 		goto done;
-	} else
+	} else {
+		fd_close(&pipe_fd[0]);
 		rc = _anchor_child(pipe_fd);
+	}
 
 done:
 	spank_rc = spank_fini(NULL);

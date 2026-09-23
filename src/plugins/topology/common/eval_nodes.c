@@ -263,7 +263,7 @@ static uint32_t _reduce_res_core_by_task_cnt(topology_eval_t* topo_eval,
 	bool one_task_per_node = false;
 	uint16_t res_cores_per_gpu =  node_ptr->res_cores_per_gpu;
 
-	if (job_ptr->details->overcommit && !job_ptr->tres_per_task)
+	if (job_ptr->bit_flags & ALLOW_OVERCOMMIT_TRES_PER_TASK)
 		one_task_per_node = true;
 	if (((job_ptr->details->task_dist & SLURM_DIST_STATE_BASE) ==
 	     SLURM_DIST_PLANE) && !one_task_per_node) {
@@ -475,13 +475,13 @@ static int _eval_nodes_busy(topology_eval_t *topo_eval)
 			    !avail_res_array[i]->avail_cpus) {
 				debug("%pJ required node %s lacks available resources",
 				      job_ptr, node_ptr->name);
-				error_code = ESLURM_BREAK_EVAL;
+				topo_eval->eval_action = EVAL_ACTION_BREAK;
 				goto fini;
 			}
 			if (topo_eval->max_nodes <= 0) {
 				log_flag(SELECT_TYPE, "%pJ requires nodes exceed maximum node limit",
 					 job_ptr);
-				error_code = ESLURM_BREAK_EVAL;
+				topo_eval->eval_action = EVAL_ACTION_BREAK;
 				goto fini;
 			}
 			eval_nodes_select_cores(topo_eval, i, min_rem_nodes);
@@ -492,7 +492,7 @@ static int _eval_nodes_busy(topology_eval_t *topo_eval)
 			if (topo_eval->avail_cpus <= 0) {
 				debug("%pJ required node %s lacks available resources",
 				      job_ptr, node_ptr->name);
-				error_code = ESLURM_BREAK_EVAL;
+				topo_eval->eval_action = EVAL_ACTION_BREAK;
 				goto fini;
 			}
 			total_cpus += topo_eval->avail_cpus;
@@ -510,7 +510,7 @@ static int _eval_nodes_busy(topology_eval_t *topo_eval)
 			goto fini;
 		}
 		if (topo_eval->max_nodes <= 0) {
-			error_code = ESLURM_BREAK_EVAL;
+			topo_eval->eval_action = EVAL_ACTION_BREAK;
 			goto fini;
 		}
 		bit_and_not(orig_node_map, topo_eval->node_map);
@@ -523,7 +523,7 @@ static int _eval_nodes_busy(topology_eval_t *topo_eval)
 	    (total_cpus > details_ptr->max_cpus)) {
 		info("%pJ can't use required nodes due to max CPU limit",
 		     job_ptr);
-		error_code = ESLURM_BREAK_EVAL;
+		topo_eval->eval_action = EVAL_ACTION_BREAK;
 		goto fini;
 	}
 
@@ -586,6 +586,7 @@ static int _eval_nodes_busy(topology_eval_t *topo_eval)
 	} else if ((rem_cpus > 0) || (min_rem_nodes > 0) ||
 		   !gres_sched_test(job_ptr->gres_list_req, job_ptr->job_id)) {
 		error_code = SLURM_ERROR;
+		topo_eval->eval_action = EVAL_ACTION_RETRY_DEFAULT;
 	} else {
 		error_code = SLURM_SUCCESS;
 	}
@@ -600,7 +601,7 @@ fini:
 
 static int _eval_nodes_consec(topology_eval_t *topo_eval)
 {
-	int i, j, error_code = SLURM_ERROR;
+	int i, error_code = SLURM_ERROR;
 	int *consec_cpus;	/* how many CPUs we can add from this
 				 * consecutive set of nodes */
 	list_t **consec_gres;	/* how many GRES we can add from this
@@ -618,6 +619,9 @@ static int _eval_nodes_consec(topology_eval_t *topo_eval)
 	int min_rem_nodes;	/* remaining resources desired */
 	int best_fit_nodes, best_fit_cpus, best_fit_req;
 	int best_fit_sufficient, best_fit_index = 0;
+	int start_rem_nodes; /* rem_nodes before any set was accumulated */
+	bool any_sufficient = false; /* some set was large enough for the job */
+	bool contiguous_futile = false; /* no retry can satisfy contiguity */
 	bool new_best;
 	uint64_t best_weight = 0;
 	int64_t rem_max_cpus;
@@ -690,7 +694,8 @@ static int _eval_nodes_consec(topology_eval_t *topo_eval)
 					debug("%pJ required node %s needed %d cpus but only has %d",
 					      job_ptr, node_ptr->name, req_cpus,
 					      topo_eval->avail_cpus);
-					error_code = ESLURM_BREAK_EVAL;
+					topo_eval->eval_action =
+						EVAL_ACTION_BREAK;
 					goto fini;
 				}
 				topo_eval->avail_cpus = req_cpus;
@@ -719,7 +724,7 @@ static int _eval_nodes_consec(topology_eval_t *topo_eval)
 			if (topo_eval->avail_cpus == 0) {
 				debug("%pJ required node %s lacks available resources",
 				      job_ptr, node_ptr->name);
-				error_code = ESLURM_BREAK_EVAL;
+				topo_eval->eval_action = EVAL_ACTION_BREAK;
 				goto fini;
 			}
 			avail_cpu_per_node[i] = topo_eval->avail_cpus;
@@ -738,7 +743,7 @@ static int _eval_nodes_consec(topology_eval_t *topo_eval)
 			goto fini;
 		}
 		if (topo_eval->max_nodes <= 0) {
-			error_code = ESLURM_BREAK_EVAL;
+			topo_eval->eval_action = EVAL_ACTION_BREAK;
 			goto fini;
 		}
 	}
@@ -748,7 +753,7 @@ static int _eval_nodes_consec(topology_eval_t *topo_eval)
 	    (total_cpus > details_ptr->max_cpus)) {
 		info("%pJ can't use required nodes due to max CPU limit",
 		     job_ptr);
-		error_code = ESLURM_BREAK_EVAL;
+		topo_eval->eval_action = EVAL_ACTION_BREAK;
 		goto fini;
 	}
 
@@ -874,6 +879,7 @@ static int _eval_nodes_consec(topology_eval_t *topo_eval)
 	 * accumulate nodes from these sets of consecutive nodes until
 	 * sufficient resources have been accumulated
 	 */
+	start_rem_nodes = rem_nodes;
 	while (consec_index && (topo_eval->max_nodes > 0)) {
 		best_fit_cpus = best_fit_nodes = best_fit_sufficient = 0;
 		best_fit_req = -1;	/* first required node, -1 if none */
@@ -893,6 +899,8 @@ static int _eval_nodes_consec(topology_eval_t *topo_eval)
 				sufficient = gres_sched_sufficient(
 					job_ptr->gres_list_req, consec_gres[i]);
 			}
+			if (sufficient)
+				any_sufficient = true;
 
 			/*
 			 * if first possibility OR
@@ -954,8 +962,25 @@ static int _eval_nodes_consec(topology_eval_t *topo_eval)
 		if (best_fit_nodes == 0)
 			break;
 
-		if (details_ptr->contiguous && !best_fit_sufficient)
+		if (details_ptr->contiguous && !best_fit_sufficient) {
+			/*
+			 * The best fit is not large enough. If no set was large
+			 * enough, and nothing has been accumulated yet so
+			 * rem_nodes still represents the full request, then a
+			 * retry will not help -- it can only remove candidate
+			 * nodes, which splits or shortens the sets, so every
+			 * set it sees will be a subset of one rejected here.
+			 *
+			 * The any_sufficient test catches the case where the
+			 * best fit is insufficient (can happen due to node
+			 * weights) but another set exists that is sufficient
+			 * (removing nodes from the lower weight set lets the
+			 * job fit on a later pass).
+			 */
+			if ((rem_nodes == start_rem_nodes) && !any_sufficient)
+				contiguous_futile = true;
 			break;	/* no hole large enough */
+		}
 		if (best_fit_req != -1) {
 			/*
 			 * This collection of nodes includes required ones
@@ -1042,7 +1067,7 @@ static int _eval_nodes_consec(topology_eval_t *topo_eval)
 			int first = consec_start[best_fit_index];
 			int last  = consec_end[best_fit_index];
 			if (rem_nodes <= 1) {
-				for (i = first, j = 0; i <= last; i++, j++) {
+				for (i = first; i <= last; i++) {
 					if (bit_test(topo_eval->node_map, i) ||
 					    !avail_res_array[i])
 						continue;
@@ -1077,7 +1102,7 @@ static int _eval_nodes_consec(topology_eval_t *topo_eval)
 				}
 			}
 
-			for (i = first, j = 0; i <= last; i++, j++) {
+			for (i = first; i <= last; i++) {
 				if ((topo_eval->max_nodes == 0) ||
 				    ((rem_nodes <= 0) && (rem_cpus <= 0) &&
 				     (!topo_eval->gres_per_job ||
@@ -1138,6 +1163,10 @@ static int _eval_nodes_consec(topology_eval_t *topo_eval)
 	    gres_sched_test(job_ptr->gres_list_req, job_ptr->job_id) &&
 	    eval_nodes_enough_nodes(0, rem_nodes, min_nodes, req_nodes))
 		error_code = SLURM_SUCCESS;
+	else if (contiguous_futile)
+		topo_eval->eval_action = EVAL_ACTION_BREAK;
+	else
+		topo_eval->eval_action = EVAL_ACTION_RETRY_DEFAULT;
 
 fini:
 	if (error_code == SLURM_SUCCESS)
@@ -1217,11 +1246,13 @@ static int _eval_nodes_lln(topology_eval_t *topo_eval)
 			    !avail_res_array[i]->avail_cpus) {
 				debug("%pJ required node %s lacks available resources",
 				      job_ptr, node_ptr->name);
+				topo_eval->eval_action = EVAL_ACTION_BREAK;
 				goto fini;
 			}
 			if (topo_eval->max_nodes <= 0) {
 				log_flag(SELECT_TYPE, "%pJ requires nodes exceed maximum node limit",
 					 job_ptr);
+				topo_eval->eval_action = EVAL_ACTION_BREAK;
 				goto fini;
 			}
 			eval_nodes_select_cores(topo_eval, i, min_rem_nodes);
@@ -1232,6 +1263,7 @@ static int _eval_nodes_lln(topology_eval_t *topo_eval)
 			if (topo_eval->avail_cpus <= 0) {
 				debug("%pJ required node %s not available",
 				      job_ptr, node_ptr->name);
+				topo_eval->eval_action = EVAL_ACTION_BREAK;
 				goto fini;
 			}
 			total_cpus += topo_eval->avail_cpus;
@@ -1249,7 +1281,7 @@ static int _eval_nodes_lln(topology_eval_t *topo_eval)
 			goto fini;
 		}
 		if (topo_eval->max_nodes <= 0) {
-			error_code = ESLURM_BREAK_EVAL;
+			topo_eval->eval_action = EVAL_ACTION_BREAK;
 			goto fini;
 		}
 		bit_and_not(orig_node_map, topo_eval->node_map);
@@ -1260,7 +1292,7 @@ static int _eval_nodes_lln(topology_eval_t *topo_eval)
 	/* Compute CPUs already allocated to required nodes */
 	if ((details_ptr->max_cpus != NO_VAL) &&
 	    (total_cpus > details_ptr->max_cpus)) {
-		error_code = ESLURM_BREAK_EVAL;
+		topo_eval->eval_action = EVAL_ACTION_BREAK;
 		info("%pJ can't use required nodes due to max CPU limit",
 		     job_ptr);
 		goto fini;
@@ -1353,6 +1385,7 @@ static int _eval_nodes_lln(topology_eval_t *topo_eval)
 	} else if ((rem_cpus > 0) || (min_rem_nodes > 0) ||
 		   !gres_sched_test(job_ptr->gres_list_req, job_ptr->job_id)) {
 		error_code = SLURM_ERROR;
+		topo_eval->eval_action = EVAL_ACTION_RETRY_DEFAULT;
 	} else {
 		error_code = SLURM_SUCCESS;
 	}
@@ -1428,13 +1461,13 @@ static int _eval_nodes_serial(topology_eval_t *topo_eval)
 			    !avail_res_array[i]->avail_cpus) {
 				debug("%pJ required node %s lacks available resources",
 				      job_ptr, node_ptr->name);
-				error_code = ESLURM_BREAK_EVAL;
+				topo_eval->eval_action = EVAL_ACTION_BREAK;
 				goto fini;
 			}
 			if (topo_eval->max_nodes <= 0) {
 				log_flag(SELECT_TYPE, "%pJ requires nodes exceed maximum node limit",
 					 job_ptr);
-				error_code = ESLURM_BREAK_EVAL;
+				topo_eval->eval_action = EVAL_ACTION_BREAK;
 				goto fini;
 			}
 			eval_nodes_select_cores(topo_eval, i, min_rem_nodes);
@@ -1444,7 +1477,7 @@ static int _eval_nodes_serial(topology_eval_t *topo_eval)
 			if (topo_eval->avail_cpus <= 0) {
 				debug("%pJ required node %s lacks available resources",
 				      job_ptr, node_ptr->name);
-				error_code = ESLURM_BREAK_EVAL;
+				topo_eval->eval_action = EVAL_ACTION_BREAK;
 				goto fini;
 			}
 			total_cpus += topo_eval->avail_cpus;
@@ -1462,7 +1495,7 @@ static int _eval_nodes_serial(topology_eval_t *topo_eval)
 			goto fini;
 		}
 		if (topo_eval->max_nodes <= 0) {
-			error_code = ESLURM_BREAK_EVAL;
+			topo_eval->eval_action = EVAL_ACTION_BREAK;
 			goto fini;
 		}
 		bit_and_not(orig_node_map, topo_eval->node_map);
@@ -1475,7 +1508,7 @@ static int _eval_nodes_serial(topology_eval_t *topo_eval)
 	    (total_cpus > details_ptr->max_cpus)) {
 		info("%pJ can't use required nodes due to max CPU limit",
 		     job_ptr);
-		error_code = ESLURM_BREAK_EVAL;
+		topo_eval->eval_action = EVAL_ACTION_BREAK;
 		goto fini;
 	}
 
@@ -1527,6 +1560,7 @@ static int _eval_nodes_serial(topology_eval_t *topo_eval)
 	} else if ((rem_cpus > 0) || (min_rem_nodes > 0) ||
 		   !gres_sched_test(job_ptr->gres_list_req, job_ptr->job_id)) {
 		error_code = SLURM_ERROR;
+		topo_eval->eval_action = EVAL_ACTION_RETRY_DEFAULT;
 	} else {
 		error_code = SLURM_SUCCESS;
 	}
@@ -1645,13 +1679,13 @@ static int _eval_nodes_spread(topology_eval_t *topo_eval)
 			    !avail_res_array[i]->avail_cpus) {
 				debug("%pJ required node %s lacks available resources",
 				      job_ptr, node_ptr->name);
-				error_code = ESLURM_BREAK_EVAL;
+				topo_eval->eval_action = EVAL_ACTION_BREAK;
 				goto fini;
 			}
 			if (topo_eval->max_nodes <= 0) {
 				log_flag(SELECT_TYPE, "%pJ requires nodes exceed maximum node limit",
 					 job_ptr);
-				error_code = ESLURM_BREAK_EVAL;
+				topo_eval->eval_action = EVAL_ACTION_BREAK;
 				goto fini;
 			}
 			used_cpu_per_node[i] = cpus_per_task;
@@ -1737,10 +1771,8 @@ more_nodes:
 		min_rem_nodes--;
 	}
 
-	if ((rem_cpus > 0) || (min_rem_nodes > 0) ||
-	    !gres_sched_test(job_ptr->gres_list_req, job_ptr->job_id)) {
-		error_code = SLURM_ERROR;
-	} else {
+	if ((rem_cpus <= 0) && (min_rem_nodes <= 0) &&
+	    gres_sched_test(job_ptr->gres_list_req, job_ptr->job_id)) {
 		error_code = SLURM_SUCCESS;
 	}
 
@@ -1776,12 +1808,17 @@ extern int eval_nodes(topology_eval_t *topo_eval)
 			       sizeof(*hres_select->avail_hres));
 
 	xassert(topo_eval->node_map);
-	if (bit_set_count(topo_eval->node_map) < topo_eval->min_nodes)
-		return ESLURM_BREAK_EVAL;
+	if (bit_set_count(topo_eval->node_map) < topo_eval->min_nodes) {
+		topo_eval->eval_action = EVAL_ACTION_BREAK;
+		return SLURM_ERROR;
+	}
 
 	if ((details_ptr->req_node_bitmap) &&
-	    (!bit_super_set(details_ptr->req_node_bitmap, topo_eval->node_map)))
-		return ESLURM_BREAK_EVAL;
+	    (!bit_super_set(details_ptr->req_node_bitmap,
+			    topo_eval->node_map))) {
+		topo_eval->eval_action = EVAL_ACTION_BREAK;
+		return SLURM_ERROR;
+	}
 
 	/* trump_others will skip any other algorithms */
 	if (topo_eval->trump_others && topo_eval->eval_nodes) {

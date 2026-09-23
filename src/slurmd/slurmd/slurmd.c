@@ -73,6 +73,7 @@
 #include "src/common/bitstring.h"
 #include "src/common/cpu_frequency.h"
 #include "src/common/daemonize.h"
+#include "src/common/events.h"
 #include "src/common/fd.h"
 #include "src/common/fetch_config.h"
 #include "src/common/forward.h"
@@ -99,6 +100,8 @@
 #include "src/common/stepd_proxy.h"
 #include "src/common/threadpool.h"
 #include "src/common/uid.h"
+#include "src/common/util-net.h"
+#include "src/common/workerpool.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xsched.h"
 #include "src/common/xstring.h"
@@ -110,6 +113,7 @@
 #include "src/interfaces/auth.h"
 #include "src/interfaces/certmgr.h"
 #include "src/interfaces/cgroup.h"
+#include "src/interfaces/compress.h"
 #include "src/interfaces/conn.h"
 #include "src/interfaces/cred.h"
 #include "src/interfaces/gpu.h"
@@ -123,6 +127,7 @@
 #include "src/interfaces/prep.h"
 #include "src/interfaces/proctrack.h"
 #include "src/interfaces/select.h"
+#include "src/interfaces/serializer.h"
 #include "src/interfaces/switch.h"
 #include "src/interfaces/task.h"
 #include "src/interfaces/topology.h"
@@ -143,11 +148,11 @@ decl_static_data(usage_txt);
 
 uint32_t slurm_daemon = IS_SLURMD;
 
-#define MAX_THREADS		256
-#define DEF_CONMGR_THREAD_COUNT 6
+#define MAX_THREADS 256
+#define DEF_WORKPOOL_THREAD_COUNT 6
 #define TIMEOUT_SIGUSR2 5000000
 #define TIMEOUT_RECONFIG 5000000
-#define SLURMD_CONMGR_DEFAULT_MAX_CONNECTIONS 50
+#define SLURMD_CONMGR_DEFAULT_MAX_CONNECTIONS 512
 #define MAX_THREAD_DELAY_INC ((timespec_t) { .tv_nsec = 1500, })
 #define MAX_THREAD_DELAY_MAX ((timespec_t) { .tv_sec = 1, })
 
@@ -173,6 +178,7 @@ typedef struct {
 	int magic; /* SERVICE_MSG_ARGS_MAGIC */
 	timespec_t delay;
 	slurm_msg_t *msg;
+	slurmd_rpc_t *this_rpc;
 } service_msg_args_t;
 
 /*
@@ -181,6 +187,15 @@ typedef struct {
 static int             active_threads = 0;
 static pthread_mutex_t active_mutex   = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  active_cond    = PTHREAD_COND_INITIALIZER;
+
+/*
+ * count of detached threads servicing new_thread RPCs. Not gated by
+ * MAX_THREADS (concurrency is intentionally unbounded); tracked only so
+ * shutdown/reconfigure can wait for in-flight script handlers to finish.
+ */
+static int active_script_threads = 0;
+static pthread_mutex_t script_mutex = PTHREAD_MUTEX_INITIALIZER;
+static event_signal_t script_event = EVENT_INITIALIZER("SCRIPT_THREADS");
 
 /*
  * Global data for resource specialization
@@ -224,7 +239,7 @@ static int       _core_spec_init(void);
 static void _create_msg_socket(void);
 static void      _decrement_thd_count(void);
 static void      _destroy_conf(void);
-static void      _fill_registration_msg(slurm_node_registration_status_msg_t *);
+static void _fill_registration_msg(slurm_node_registration_status_msg_t *);
 static int _increment_thd_count(bool block);
 static void      _init_conf(void);
 static int       _memory_spec_init(void);
@@ -249,7 +264,6 @@ static void      _usage(void);
 static int       _validate_and_convert_cpu_list(void);
 static void      _wait_for_all_threads(int secs);
 static void _wait_on_old_slurmd(bool kill_it);
-static void *_service_msg(void *arg);
 
 /**************************************************************************\
  * To test for memory leaks, set MEMORY_LEAK_DEBUG to 1 using
@@ -344,6 +358,14 @@ static void _on_sigpipe(conmgr_callback_args_t conmgr_args, void *arg)
 	info("Caught SIGPIPE. Ignoring.");
 }
 
+static void _on_sigprof(conmgr_callback_args_t conmgr_args, void *arg)
+{
+	if (conmgr_args.status == CONMGR_WORK_STATUS_CANCELLED)
+		return;
+
+	(void) probe_run(true, NULL, NULL, __func__);
+}
+
 static probe_status_t _probe_listener(probe_log_t *log, void *arg)
 {
 	probe_status_t status = PROBE_RC_UNKNOWN;
@@ -394,6 +416,7 @@ main (int argc, char **argv)
 
 	probe_init();
 	probe_register("rpc-listeners", _probe_listener, NULL);
+	closeall_init();
 
 	if (original) {
 		/*
@@ -453,8 +476,8 @@ main (int argc, char **argv)
 	info("slurmd version %s started", SLURM_VERSION_STRING);
 	debug3("finished daemonize");
 
-	conmgr_init(0, DEF_CONMGR_THREAD_COUNT,
-		    SLURMD_CONMGR_DEFAULT_MAX_CONNECTIONS);
+	workerpool_init(0, DEF_WORKPOOL_THREAD_COUNT, slurm_conf.slurmd_params);
+	conmgr_init(SLURMD_CONMGR_DEFAULT_MAX_CONNECTIONS);
 
 	conmgr_add_work_signal(SIGINT, _on_sigint, NULL);
 	conmgr_add_work_signal(SIGTERM, _on_sigterm, NULL);
@@ -462,6 +485,7 @@ main (int argc, char **argv)
 	conmgr_add_work_signal(SIGHUP, _on_sighup, NULL);
 	conmgr_add_work_signal(SIGUSR2, _on_sigusr2, NULL);
 	conmgr_add_work_signal(SIGPIPE, _on_sigpipe, NULL);
+	conmgr_add_work_signal(SIGPROF, _on_sigprof, NULL);
 
 	if ((oom_value = getenv("SLURMD_OOM_ADJ"))) {
 		int i = atoi(oom_value);
@@ -490,7 +514,7 @@ main (int argc, char **argv)
 	if (namespace_g_init() < 0)
 		fatal("Unable to initialize namespace plugin.");
 	if (namespace_g_restore(conf->spooldir, !conf->cleanstart))
-		error("Unable to restore job_container state.");
+		error("Unable to restore namespace state.");
 	if (prep_g_init(NULL) != SLURM_SUCCESS)
 		fatal("failed to initialize prep plugin");
 	if (switch_g_init(false) < 0)
@@ -507,6 +531,8 @@ main (int argc, char **argv)
 	    conf->binary[0])
 		fatal("%s: Unable to reliably execute %s",
 		      __func__, conf->binary);
+
+	forward_init();
 
 	plugins_registered = true;
 
@@ -548,8 +574,9 @@ main (int argc, char **argv)
 
 	conmgr_run(false);
 
-	if (original)
-		run_script_health_check();
+	if (original &&
+	    !(slurm_conf.health_check_node_state & HEALTH_CHECK_REBOOT_ONLY))
+		run_script_health_check(HC_HEALTH_UNKNOWN);
 
 	record_launched_jobs();
 
@@ -588,6 +615,7 @@ main (int argc, char **argv)
 	_destroy_conf();
 	cred_g_fini();	/* must be after _destroy_conf() */
 	group_cache_purge();
+	getnameinfo_cache_purge();
 	file_bcast_purge();
 
 	/*
@@ -599,8 +627,11 @@ main (int argc, char **argv)
 	info("Slurmd shutdown completing");
 
 	conmgr_fini();
+	if (http_switch_http_enabled())
+		http_fini();
 	http_switch_fini();
 	probe_fini();
+	workerpool_fini();
 	log_fini();
 
 	return SLURM_SUCCESS;
@@ -685,17 +716,39 @@ static int _increment_thd_count(bool block)
 	return rc;
 }
 
+/*
+ * Detached new_thread script handlers are not gated by MAX_THREADS; these
+ * only track in-flight handlers so _wait_for_all_threads() can drain them.
+ */
+static void _increment_script_thd_count(void)
+{
+	slurm_mutex_lock(&script_mutex);
+	active_script_threads++;
+	slurm_mutex_unlock(&script_mutex);
+}
+
+static void _decrement_script_thd_count(void)
+{
+	slurm_mutex_lock(&script_mutex);
+	if (active_script_threads > 0)
+		active_script_threads--;
+	EVENT_BROADCAST(&script_event);
+	slurm_mutex_unlock(&script_mutex);
+}
+
 /* secs IN - wait up to this number of seconds for all threads to complete */
 static void
 _wait_for_all_threads(int secs)
 {
 	struct timespec ts;
 	int rc;
+	bool timed_out = false;
 
 	ts.tv_sec  = time(NULL);
 	ts.tv_nsec = 0;
 	ts.tv_sec += secs;
 
+	/* Drain conmgr-worker RPC threads. */
 	slurm_mutex_lock(&active_mutex);
 	while (active_threads > 0) {
 		verbose("waiting on %d active threads", active_threads);
@@ -707,64 +760,160 @@ _wait_for_all_threads(int secs)
 			if (rc == ETIMEDOUT) {
 				error("Timeout waiting for completion of %d threads",
 				      active_threads);
-				slurm_cond_signal(&active_cond);
-				slurm_mutex_unlock(&active_mutex);
-				return;
+				timed_out = true;
+				break;
 			}
 		}
 	}
 	slurm_cond_signal(&active_cond);
 	slurm_mutex_unlock(&active_mutex);
-	verbose("all threads complete");
+
+	/*
+	 * Drain detached new_thread script handlers under the same deadline so
+	 * shutdown/reconfigure never tears down (or exec's) out from under a
+	 * running script. A timeout on active_threads above falls through to
+	 * here rather than returning early. EVENT_WAIT_TIMED() does not surface
+	 * ETIMEDOUT, so re-check the deadline explicitly to avoid spinning once
+	 * it passes.
+	 */
+	slurm_mutex_lock(&script_mutex);
+	while (active_script_threads > 0) {
+		verbose("waiting on %d active script threads",
+			active_script_threads);
+		if (secs == NO_VAL16) { /* Wait forever */
+			EVENT_WAIT(&script_event, &script_mutex);
+		} else {
+			EVENT_WAIT_TIMED(&script_event, ts, &script_mutex);
+			if (timespec_is_after(timespec_now(), ts)) {
+				error("Timeout waiting for completion of %d script threads",
+				      active_script_threads);
+				timed_out = true;
+				break;
+			}
+		}
+	}
+	slurm_mutex_unlock(&script_mutex);
+
+	if (!timed_out)
+		verbose("all threads complete");
 }
 
-static void *_service_msg(void *arg)
+static void _service_msg(conmgr_callback_args_t conmgr_args, void *arg)
 {
 	service_msg_args_t *args = arg;
 	slurm_msg_t *msg = args->msg;
 	const slurm_addr_t *addr = &msg->address;
-	conmgr_fd_ref_t *conmgr_con = NULL;
+	slurmd_rpc_t *this_rpc = args->this_rpc;
+	int rc = EINVAL;
 
 	xassert(args->magic == SERVICE_MSG_ARGS_MAGIC);
 
-	/*
-	 * Remove conmgr connection from msg to avoid msg logic trying to send
-	 * via conmgr instead via msg->conn.
-	 */
-	SWAP(conmgr_con, msg->conmgr_con);
+	if (conmgr_args.status == CONMGR_WORK_STATUS_CANCELLED) {
+		log_flag(NET, "%s: [%pA] RPC servicing cancelled",
+			 __func__, &msg->address);
+		FREE_NULL_CONN(msg->conn);
+		FREE_NULL_MSG(msg);
+		args->magic = ~SERVICE_MSG_ARGS_MAGIC;
+		xfree(args);
+		return;
+	}
 
-	log_flag(NET, "%s: [%s] processing new RPC msg_type[0x%x]=%s connection from %pA",
-		 __func__, conmgr_con_get_name(conmgr_con),
-		 (uint32_t) msg->msg_type, rpc_num2string(msg->msg_type), addr);
+	if ((rc = _increment_thd_count(false))) {
+		xassert(rc == EWOULDBLOCK);
 
-	log_flag(AUDIT_RPCS, "[%s] msg_type=%s uid=%u client=[%pA] protocol=%u",
-		 conmgr_con_get_name(conmgr_con), rpc_num2string(msg->msg_type),
-		 msg->auth_uid, addr, msg->protocol_version);
+		/*
+		 * Servicing the connection will be deferred which means the
+		 * thread count should no longer consider processing this
+		 * connection until the delay is complete and this function is
+		 * called again.
+		 */
+		_decrement_thd_count();
 
-	/* Release conmgr connection as it will have been closed */
-	CONMGR_CON_UNLINK(msg->conmgr_con);
-	slurmd_req(msg);
+		/*
+		 * Backoff attempts to avoid needless lock contention while
+		 * avoiding having a new thread created
+		 */
+		args->delay = timespec_add(args->delay, MAX_THREAD_DELAY_INC);
+		if (timespec_is_after(args->delay, MAX_THREAD_DELAY_MAX))
+			args->delay = MAX_THREAD_DELAY_MAX;
 
-	conn_g_destroy(msg->conn, true);
-	msg->conn = NULL;
+		warning("%s: [%pA] deferring servicing connection for %s",
+			__func__, &args->msg->address,
+			TIMESPEC_STR(args->delay, false));
 
-	log_flag(NET, "%s: [%s] Finish processing RPC msg_type[0x%x]=%s",
-		 __func__, conmgr_con_get_name(conmgr_con),
-		 (uint32_t) msg->msg_type, rpc_num2string(msg->msg_type));
+		if (conmgr_args.ref)
+			conmgr_add_work_con_delayed_fifo(conmgr_args.con,
+							 _service_msg, args,
+							 args->delay.tv_sec,
+							 args->delay.tv_nsec);
+		else
+			conmgr_add_work_delayed_fifo(_service_msg, args,
+						     args->delay.tv_sec,
+						     args->delay.tv_nsec);
 
-	/* Release conmgr connection as it will have been closed */
-	CONMGR_CON_UNLINK(conmgr_con);
+		return;
+	}
 
-	slurm_free_msg(msg);
+	xassert(this_rpc);
+	args->magic = ~SERVICE_MSG_ARGS_MAGIC;
+	xfree(args);
+
+	log_flag(NET, "%s: processing new RPC msg_type[0x%x]=%s connection from %pA",
+		 __func__, (uint32_t) msg->msg_type,
+		 rpc_num2string(msg->msg_type), addr);
+
+	slurmd_req(msg, this_rpc);
+
+	log_flag(NET, "%s: finished processing RPC msg_type[0x%x]=%s",
+		 __func__, (uint32_t) msg->msg_type,
+		 rpc_num2string(msg->msg_type));
+
+	FREE_NULL_CONN(msg->conn);
+	FREE_NULL_MSG(msg);
+
+	_decrement_thd_count();
+}
+
+/*
+ * Detached-thread entry for new_thread RPCs. Runs the handler to completion
+ * off the conmgr worker pool, without taking a MAX_THREADS slot. The fd was
+ * already extracted (msg->conn owns it, msg->conmgr_con is NULL), so the
+ * handler replies via msg->conn. Owns args/msg/conn and frees them here.
+ * The active_script_threads count was incremented by the caller before this
+ * thread was created.
+ */
+static void *_service_msg_thread(void *arg)
+{
+	service_msg_args_t *args = arg;
+	slurm_msg_t *msg = args->msg;
+	const slurm_addr_t *addr = &msg->address;
+	slurmd_rpc_t *this_rpc = args->this_rpc;
+
+	xassert(args->magic == SERVICE_MSG_ARGS_MAGIC);
+	xassert(this_rpc && this_rpc->new_thread);
+	xassert(!msg->conmgr_con && msg->conn);
 
 	args->magic = ~SERVICE_MSG_ARGS_MAGIC;
 	xfree(args);
 
-	_decrement_thd_count();
+	log_flag(NET, "%s: [%pA] processing new RPC msg_type[0x%x]=%s in detached thread",
+		 __func__, addr, (uint32_t) msg->msg_type,
+		 rpc_num2string(msg->msg_type));
+
+	slurmd_req(msg, this_rpc);
+
+	log_flag(NET, "%s: finished processing RPC msg_type[0x%x]=%s",
+		 __func__, (uint32_t) msg->msg_type,
+		 rpc_num2string(msg->msg_type));
+
+	FREE_NULL_CONN(msg->conn);
+	FREE_NULL_MSG(msg);
+
+	_decrement_script_thd_count();
 	return NULL;
 }
 
-static int _load_gres()
+static int _load_gres(void)
 {
 	int rc;
 	uint32_t cpu_cnt;
@@ -1430,9 +1579,6 @@ static void *_try_to_reconfig(void *ptr)
 	int close_skip[] = { -1, -1, -1, -1 }, skip_index = 0, auth_fd = -1;
 	DEF_TIMERS;
 
-	if ((auth_fd = auth_g_get_reconfig_fd(AUTH_PLUGIN_SLURM)) >= 0)
-		close_skip[skip_index++] = auth_fd;
-
 	conmgr_quiesce(__func__);
 
 	START_TIMER;
@@ -1470,6 +1616,10 @@ static void *_try_to_reconfig(void *ptr)
 		close_skip[skip_index++] = conf->lfd;
 		debug3("%s: retaining listener socket fd:%d", __func__, conf->lfd);
 	}
+
+	if ((auth_fd = auth_g_prepare_reconfig_fd(AUTH_PLUGIN_SLURM,
+						  &child_env)) >= 0)
+		close_skip[skip_index++] = auth_fd;
 
 	if (!conf->daemonize && !under_systemd)
 		goto start_child;
@@ -1597,6 +1747,7 @@ _print_conf(void)
 
 	debug3("Logfile     = `%s'",     conf->logfile);
 	debug3("HealthCheck = `%s'",     cf->health_check_program);
+	debug3("HealthCheckTimeout = %u", cf->health_check_timeout);
 	debug3("NodeName    = %s",       conf->node_name);
 	debug3("Port        = %u",       conf->port);
 
@@ -2007,7 +2158,7 @@ static void *_on_listen_connect(conmgr_callback_args_t conmgr_args, void *arg)
 	}
 	slurm_mutex_unlock(&listen_mutex);
 
-	slurmd_req(NULL);	/* initialize timer */
+	slurmd_req(NULL, NULL); /* initialize timer */
 
 	return con;
 }
@@ -2028,70 +2179,42 @@ static void _on_listen_finish(conmgr_callback_args_t conmgr_args, void *arg)
 	conf->lfd = -1;
 }
 
-/* Try to process connection if thread max has not been hit */
-static void _try_service_msg(conmgr_callback_args_t conmgr_args, void *arg)
+static void _on_extract(conmgr_callback_args_t conmgr_args, conn_t *conn,
+			void *arg)
 {
 	service_msg_args_t *args = arg;
-	int rc = SLURM_ERROR;
+	slurm_msg_t *msg = args->msg;
 
 	xassert(args->magic == SERVICE_MSG_ARGS_MAGIC);
-
-	if (!(rc = _increment_thd_count(false))) {
-		log_flag(NET, "%s: [%s] detaching new thread for RPC connection",
-			 __func__, conmgr_fd_get_name(conmgr_args.con));
-
-		slurm_thread_create_detached(NULL, _service_msg, args);
-	} else {
-		xassert(rc == EWOULDBLOCK);
-
-		/*
-		 * Servicing the connection will be deferred which means the
-		 * thread count should no longer consider processing this
-		 * connection until the delay is complete and this function is
-		 * called again.
-		 */
-		_decrement_thd_count();
-
-		log_flag(NET, "%s: [%pA] deferring servicing connection",
-			 __func__, &args->msg->address);
-
-		/*
-		 * Backoff attempts to avoid needless lock contention while
-		 * avoiding having a new thread created
-		 */
-		args->delay = timespec_add(args->delay, MAX_THREAD_DELAY_INC);
-		if (timespec_is_after(args->delay, MAX_THREAD_DELAY_MAX))
-			args->delay = MAX_THREAD_DELAY_MAX;
-
-		conmgr_add_work_con_delayed_fifo(conmgr_args.con,
-						 _try_service_msg, args,
-						 args->delay.tv_sec,
-						 args->delay.tv_sec);
-	}
-}
-
-static void _on_extract_fd(conmgr_callback_args_t conmgr_args, conn_t *conn,
-			   void *arg)
-{
-	service_msg_args_t *args = NULL;
-	slurm_msg_t *msg = arg;
-
+	xassert(!msg->conmgr_con);
 	xassert(!msg->conn || (msg->conn == conn));
 	msg->conn = conn;
 
 	if (conmgr_args.status == CONMGR_WORK_STATUS_CANCELLED) {
-		log_flag(NET, "%s: [%s] connection work cancelled",
-			 __func__, conmgr_con_get_name(msg->conmgr_con));
+		log_flag(NET, "%s: [%pA] connection work cancelled",
+			 __func__, &msg->address);
 		FREE_NULL_CONN(msg->conn);
 		FREE_NULL_MSG(msg);
+		args->magic = ~SERVICE_MSG_ARGS_MAGIC;
+		xfree(args);
 		return;
 	}
 
-	args = xmalloc(sizeof(*args));
-	args->magic = SERVICE_MSG_ARGS_MAGIC;
-	args->msg = msg;
+	if (args->this_rpc->new_thread) {
+		/*
+		 * Ownership of args (and thus msg + the extracted msg->conn)
+		 * passes to the detached thread. Increment here, on the conmgr
+		 * worker, before spawning: conmgr_quiesce()/conmgr_run() only
+		 * return once no worker is active, so the count is guaranteed
+		 * visible to _wait_for_all_threads() before shutdown/reconfig
+		 * can proceed. The thread is not gated by MAX_THREADS.
+		 */
+		_increment_script_thd_count();
+		slurm_thread_create_detached(NULL, _service_msg_thread, args);
+		return;
+	}
 
-	_try_service_msg(conmgr_args, args);
+	_service_msg(conmgr_args, args);
 }
 
 static void *_on_connection(conmgr_callback_args_t conmgr_args, void *arg)
@@ -2108,6 +2231,8 @@ static int _on_msg(conmgr_callback_args_t conmgr_args, slurm_msg_t *msg,
 		   int unpack_rc, void *arg)
 {
 	conmgr_fd_t *con = conmgr_args.con;
+	slurmd_rpc_t *this_rpc = NULL;
+	service_msg_args_t *args = NULL;
 	int rc = SLURM_SUCCESS;
 
 	if ((unpack_rc == SLURM_PROTOCOL_AUTHENTICATION_ERROR) ||
@@ -2119,16 +2244,13 @@ static int _on_msg(conmgr_callback_args_t conmgr_args, slurm_msg_t *msg,
 		 */
 		msg->flags |= SLURM_NO_AUTH_CRED;
 		slurm_send_rc_msg(msg, SLURM_PROTOCOL_AUTHENTICATION_ERROR);
-		slurm_free_msg(msg);
-		conmgr_queue_close_fd(con);
-		return SLURM_SUCCESS;
+		goto cleanup;
 	} else if (unpack_rc) {
 		error("%s: [%s] rejecting malformed RPC and closing connection: %s",
 		      __func__, conmgr_fd_get_name(con),
 		      slurm_strerror(unpack_rc));
-		slurm_free_msg(msg);
-		conmgr_queue_close_fd(con);
-		return unpack_rc;
+		rc = unpack_rc;
+		goto cleanup;
 	}
 
 	if (!msg->auth_ids_set)
@@ -2138,13 +2260,36 @@ static int _on_msg(conmgr_callback_args_t conmgr_args, slurm_msg_t *msg,
 		 conmgr_fd_get_name(con), rpc_num2string(msg->msg_type),
 		 msg->auth_uid, &msg->address, msg->protocol_version);
 
-	if ((rc = conmgr_queue_extract_con_fd(con, _on_extract_fd,
-					      XSTRINGIFY(_on_extract_fd),
-							 msg))) {
-		error("%s: [%s] Extracting FDs failed: %s",
-		      __func__, conmgr_fd_get_name(con), slurm_strerror(rc));
+	if (!(this_rpc = find_rpc(msg->msg_type))) {
+		error("%s: invalid request for msg_type %u",
+		      __func__, msg->msg_type);
+		rc = slurm_send_rc_msg(msg, EINVAL);
+		goto cleanup;
 	}
 
+	args = xmalloc(sizeof(*args));
+	*args = (service_msg_args_t) {
+		.magic = SERVICE_MSG_ARGS_MAGIC,
+		.msg = msg,
+		.this_rpc = this_rpc,
+	};
+
+	CONMGR_CON_UNLINK(msg->conmgr_con);
+
+	if ((rc = conmgr_queue_extract_con_fd(con, _on_extract,
+					      XSTRINGIFY(_on_extract), args))) {
+		error("%s: [%s] Extracting FDs failed: %s",
+		      __func__, conmgr_fd_get_name(con), slurm_strerror(rc));
+		args->magic = ~SERVICE_MSG_ARGS_MAGIC;
+		xfree(args);
+		goto cleanup;
+	}
+
+	return rc;
+
+cleanup:
+	slurm_free_msg(msg);
+	conmgr_queue_close_fd(con);
 	return rc;
 }
 
@@ -2176,8 +2321,7 @@ static void _create_msg_socket(void)
 	int rc;
 	static const conmgr_con_flags_t flags =
 		(CON_FLAG_RPC_RECV_FORWARD | CON_FLAG_RPC_KEEP_BUFFER |
-		 CON_FLAG_QUIESCE | CON_FLAG_WATCH_WRITE_TIMEOUT |
-		 CON_FLAG_WATCH_READ_TIMEOUT | CON_FLAG_WATCH_CONNECT_TIMEOUT);
+		 CON_FLAG_QUIESCE);
 
 	if (getenv("SLURMD_RECONF_LISTEN_FD")) {
 		conf->lfd = atoi(getenv("SLURMD_RECONF_LISTEN_FD"));
@@ -2187,7 +2331,7 @@ static void _create_msg_socket(void)
 	}
 
 	if ((rc = conmgr_process_fd_listen(conf->lfd, http_switch_con_type(),
-					   &events,
+					   NULL, &events,
 					   (flags | http_switch_con_flags()),
 					   NULL)))
 		fatal("%s: unable to process fd:%d error:%s",
@@ -2441,6 +2585,69 @@ static void _validate_dynamic_conf(void)
 	}
 }
 
+static void _insert_gpu_conf(char **tmp)
+{
+	char *gres_ptr = NULL;
+	char *gpu_gres_str = NULL;
+	uint32_t cpu_cnt = MAX(conf->actual_cpus, conf->block_map_size);
+	node_config_load_t node_conf = {
+		.cpu_cnt = cpu_cnt,
+		.in_slurmd = true,
+		.gres_name = "gpu",
+		.xcpuinfo_mac_to_abs = xcpuinfo_mac_to_abs,
+	};
+
+	if (conf->dynamic_conf &&
+	    (gres_ptr = xstrcasestr(conf->dynamic_conf, "Gres="))) {
+		char *gres_end = strchr(gres_ptr, ' ');
+
+		if (gres_end)
+			*gres_end = '\0';
+		if (xstrcasestr(gres_ptr, "gpu:")) {
+			if (gres_end)
+				*gres_end = ' ';
+			return; /* GPU GRES already exists */
+		}
+		if (gres_end)
+			*gres_end = ' ';
+	}
+
+	/* Parse gres.conf so autofill honors admin settings. */
+	(void) gres_parse_conf(conf->node_name, cpu_cnt);
+
+	gpu_gres_str = gres_get_dynamic_gpu_str(node_conf);
+	if (!gpu_gres_str)
+		return; /* No GPU GRES found */
+
+	verbose("Autodetected Gres for dynamic node %s: %s",
+	        conf->node_name, gpu_gres_str);
+
+	if (gres_ptr) {
+		char *gres_end = strchr(gres_ptr, ' ');
+		char *new_dynamic_conf = NULL;
+
+		/*
+		 * If Gres= is already present, append the GPU GRES to
+		 * conf->dynamic_conf instead of *tmp like normal
+		 */
+		if (gres_end) {
+			*gres_end = '\0';
+			xstrfmtcat(new_dynamic_conf, "%s,%s %s",
+				   conf->dynamic_conf, gpu_gres_str,
+				   gres_end + 1);
+			*gres_end = ' ';
+		} else {
+			xstrfmtcat(new_dynamic_conf, "%s,%s",
+				   conf->dynamic_conf, gpu_gres_str);
+		}
+		xfree(conf->dynamic_conf);
+		conf->dynamic_conf = new_dynamic_conf;
+	} else {
+		xstrfmtcat(*tmp, "Gres=%s ", gpu_gres_str);
+	}
+	xfree(gpu_gres_str);
+}
+
 static void _dynamic_init(void)
 {
 	if (!conf->dynamic_type)
@@ -2513,6 +2720,8 @@ static void _dynamic_init(void)
 			xstrfmtcat(tmp, "RealMemory=%"PRIu64" ",
 				   conf->physical_memory_size);
 
+		_insert_gpu_conf(&tmp);
+
 		if (conf->dynamic_conf)
 			xstrcat(tmp, conf->dynamic_conf);
 
@@ -2533,7 +2742,7 @@ static void _dynamic_init(void)
 	slurm_mutex_unlock(&conf->config_mutex);
 }
 
-static void _log_setup()
+static void _log_setup(void)
 {
 	slurm_conf_t *cf = NULL;
 
@@ -2671,6 +2880,8 @@ _slurmd_init(void)
 		return SLURM_ERROR;
 	if (conn_g_init() != SLURM_SUCCESS)
 		return SLURM_ERROR;
+	if (serializer_g_init() != SLURM_SUCCESS)
+		fatal("Failed to initialize serialization plugins.");
 
 	_dynamic_init();
 
@@ -2745,6 +2956,8 @@ _slurmd_init(void)
 		return SLURM_ERROR;
 	if (cred_g_init() != SLURM_SUCCESS)
 		return SLURM_ERROR;
+	if (compress_g_init() != SLURM_SUCCESS)
+		return SLURM_ERROR;
 
 	if (getrlimit(RLIMIT_CPU, &rlim) == 0) {
 		rlim.rlim_cur = rlim.rlim_max;
@@ -2796,6 +3009,7 @@ _slurmd_fini(void)
 {
 	int rc;
 
+	compress_g_fini();
 	assoc_mgr_fini(false);
 	mpi_fini();
 	node_features_g_fini();
@@ -2815,7 +3029,8 @@ _slurmd_fini(void)
 	topology_g_destroy_config();
 	topology_g_fini();
 	job_mem_limit_fini();
-	slurmd_req(NULL);	/* purge memory allocated by slurmd_req() */
+	slurmd_req(NULL, NULL); /* purge memory allocated by slurmd_req() */
+	forward_fini();
 	conn_g_fini();
 	if ((rc = spank_slurmd_exit())) {
 		error("%s: SPANK slurmd exit failed: %s",
@@ -2825,6 +3040,7 @@ _slurmd_fini(void)
 	_resource_spec_fini();
 	namespace_g_fini();
 	acct_gather_conf_destroy();
+	serializer_g_fini();
 	fini_system_cgroup();
 	cgroup_g_fini();
 	slurm_mutex_lock(&cached_features_mutex);
@@ -2937,7 +3153,7 @@ extern void update_slurmd_logging(log_level_t log_lvl)
 		o->syslog_level = LOG_LEVEL_FATAL;
 
 	log_alter(conf->log_opts, SYSLOG_FACILITY_DAEMON, conf->logfile);
-	log_set_timefmt(cf->log_fmt);
+	log_set_timefmt(cf->log_fmt, cf->log_flags);
 
 	/*
 	 * If logging to syslog and running in
@@ -3021,7 +3237,6 @@ static int _core_spec_init(void)
 	pid_t pid;
 	bool slurmd_off_spec;
 	bitstr_t *res_mac_bitmap;
-	cpu_set_t mask;
 
 	if ((conf->core_spec_cnt == 0) && (conf->cpu_spec_list == NULL)) {
 		debug("Resource spec: No specialized cores configured by "
@@ -3099,23 +3314,25 @@ static int _core_spec_init(void)
 			return SLURM_ERROR;
 		}
 	} else {
+		xcpuset_t *mask = xcpuset_alloc();
 		res_mac_bitmap = bit_alloc(ncpus);
 		bit_unfmt(res_mac_bitmap, res_mac_cpus);
-		CPU_ZERO(&mask);
 		for (i = 0; i < ncpus; i++) {
 			bool cpu_in_spec = bit_test(res_mac_bitmap, i);
 			if (slurmd_off_spec != cpu_in_spec) {
-				CPU_SET(i, &mask);
+				XCPU_SET(i, mask);
 			}
 		}
 		FREE_NULL_BITMAP(res_mac_bitmap);
 
-		if ((rval = slurm_setaffinity(pid, sizeof(mask), &mask))) {
+		if ((rval = xsetaffinity(pid, mask))) {
 			error("Resource spec: unable to establish slurmd CPU "
 			      "affinity: %m");
 			_resource_spec_fini();
+			xfree(mask);
 			return SLURM_ERROR;
 		}
+		xfree(mask);
 	}
 
 	info("Resource spec: Reserved abstract CPU IDs: %s", res_abs_cpus);
@@ -3318,19 +3535,22 @@ static void _resource_spec_fini(void)
 /*
  * Run the configured health check program
  *
- * Returns the run result. If the health check program
- * is not defined, returns success immediately.
+ * IN node_health - ctld's view of node health; exported to the program as
+ *     SLURM_NODE_IS_HEALTHY={yes,no} when known
+ * RET run result, or SLURM_SUCCESS if no health check program is configured
  */
-extern int run_script_health_check(void)
+extern int run_script_health_check(hc_node_health_t node_health)
 {
 	int rc = SLURM_SUCCESS;
 
 	if (slurm_conf.health_check_program &&
 	    (slurm_conf.health_check_interval ||
-	     (slurm_conf.health_check_node_state & HEALTH_CHECK_START_ONLY))) {
+	     (slurm_conf.health_check_node_state & HEALTH_CHECK_START_ONLY) ||
+	     (slurm_conf.health_check_node_state & HEALTH_CHECK_REBOOT_ONLY))) {
 		char **env = env_array_create();
 		char *cmd_argv[2];
 		char *resp = NULL;
+
 		/*
 		 * We can point script_argv to cmd_argv now (before setting
 		 * values inside cmd_argv) since cmd_argv is on the stack
@@ -3338,7 +3558,7 @@ extern int run_script_health_check(void)
 		 */
 		run_command_args_t run_command_args = {
 			.job_id = 0, /* implicit job_id = 0 */
-			.max_wait = 60 * 1000,
+			.max_wait = slurm_conf.health_check_timeout * 1000,
 			.script_argv = cmd_argv,
 			.script_path = slurm_conf.health_check_program,
 			.script_type = "health_check",
@@ -3349,6 +3569,10 @@ extern int run_script_health_check(void)
 		cmd_argv[1] = NULL;
 
 		setenvf(&env, "SLURMD_NODENAME", "%s", conf->node_name);
+		if (node_health != HC_HEALTH_UNKNOWN)
+			setenvf(&env, "SLURM_NODE_IS_HEALTHY", "%s",
+				(node_health == HC_HEALTH_HEALTHY) ? "yes" :
+								     "no");
 		/*
 		 * We need to set the pointer after we alter or we may be
 		 * pointing to the wrong place otherwise.

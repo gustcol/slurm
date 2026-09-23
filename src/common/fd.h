@@ -48,6 +48,11 @@
 #include "src/common/macros.h"
 
 /*
+ * Locate close_range() if available so closeall() can use it.
+ */
+extern void closeall_init(void);
+
+/*
  * Close all FDs >= a specified value
  * NOTE: logging file descriptors will be skipped
  * WARNING: Will skip close()ing any open logging file descriptors
@@ -162,6 +167,20 @@ extern char *fd_resolve_path(int fd);
 extern char *fd_resolve_peer(int fd);
 
 /*
+ * Get peer address for a given socket (fd) as a string.
+ *
+ * Unlike fd_resolve_peer(), this does not perform a reverse DNS lookup;
+ * the result is an IP literal (or unix path) only. Prefer this on hot
+ * paths where the resolved hostname is not actually consumed.
+ *
+ * Explicitly preserves value of errno.
+ *
+ * IN fd - file descriptor to query
+ * RET ptr to a peer address (must xfree()) or NULL on failure
+ */
+extern char *fd_get_peer(int fd);
+
+/*
  * Set inline Out of Band (OOB) data on socket fd
  */
 extern void fd_set_oob(int fd, int value);
@@ -235,5 +254,17 @@ extern int fd_get_buffered_output_bytes(int fd, int *bytes_ptr,
  * RET NO_VAL on failure or >0 for MSS of socket
  */
 extern int fd_get_maxmss(int fd, const char *con_name);
+
+#define FCNTL_MODES_STR_BYTES 512
+
+/*
+ * Dump output of fcntl(F_GETFL) as string
+ * IN modes flags from fcntl(F_GETFL)
+ * IN str - string to populate
+ * IN bytes - number of bytes in str (should be >= FCNTL_MODES_STR_BYTES)
+ * RET access type as string
+ */
+extern const char *fcntl_modes_to_string(const int modes, char *str,
+					 size_t bytes);
 
 #endif /* !_FD_H */

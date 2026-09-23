@@ -56,6 +56,7 @@
 
 #include "src/common/daemonize.h"
 #include "src/common/fd.h"
+#include "src/common/forward.h"
 #include "src/common/log.h"
 #include "src/common/proc_args.h"
 #include "src/common/read_config.h"
@@ -65,6 +66,7 @@
 #include "src/common/slurm_time.h"
 #include "src/common/threadpool.h"
 #include "src/common/uid.h"
+#include "src/common/workerpool.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
 
@@ -228,6 +230,7 @@ int main(int argc, char **argv)
 	assoc_init_args_t assoc_init_arg;
 
 	_init_config();
+	closeall_init();
 	log_init(argv[0], log_opts, LOG_DAEMON, NULL);
 	if (read_slurmdbd_conf())
 		exit(1);
@@ -257,7 +260,8 @@ int main(int argc, char **argv)
 	_init_pidfile();
 	become_slurm_user();
 
-	conmgr_init(0, 0, 0);
+	workerpool_init(0, 0, NULL);
+	conmgr_init(0);
 
 	_register_signal_handlers();
 
@@ -293,6 +297,8 @@ int main(int argc, char **argv)
 #endif /* PR_SET_DUMPABLE */
 
 	registered_clusters = list_create(NULL);
+
+	forward_init();
 
 	slurm_thread_create(NULL, &commit_handler_thread, _commit_handler,
 			    NULL);
@@ -388,8 +394,11 @@ int main(int argc, char **argv)
 	/* Daemon termination handled here */
 
 end_it:
+	conmgr_request_shutdown();
 
 	slurm_thread_join(commit_handler_thread);
+
+	forward_fini();
 
 	acct_storage_g_commit(db_conn, 1);
 	acct_storage_g_close_connection(&db_conn);
@@ -409,6 +418,7 @@ end_it:
 		_restart_self(argc, argv);
 	}
 
+	conmgr_fini();
 	assoc_mgr_fini(0);
 	acct_storage_g_fini();
 	auth_g_fini();
@@ -420,19 +430,35 @@ end_it:
 	rpc_stats = NULL;
 	slurm_mutex_unlock(&rpc_mutex);
 
-	conmgr_fini();
+	workerpool_fini();
 	log_fini();
 	return SLURM_SUCCESS;
 }
 
 extern void *reconfig(void *arg)
 {
+	char *prev_ser_params = xstrdup(slurmdbd_conf->serializer_params);
+	char *prev_ser_plugins = xstrdup(slurmdbd_conf->serializer_plugins);
+
 	conmgr_quiesce(__func__);
 
 	read_slurmdbd_conf();
 	assoc_mgr_set_missing_uids(NULL);
 	acct_storage_g_reconfig(NULL, 0);
 	_update_logging(false);
+
+	/*
+	 * Serializer plugins are loaded once, on the first serializer_g_init().
+	 * The new values are stored and reported by 'sacctmgr show config', so
+	 * warn rather than let that silently imply they took effect.
+	 */
+	if (xstrcmp(prev_ser_params, slurmdbd_conf->serializer_params))
+		warning("SerializerParameters changed. Restart slurmdbd for the new value to take effect.");
+	if (xstrcmp(prev_ser_plugins, slurmdbd_conf->serializer_plugins))
+		warning("SerializerPlugins changed. Restart slurmdbd for the new value to take effect.");
+
+	xfree(prev_ser_params);
+	xfree(prev_ser_plugins);
 
 	conmgr_unquiesce(__func__);
 
@@ -725,7 +751,7 @@ static void _update_logging(bool startup)
 		log_opts.syslog_level = LOG_LEVEL_FATAL;
 
 	log_alter(log_opts, SYSLOG_FACILITY_DAEMON, slurmdbd_conf->log_file);
-	log_set_timefmt(slurm_conf.log_fmt);
+	log_set_timefmt(slurm_conf.log_fmt, slurm_conf.log_flags);
 	if (startup && slurmdbd_conf->log_file) {
 		int rc;
 		gid_t slurm_user_gid;
@@ -953,7 +979,7 @@ static void *_commit_handler(void *db_conn)
 			itr = list_iterator_create(registered_clusters);
 			while ((slurmdbd_conn = list_next(itr))) {
 				debug4("running commit for %s",
-				       slurmdbd_conn->pcon->cluster_name);
+				       slurmdbd_conn->cluster_name);
 				acct_storage_g_commit(
 					slurmdbd_conn->db_conn, 1);
 			}

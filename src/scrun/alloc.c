@@ -45,6 +45,7 @@
 #include "src/common/slurm_protocol_defs.h"
 #include "src/common/spank.h"
 #include "src/common/uid.h"
+#include "src/common/workerpool.h"
 #include "src/common/xassert.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
@@ -215,7 +216,7 @@ static void _script_env(void)
 #undef _set_env
 #undef _set_env_args
 
-static int _stage_in()
+static int _stage_in(void)
 {
 	int rc;
 
@@ -249,6 +250,17 @@ static void *_on_connection(conmgr_callback_args_t conmgr_args, void *arg)
 	conmgr_fd_t *con = conmgr_args.con;
 
 	debug("%s:[%s] new srun connection",
+	      __func__, conmgr_fd_get_name(con));
+
+	/* must return !NULL or connection will be closed */
+	return con;
+}
+
+static void *_on_listen_connect(conmgr_callback_args_t conmgr_args, void *arg)
+{
+	conmgr_fd_t *con = conmgr_args.con;
+
+	debug("%s:[%s] opened listener connection",
 	      __func__, conmgr_fd_get_name(con));
 
 	/* must return !NULL or connection will be closed */
@@ -351,9 +363,24 @@ static void _on_finish(conmgr_callback_args_t conmgr_args, void *arg)
 
 	xassert(con == arg);
 
-	if (get_log_level() > LOG_LEVEL_DEBUG) {
+	if (get_log_level() >= LOG_LEVEL_DEBUG) {
 		read_lock_state();
 		debug("%s: [%s] closed srun connection state=%s",
+		      __func__, conmgr_fd_get_name(con),
+		      slurm_container_status_to_str(state.status));
+		unlock_state();
+	}
+}
+
+static void _on_listen_finish(conmgr_callback_args_t conmgr_args, void *arg)
+{
+	conmgr_fd_t *con = conmgr_args.con;
+
+	xassert(con == arg);
+
+	if (get_log_level() >= LOG_LEVEL_DEBUG) {
+		read_lock_state();
+		debug("%s: [%s] closed listener connection, state=%s",
 		      __func__, conmgr_fd_get_name(con),
 		      slurm_container_status_to_str(state.status));
 		unlock_state();
@@ -368,31 +395,26 @@ static uint32_t _setup_listener(void)
 {
 	static const conmgr_events_t events = {
 		.on_connection = _on_connection,
-		.on_msg = _on_msg,
 		.on_finish = _on_finish,
+		.on_listen_connect = _on_listen_connect,
+		.on_listen_finish = _on_listen_finish,
+		.on_msg = _on_msg,
 	};
-	uint16_t *ports;
 	uint16_t port = 0;
 	int fd = -1;
 	int rc;
 
-	if ((ports = slurm_get_srun_port_range())) {
-		if (net_stream_listen_ports(&fd, &port,
-					    slurm_get_srun_port_range(),
-					    false) < 0)
-			fatal("%s: unable to open local listening port. Try increasing range of SrunPortRange in slurm.conf.",
-			      __func__);
-	} else {
-		if (net_stream_listen(&fd, &port) < 0)
-			fatal("%s: unable to open local listening port",
+	if (slurm_init_msg_engine_srun_ports(&fd, &port) != SLURM_SUCCESS) {
+		fatal("%s: unable to open local listening port. Try increasing range of SrunPortRange in slurm.conf.",
 			      __func__);
 	}
 
 	xassert(port > 0);
 	debug("%s: listening for srun RPCs on port=%hu", __func__, port);
 
-	if ((rc = conmgr_process_fd(CON_TYPE_RPC, fd, fd, &events, CON_FLAG_NONE,
-				    NULL, 0, NULL, NULL)))
+	if ((rc = conmgr_process_fd_listen(fd, CON_TYPE_RPC,
+					   &conmgr_timeouts_disabled, &events,
+					   CON_FLAG_NONE, NULL)))
 		fatal("%s: conmgr refused fd=%d: %s",
 		      __func__, fd, slurm_strerror(rc));
 
@@ -444,7 +466,7 @@ extern void check_allocation(conmgr_callback_args_t conmgr_args, void *arg)
 		      __func__, &state.step_id);
 		unlock_state();
 	}
-	rc = slurm_job_node_ready(step_id.job_id);
+	rc = slurm_job_node_ready(step_id);
 	if ((rc == READY_JOB_ERROR) || (rc == EAGAIN)) {
 		delay *= 2;
 		if ((delay < 0) || (delay > MAX_DELAY))
@@ -479,7 +501,7 @@ extern void check_allocation(conmgr_callback_args_t conmgr_args, void *arg)
 			stop_anchor(rc);
 		} else {
 			/* we have a job now. see if creating is done */
-			conmgr_add_work_fifo(on_allocation, NULL);
+			workerpool_enqueue_normal(on_allocation, NULL);
 		}
 	}
 }
@@ -518,11 +540,10 @@ static void _alloc_job(void)
 	xfree(opt_string);
 
 	desc = slurm_opt_create_job_desc(&opt, true);
-	xfree(desc->name);
 	read_lock_state();
-	desc->name = xstrdup(state.id);
 	desc->container_id = xstrdup(state.id);
 	if (state.spank_job_env) {
+		env_array_free(desc->spank_job_env);
 		desc->spank_job_env =
 			env_array_copy((const char **) state.spank_job_env);
 		desc->spank_job_env_size = envcount(state.spank_job_env);
@@ -537,6 +558,7 @@ static void _alloc_job(void)
 	 */
 	desc->user_id = SLURM_AUTH_NOBODY;
 	desc->group_id = SLURM_AUTH_NOBODY;
+	xfree(desc->name);
 	desc->name = xstrdup("scrun");
 	desc->other_port = _setup_listener();
 
@@ -544,7 +566,7 @@ static void _alloc_job(void)
 	      __func__, (desc->num_tasks == NO_VAL ? 1 : desc->num_tasks),
 	      (desc->min_nodes == NO_VAL ? 1 : desc->min_nodes));
 	alloc = slurm_allocate_resources_blocking(desc, false,
-						  _pending_callback);
+						  _pending_callback, -1);
 	if (!alloc)
 		fatal("Unable to request job allocation: %m");
 	if (alloc->error_code) {
@@ -570,6 +592,7 @@ static void _alloc_job(void)
 
 	/* take job env (if any) for srun calls later */
 	SWAP(state.job_env, alloc->environment);
+	alloc->env_size = envcount(alloc->environment);
 
 	/* apply SPANK env (if any) */
 	for (int i = 0; i < opt.spank_job_env_size; i++) {
@@ -600,13 +623,18 @@ static void _alloc_job(void)
 	slurm_free_resource_allocation_response_msg(alloc);
 }
 
-extern void get_allocation(conmgr_callback_args_t conmgr_args, void *arg)
+extern void get_allocation(const bool shutdown, void *arg)
 {
 	int rc;
 	job_info_msg_t *jobs = NULL;
 	slurm_step_id_t step_id;
 	char *job_id_str = getenv("SLURM_JOB_ID");
 	bool existing_allocation = false;
+
+	if (shutdown) {
+		debug("%s: skipping due to workerpool shutdown", __func__);
+		return;
+	}
 
 	if (job_id_str && job_id_str[0]) {
 		extern char **environ;
@@ -638,7 +666,7 @@ extern void get_allocation(conmgr_callback_args_t conmgr_args, void *arg)
 	}
 
 	/* alloc response is too sparse. get full job info */
-	rc = slurm_load_job(&jobs, step_id.job_id, 0);
+	rc = slurm_load_job(&jobs, step_id, 0);
 	if (rc || !jobs || (jobs->record_count <= 0)) {
 		/* job not found or already died ? */
 		if ((rc == SLURM_ERROR) && errno)
@@ -683,7 +711,7 @@ extern void get_allocation(conmgr_callback_args_t conmgr_args, void *arg)
 		if ((rc = _stage_in()))
 			stop_anchor(rc);
 		else
-			conmgr_add_work_fifo(on_allocation, NULL);
+			workerpool_enqueue_normal(on_allocation, NULL);
 	} else {
 		conmgr_add_work_delayed_fifo(check_allocation, NULL, 0, 1);
 	}

@@ -47,6 +47,7 @@
 #  include <sys/prctl.h>
 #endif
 
+#include <fcntl.h>
 #include <grp.h>
 #include <limits.h>
 #include <poll.h>
@@ -90,6 +91,7 @@
 #include "src/common/strlcpy.h"
 #include "src/common/tres_frequency.h"
 #include "src/common/util-net.h"
+#include "src/common/workerpool.h"
 #include "src/common/x11_util.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
@@ -451,22 +453,22 @@ static int _setup_normal_io(void)
 		int srun_stdout_tasks = -1;
 		int srun_stderr_tasks = -1;
 
-		xassert(srun != NULL);
-
 		/* If I/O is labelled with task num, and if a separate file is
 		   written per node or per task, the I/O needs to be sent
 		   back to the stepd, get a label appended, and written from
 		   the stepd rather than sent back to srun or written directly
 		   from the node.  When a task has ofname or efname == NULL, it
 		   means data gets sent back to the client. */
-		if (step->flags & LAUNCH_LABEL_IO) {
+		if ((step->flags & LAUNCH_LABEL_IO) ||
+		    (step->flags & LAUNCH_LOCAL_IO)) {
+			int file_flags = io_get_file_flags();
+			bool labelio =
+				(step->flags & LAUNCH_LABEL_IO) ? true : false;
 			slurmd_filename_pattern_t outpattern, errpattern;
 			bool same = false;
-			int file_flags;
 
 			io_find_filename_pattern(&outpattern, &errpattern,
 						 &same);
-			file_flags = io_get_file_flags();
 
 			/* Make eio objects to write from the slurmstepd */
 			if (outpattern == SLURMD_ALL_UNIQUE) {
@@ -474,7 +476,7 @@ static int _setup_normal_io(void)
 				for (ii = 0; ii < step->node_tasks; ii++) {
 					rc = io_create_local_client(
 						step->task[ii]->ofname,
-						file_flags, 1,
+						file_flags, labelio,
 						step->task[ii]->id,
 						same ? step->task[ii]->id : -2);
 					if (rc != SLURM_SUCCESS) {
@@ -491,7 +493,8 @@ static int _setup_normal_io(void)
 				/* Open a file for all tasks */
 				rc = io_create_local_client(step->task[0]
 								    ->ofname,
-							    file_flags, 1, -1,
+							    file_flags, labelio,
+							    -1,
 							    same ? -1 : -2);
 				if (rc != SLURM_SUCCESS) {
 					error("Could not open output file %s: %m",
@@ -511,7 +514,8 @@ static int _setup_normal_io(void)
 					     ii < step->node_tasks; ii++) {
 						rc = io_create_local_client(
 							step->task[ii]->efname,
-							file_flags, 1, -2,
+							file_flags, labelio,
+							-2,
 							step->task[ii]->id);
 						if (rc != SLURM_SUCCESS) {
 							error("Could not open error file %s: %m",
@@ -526,7 +530,7 @@ static int _setup_normal_io(void)
 					/* Open a file for all tasks */
 					rc = io_create_local_client(
 						step->task[0]->efname,
-						file_flags, 1, -2, -1);
+						file_flags, labelio, -2, -1);
 					if (rc != SLURM_SUCCESS) {
 						error("Could not open error file %s: %m",
 						      step->task[0]->efname);
@@ -538,7 +542,8 @@ static int _setup_normal_io(void)
 			}
 		}
 
-		if (io_initial_client_connect(srun, srun_stdout_tasks,
+		if (!(step->flags & LAUNCH_LOCAL_IO) &&
+		    io_initial_client_connect(srun, srun_stdout_tasks,
 					      srun_stderr_tasks) < 0) {
 			rc = ESLURMD_IO_ERROR;
 			goto claim;
@@ -627,8 +632,17 @@ static int _send_exit_msg(uint32_t *tid, int n, int status)
 
 		slurm_msg_set_r_uid(&resp, srun->uid);
 
-		if (_send_srun_resp_msg(&resp, step->nnodes) != SLURM_SUCCESS)
+		if (_send_srun_resp_msg(&resp, step->nnodes) != SLURM_SUCCESS) {
 			error("Failed to send MESSAGE_TASK_EXIT: %m");
+			/*
+			 * Backstop for an attached (sattach) client that went
+			 * away without its IO connection closing: clear its
+			 * resp_addr so it is not retried on later messages.
+			 */
+			if (srun->attached)
+				memset(&srun->resp_addr, 0,
+				       sizeof(srun->resp_addr));
+		}
 	}
 	list_iterator_destroy(i);
 
@@ -902,16 +916,30 @@ extern void stepd_send_step_complete_msgs(void)
 	slurm_mutex_unlock(&step_complete.lock);
 }
 
-extern void set_job_state(slurmstepd_state_t new_state)
+extern void set_job_state_from(slurmstepd_state_t new_state, const char *caller)
 {
 	slurm_mutex_lock(&step->state_mutex);
+	debug2("%s: setting step state %s -> %s",
+	       caller, stepd_state_2str(step->state),
+	       stepd_state_2str(new_state));
 	step->state = new_state;
 	slurm_cond_signal(&step->state_cond);
 	slurm_mutex_unlock(&step->state_mutex);
 }
 
+extern slurmstepd_state_t get_job_state(void)
+{
+	slurmstepd_state_t state;
+
+	slurm_mutex_lock(&step->state_mutex);
+	state = step->state;
+	slurm_mutex_unlock(&step->state_mutex);
+
+	return state;
+}
+
 /*
- * Run SPANK functions within the job container.
+ * Run SPANK functions within the job namespace.
  * WARNING: This is running as a separate process, but sharing the parent's
  * memory space. Be careful not to leak memory, or free resources that the
  * parent needs to continue processing. Only use _exit() here, otherwise
@@ -1079,7 +1107,7 @@ fail:
 	return rc;
 }
 
-static bool _need_join_container()
+static bool _need_join_container(void)
 {
 	/*
 	 * To avoid potential problems with namespace plugins and
@@ -1110,14 +1138,14 @@ static void _shutdown_x11_forward(void)
 		error("%s: Unable to reclaim privileges", __func__);
 }
 
-static void _x11_signal_handler(conmgr_callback_args_t conmgr_args, void *ignored)
+static void _x11_signal_handler(const bool shutdown, void *arg)
 {
 	static bool run_once = false;
 	static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 	bool bail = false;
 	pid_t cpid, pid;
 
-	if (conmgr_args.status == CONMGR_WORK_STATUS_CANCELLED) {
+	if (shutdown) {
 		debug4("%s: cancelled", __func__);
 		return;
 	}
@@ -1139,15 +1167,11 @@ static void _x11_signal_handler(conmgr_callback_args_t conmgr_args, void *ignore
 
 	debug("Terminate signal (SIGTERM) received");
 
-	if (!_need_join_container()) {
-		_shutdown_x11_forward();
-		return;
-	}
 	if ((cpid = fork()) == 0) {
-		if (namespace_g_join(&step->step_id, step->uid, false) !=
-		    SLURM_SUCCESS) {
-			error("%s: cannot join container",
-			      __func__);
+		if ((_need_join_container()) &&
+		    (namespace_g_join(&step->step_id, step->uid, false) !=
+		     SLURM_SUCCESS)) {
+			error("%s: cannot join namespace", __func__);
 			_exit(1);
 		}
 		_shutdown_x11_forward();
@@ -1155,9 +1179,12 @@ static void _x11_signal_handler(conmgr_callback_args_t conmgr_args, void *ignore
 	} else if (cpid < 0) {
 		error("%s: fork: %m", __func__);
 	} else {
-		int status;
+		int status = 0;
 
-		pid = waitpid(cpid, &status, 0);
+		while (((pid = waitpid(cpid, &status, 0)) < 0) &&
+		       (errno == EINTR))
+			debug2("%s: waitpid() interrupted", __func__);
+
 		if (pid < 0)
 			error("%s: waitpid failed: %m",
 			      __func__);
@@ -1170,7 +1197,14 @@ static void _x11_signal_handler(conmgr_callback_args_t conmgr_args, void *ignore
 	}
 }
 
-static int _set_xauthority(void)
+static void _on_sigterm(conmgr_callback_args_t conmgr_args, void *ignored)
+{
+	_x11_signal_handler((conmgr_args.status ==
+			     CONMGR_WORK_STATUS_CANCELLED),
+			    NULL);
+}
+
+static int _set_xauthority(bool *file_created)
 {
 	struct priv_state sprivs = { 0 };
 	int rc = SLURM_SUCCESS;
@@ -1191,6 +1225,8 @@ static int _set_xauthority(void)
 			goto endit;
 		}
 		close(fd);
+		if (file_created)
+			*file_created = true;
 	}
 
 	if (x11_set_xauth(step->x11_xauthority, step->x11_magic_cookie,
@@ -1262,6 +1298,8 @@ static int _run_prolog_epilog(bool is_epilog)
 static void _setup_x11_child(int to_parent[2])
 {
 	uint32_t len = 0;
+	int rc = SLURM_SUCCESS;
+	bool file_created = false;
 
 	if (namespace_g_join(&step->step_id, step->uid, false) !=
 	    SLURM_SUCCESS) {
@@ -1269,14 +1307,23 @@ static void _setup_x11_child(int to_parent[2])
 		_exit(1);
 	}
 
-	if (_set_xauthority() != SLURM_SUCCESS) {
-		safe_write(to_parent[1], &len, sizeof(len));
-		_exit(1);
-	}
+	rc = _set_xauthority(&file_created);
 
-	len = strlen(step->x11_xauthority);
+	/*
+	 * Send the path once the file exists, even when _set_xauthority()
+	 * failed. Only this process sees the name that mkstemp() expanded,
+	 * so without this the parent cannot unlink the file during the X11
+	 * shutdown. Send a zero length when there is no file to remove.
+	 */
+	if (file_created || (rc == SLURM_SUCCESS))
+		len = strlen(step->x11_xauthority);
+
 	safe_write(to_parent[1], &len, sizeof(len));
-	safe_write(to_parent[1], step->x11_xauthority, len);
+	if (len)
+		safe_write(to_parent[1], step->x11_xauthority, len);
+
+	if (rc != SLURM_SUCCESS)
+		_exit(1);
 
 	_exit(0);
 
@@ -1289,17 +1336,34 @@ static int _setup_x11_parent(int to_parent[2], pid_t pid, char **tmp)
 {
 	uint32_t len = 0;
 	int status = 0;
+	pid_t wpid = -1;
+
+	fd_close(&to_parent[1]);
 
 	safe_read(to_parent[0], &len, sizeof(len));
 
 	if (len) {
-		*tmp = xcalloc(len, sizeof(char));
+		*tmp = xcalloc(len + 1, sizeof(**tmp));
 		safe_read(to_parent[0], *tmp, len);
 	}
 
-	if ((waitpid(pid, &status, 0) != pid) || WEXITSTATUS(status)) {
+	do {
+		errno = 0;
+
+		if ((wpid = waitpid(pid, &status, 0)) > 0)
+			break;
+
+		if (errno != EINTR) {
+			error("%s: waitpid() failed: %m", __func__);
+			return SLURM_ERROR;
+		}
+
+		debug2("%s: waitpid() interrupted", __func__);
+	} while (true);
+
+	/* Do not free *tmp on failure; X11 shutdown removes the file. */
+	if (!WIFEXITED(status) || WEXITSTATUS(status)) {
 		error("%s: Xauthority setup failed", __func__);
-		xfree(*tmp);
 		return SLURM_ERROR;
 	}
 
@@ -1308,8 +1372,13 @@ static int _setup_x11_parent(int to_parent[2], pid_t pid, char **tmp)
 rwfail:
 	error("%s: failed to read from child: %m", __func__);
 	xfree(*tmp);
-	waitpid(pid, &status, 0);
-	debug2("%s: status from child %d", __func__, status);
+	while (((wpid = waitpid(pid, &status, 0)) < 0) && (errno == EINTR))
+		debug2("%s: waitpid() interrupted", __func__);
+
+	if (wpid != pid)
+		error("%s: waitpid() failed: %m", __func__);
+	else
+		debug2("%s: status from child %d", __func__, status);
 
 	return SLURM_ERROR;
 }
@@ -1361,10 +1430,10 @@ static int _spawn_job_container(void)
 			return SLURM_ERROR;
 		}
 
-		conmgr_add_work_signal(SIGTERM, _x11_signal_handler, NULL);
+		conmgr_add_work_signal(SIGTERM, _on_sigterm, NULL);
 
 		/*
-		 * When using job_container/tmpfs we need to get into
+		 * When using a namespace plugin we need to get into
 		 * the correct namespace or .Xauthority won't be visible
 		 * in /tmp from inside the job.
 		 */
@@ -1372,8 +1441,8 @@ static int _spawn_job_container(void)
 			pid_t pid;
 			int to_parent[2] = {-1, -1};
 
-			if (pipe(to_parent) < 0) {
-				error("%s: pipe failed: %m", __func__);
+			if (pipe2(to_parent, O_CLOEXEC)) {
+				error("%s: pipe2() failed: %m", __func__);
 				rc = SLURM_ERROR;
 				goto x11_fail;
 			}
@@ -1397,10 +1466,10 @@ static int _spawn_job_container(void)
 				error("fork: %m");
 				rc = SLURM_ERROR;
 			}
-			close(to_parent[0]);
-			close(to_parent[1]);
+			fd_close(&to_parent[0]);
+			fd_close(&to_parent[1]);
 		} else {
-			rc = _set_xauthority();
+			rc = _set_xauthority(NULL);
 		}
 x11_fail:
 		if (rc != SLURM_SUCCESS) {
@@ -1463,7 +1532,8 @@ x11_fail:
 	slurm_mutex_unlock(&step->state_mutex);
 	/* Wait for all steps other than extern (this one) to complete */
 	if (!pause_for_job_completion(&step->step_id,
-				      MAX(slurm_conf.kill_wait, 5), true)) {
+				      MAX(slurm_conf.kill_wait, 5), true,
+				      false)) {
 		warning("steps did not complete quickly");
 	}
 
@@ -1521,7 +1591,8 @@ x11_fail:
 	auth_context_unlock();
 
 fail1:
-	conmgr_add_work_fifo(_x11_signal_handler, NULL);
+	if (step->x11)
+		workerpool_enqueue_normal(_x11_signal_handler, NULL);
 
 	debug2("%s: Before call to spank_fini()", __func__);
 	if (spank_fini(step))
@@ -1543,11 +1614,12 @@ fail1:
 
 	stepd_send_step_complete_msgs();
 
-	switch_g_extern_step_fini(step->step_id.job_id);
+	if (running_with_stepmgr())
+		switch_g_stepmgr_fini(step->step_id.job_id);
 
 	if (slurm_conf.prolog_flags & PROLOG_FLAG_RUN_IN_JOB) {
 		/* Force all other steps to end before epilog starts */
-		pause_for_job_completion(&step->step_id, 0, true);
+		pause_for_job_completion(&step->step_id, 0, true, false);
 
 		int epilog_rc = _run_prolog_epilog(true);
 		epilog_complete(&step->step_id, step->node_list, epilog_rc);
@@ -1785,14 +1857,6 @@ fail2:
 			      __func__);
 	}
 
-	/*
-	 * Notify srun of completion AFTER frequency reset to avoid race
-	 * condition starting another job on these CPUs.
-	 */
-	while (stepd_send_pending_exit_msgs()) {
-		;
-	}
-
 	debug2("Before call to spank_fini()");
 	if (spank_fini(step))
 		error("spank_fini failed");
@@ -1808,15 +1872,7 @@ fail2:
 		pam_finish();
 
 fail1:
-	/* If interactive job startup was abnormal,
-	 * be sure to notify client.
-	 */
 	set_job_state(SLURMSTEPD_STEP_ENDING);
-	if (rc != 0) {
-		error("%s: exiting abnormally: %s",
-		      __func__, slurm_strerror(rc));
-		_send_launch_resp(rc);
-	}
 
 	if (!step->batch && (step_complete.rank > -1)) {
 		if (step->aborted)
@@ -1835,6 +1891,28 @@ fail1:
 		stepd_send_step_complete_msgs();
 	}
 
+	/*
+	 * Notify srun of completion AFTER frequency reset to avoid race
+	 * condition starting another job on these CPUs. Doing this after
+	 * stepd_send_step_complete_msgs() also avoids a potential race
+	 * condition when performing sequential sruns: the next srun could
+	 * issue step create request before notifying the controller that
+	 * the previous one ended.
+	 */
+	while (stepd_send_pending_exit_msgs()) {
+		;
+	}
+
+	/*
+	 * If interactive job startup was abnormal,
+	 * be sure to notify client.
+	 */
+	if (rc != SLURM_SUCCESS) {
+		error("%s: exiting abnormally: %s",
+		      __func__, slurm_strerror(rc));
+		_send_launch_resp(rc);
+	}
+
 	return(rc);
 }
 
@@ -1849,14 +1927,14 @@ static int _pre_task_child_privileged(int taskid, struct priv_state *sp)
 	set_oom_adj(0); /* the tasks may be killed by OOM */
 
 	if (!(step->flags & LAUNCH_NO_ALLOC)) {
-		/* Add job's pid to job container, if a normal job */
+		/* Add job's pid to job namespace, if a normal job */
 		if (namespace_g_join(&step->step_id, step->uid, false)) {
 			error("namespace_g_join(%pI) failed", &step->step_id);
 			exit(1);
 		}
 
 		/*
-		 * tmpfs job container plugin changes the working directory
+		 * The namespace/tmpfs plugin changes the working directory
 		 * back to root working directory, so change it back to users
 		 * but after dropping privillege
 		 */
@@ -2104,7 +2182,7 @@ static int _fork_all_tasks(bool *io_initialized)
 	 * Temporarily drop effective privileges, except for the euid.
 	 * We need to wait until after pam_setup() to drop euid.
 	 */
-	if (drop_privileges (step, false, &sprivs, true) < 0)
+	if (drop_privileges(step, false, &sprivs, true) < 0)
 		return ESLURMD_SET_UID_OR_GID_ERROR;
 
 	if (pam_setup(step->user_name, conf->hostname)
@@ -2518,6 +2596,69 @@ _log_task_exit(unsigned long taskid, unsigned long pid, int status)
 }
 
 /*
+ * Enforce --kill-on-bad-exit for async steps, which have no srun to drive
+ * the kill (sync steps use _step_signal() in srun).
+ * IN t - task that just exited.
+ */
+static void _maybe_kill_peers_on_bad_exit(stepd_step_task_info_t *t)
+{
+	static bool signaled = false;
+	int estatus = t->estatus;
+	slurm_msg_t msg, resp_msg;
+	job_step_kill_msg_t req = { 0 };
+
+	/* Fire once: several local tasks may fail before the kill returns. */
+	if (signaled)
+		return;
+	/*
+	 * A task signaled to be killed shouldn't send out additional kill RPCs
+	 */
+	if (t->killed_by_cmd)
+		return;
+	if (!(step->flags & LAUNCH_KILL_ON_BAD_EXIT))
+		return;
+
+	/*
+	 * LAUNCH_LOCAL_IO is set iff SSF_ASYNC; sync steps are driven by srun.
+	 */
+	if (!(step->flags & LAUNCH_LOCAL_IO))
+		return;
+
+	/*
+	 * Any non-zero status or cgroup-OOM is abnormal; honor --no-sig-fail.
+	 */
+	if (!estatus && !step->oom_error)
+		return;
+	if (!step->oom_error && WIFSIGNALED(estatus) &&
+	    (step->flags & LAUNCH_NO_SIG_FAIL))
+		return;
+
+	debug2("kill-on-bad-exit: async task exit (0x%x); signaling peers",
+	       estatus);
+
+	/*
+	 * Async steps only exist under stepmgr, so signal peers by sending the
+	 * cancel straight to the stepmgr rather than routing through slurmctld.
+	 */
+	xassert(step->stepmgr);
+	req.step_id = step->step_id;
+	req.signal = SIG_TERM_KILL;
+
+	slurm_msg_t_init(&msg);
+	slurm_msg_t_init(&resp_msg);
+	msg.msg_type = REQUEST_CANCEL_JOB_STEP;
+	msg.data = &req;
+	slurm_conf_get_addr(step->stepmgr, &msg.address, msg.flags);
+	slurm_msg_set_r_uid(&msg, slurm_conf.slurmd_user_id);
+	if (slurm_send_recv_node_msg(&msg, &resp_msg, 0))
+		error("%s: failed to signal peer tasks via stepmgr %s",
+		      __func__, step->stepmgr);
+	else
+		signaled = true;
+	slurm_free_msg_members(&resp_msg);
+}
+
+/*
  * If waitflag is true, perform a blocking wait for a single process
  * and then return.
  *
@@ -2648,6 +2789,8 @@ static int _wait_for_any_task(bool waitflag)
 					step_complete.step_rc = t->estatus;
 				slurm_mutex_unlock(&step_complete.lock);
 			}
+
+			_maybe_kill_peers_on_bad_exit(t);
 		}
 
 	} while ((pid > 0) && !waitflag);
@@ -2896,7 +3039,7 @@ static void _send_launch_resp(int rc)
 	launch_tasks_response_msg_t resp;
 	srun_info_t *srun = list_peek(step->sruns);
 
-	if (step->batch)
+	if (step->batch || !srun)
 		return;
 
 	debug("Sending launch resp rc=%d", rc);
@@ -3046,25 +3189,25 @@ static void _set_prio_process(void)
 	char *env_val;
 	int prio_daemon, prio_process;
 
-	if (!(env_val = getenvp( step->env, env_name ))) {
-		error( "Couldn't find %s in environment", env_name );
+	if (!(env_val = getenvp(step->env, env_name))) {
+		error("Couldn't find %s in environment", env_name);
 		prio_process = 0;
 	} else {
+		prio_process = atoi(env_val);
 		/* Users shouldn't get this in their environment */
-		unsetenvp( step->env, env_name );
-		prio_process = atoi( env_val );
+		unsetenvp(step->env, env_name);
 	}
 
 	if (slurm_conf.propagate_prio_process == PROP_PRIO_NICER) {
-		prio_daemon = getpriority( PRIO_PROCESS, 0 );
-		prio_process = MAX( prio_process, (prio_daemon + 1) );
+		prio_daemon = getpriority(PRIO_PROCESS, 0);
+		prio_process = MAX(prio_process, (prio_daemon + 1));
 	}
 
-	if (setpriority( PRIO_PROCESS, 0, prio_process ))
-		error( "setpriority(PRIO_PROCESS, %d): %m", prio_process );
+	if (setpriority(PRIO_PROCESS, 0, prio_process))
+		error("setpriority(PRIO_PROCESS, %d): %m", prio_process);
 	else {
-		debug2( "_set_prio_process: setpriority %d succeeded",
-			prio_process);
+		debug2("_set_prio_process: setpriority %d succeeded",
+		       prio_process);
 	}
 }
 

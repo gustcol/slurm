@@ -53,6 +53,7 @@
 #include "src/common/job_record.h"
 #include "src/common/log.h"
 #include "src/common/parse_time.h"
+#include "src/common/sluid.h"
 #include "src/common/slurm_protocol_defs.h"
 #include "src/common/slurm_time.h"
 #include "src/common/slurmdbd_defs.h"
@@ -77,6 +78,8 @@
 strong_alias(preempt_mode_string, slurm_preempt_mode_string);
 strong_alias(preempt_mode_num, slurm_preempt_mode_num);
 strong_alias(job_share_string, slurm_job_share_string);
+strong_alias(job_oversubscribe_string, slurm_job_oversubscribe_string);
+strong_alias(job_exclusive_display_string, slurm_job_exclusive_display_string);
 strong_alias(job_state_string, slurm_job_state_string);
 strong_alias(job_state_string_compact, slurm_job_state_string_compact);
 strong_alias(job_state_num, slurm_job_state_num);
@@ -755,7 +758,7 @@ static int _addto_step_list_internal(list_t *step_list, char *name, void *x)
 {
 	slurm_selected_step_t *selected_step = NULL;
 
-	if (!isdigit(*name)) {
+	if (!isdigit(*name) && (name[0] != 's')) {
 		fatal("Bad job/step specified: %s", name);
 		return SLURM_ERROR;
 	}
@@ -982,11 +985,63 @@ extern bitstr_t *slurm_array_str2bitmap(char *str, uint32_t max_array_size,
 	return array_bitmap;
 }
 
+/*
+ * Parse a step identifier (number or name) from a string.
+ * Expects the text after the '.' separator (e.g. "0", "extern", "batch").
+ *
+ * IN str - step identifier string (after the '.')
+ * IN/OUT id - step_id field is populated on success
+ * OUT end_ptr - if non-NULL, set to point past the parsed step identifier
+ * RET SLURM_SUCCESS or error
+ */
+static int _unfmt_step_id_str(const char *str, slurm_step_id_t *id,
+			      char **end_ptr)
+{
+	char *str_end;
+	long step;
+
+	if (!str || !*str)
+		return ESLURM_EMPTY_STEP_ID;
+
+	errno = 0;
+	step = strtol(str, &str_end, 10);
+
+	if (str_end == str) {
+		/* check for step name instead */
+		for (int i = 0;; i++) {
+			if (i == ARRAY_SIZE(step_names))
+				return ESLURM_INVALID_STEP_ID_NON_NUMERIC;
+
+			if (!xstrncasecmp(step_names[i].name, str,
+					  strlen(step_names[i].name))) {
+				step = step_names[i].step_id;
+				str_end = (char *) str +
+					  strlen(step_names[i].name);
+				break;
+			}
+		}
+	} else if (step < 0) {
+		return ESLURM_INVALID_STEP_ID_NEGATIVE;
+	} else if (step >= SLURM_MAX_NORMAL_STEP_ID) {
+		return ESLURM_INVALID_STEP_ID_TOO_LARGE;
+	} else if (errno) {
+		return SLURM_ERROR;
+	}
+
+	id->step_id = step;
+
+	if (end_ptr)
+		*end_ptr = str_end;
+
+	return SLURM_SUCCESS;
+}
+
 extern int unfmt_job_id_string(const char *src, slurm_selected_step_t *id,
 			       uint32_t max_array_size)
 {
-	char *end_ptr = NULL, *step_end_ptr = NULL, *step_het_end_ptr = NULL;
-	long job, step, step_het;
+	char *end_ptr = NULL, *step_het_end_ptr = NULL;
+	long job, step_het;
+	int rc;
 
 	/*
 	 * Based on parser in scontrol_print_job() and scontrol_print_step()
@@ -996,12 +1051,39 @@ extern int unfmt_job_id_string(const char *src, slurm_selected_step_t *id,
 	id->array_bitmap = NULL;
 	id->array_task_id = NO_VAL;
 	id->het_job_offset = NO_VAL;
-	id->step_id.job_id = NO_VAL;
-	id->step_id.step_het_comp = NO_VAL;
-	id->step_id.step_id = NO_VAL;
+	id->step_id = SLURM_STEP_ID_INITIALIZER;
 
 	if (!src || !src[0])
 		return ESLURM_EMPTY_JOB_ID;
+
+	if (src[0] == 's') {
+		sluid_t sluid;
+		char tmp[SLUID_STR_BYTES];
+
+		if (strlen(src) >= SLUID_STR_BYTES) {
+			if (src[SLUID_STR_BYTES - 1] != '.')
+				return ESLURM_INVALID_SLUID;
+		}
+
+		strlcpy(tmp, src, sizeof(tmp));
+
+		sluid = str2sluid(tmp);
+		if (!sluid)
+			return ESLURM_INVALID_SLUID;
+
+		if (src[SLUID_STR_BYTES - 1] == '.') {
+			char *step_end;
+			rc = _unfmt_step_id_str(&src[SLUID_STR_BYTES],
+						&id->step_id, &step_end);
+			if (rc != SLURM_SUCCESS)
+				return rc;
+			if (*step_end != '\0')
+				return ESLURM_INVALID_STEP_ID_NON_NUMERIC;
+		}
+
+		id->step_id.sluid = sluid;
+		return SLURM_SUCCESS;
+	}
 
 	errno = 0;
 	job = strtol(src, &end_ptr, 10);
@@ -1094,36 +1176,8 @@ extern int unfmt_job_id_string(const char *src, slurm_selected_step_t *id,
 
 	end_ptr++;
 
-	if (*end_ptr == '\0')
-		return ESLURM_EMPTY_STEP_ID;
-
-	errno = 0;
-	step = strtol(end_ptr, &step_end_ptr, 10);
-
-	if (step_end_ptr == end_ptr) {
-		/* check for step name instead */
-		for (int i = 0; true; i++) {
-			if (!xstrncasecmp(step_names[i].name, end_ptr,
-					  strlen(step_names[i].name))) {
-				step = step_names[i].step_id;
-				step_end_ptr =
-					end_ptr + strlen(step_names[i].name);
-				break;
-			}
-
-			if (i == ARRAY_SIZE(step_names))
-				return ESLURM_INVALID_STEP_ID_NON_NUMERIC;
-		}
-	} else if (step < 0) {
-		return ESLURM_INVALID_STEP_ID_NEGATIVE;
-	} else if (step >= SLURM_MAX_NORMAL_STEP_ID) {
-		return ESLURM_INVALID_STEP_ID_TOO_LARGE;
-	} else if (errno) {
-		return SLURM_ERROR;
-	}
-
-	id->step_id.step_id = step;
-	end_ptr = step_end_ptr;
+	if ((rc = _unfmt_step_id_str(end_ptr, &id->step_id, &end_ptr)))
+		return rc;
 
 	if (*end_ptr == '\0')
 		return SLURM_SUCCESS;
@@ -1167,6 +1221,15 @@ extern int fmt_job_id_string(slurm_selected_step_t *id, char **dst)
 	char *str = NULL, *pos = NULL;
 
 	xassert(dst && !*dst);
+
+	if (id->step_id.sluid &&
+	    ((id->step_id.job_id == NO_VAL) || !id->step_id.job_id)) {
+		char sluid_str[SLUID_STR_BYTES];
+		print_sluid(id->step_id.sluid, sluid_str, sizeof(sluid_str));
+		xstrfmtcatat(str, &pos, "%s", sluid_str);
+		*dst = str;
+		return SLURM_SUCCESS;
+	}
 
 	if (id->step_id.job_id == NO_VAL) {
 		rc = ESLURM_EMPTY_JOB_ID;
@@ -1231,61 +1294,16 @@ cleanup:
 extern slurm_selected_step_t *slurm_parse_step_str(char *name)
 {
 	slurm_selected_step_t *selected_step;
-	char *dot, *plus = NULL, *under;
+	int rc;
 
 	xassert(name);
 
 	selected_step = xmalloc(sizeof(*selected_step));
-	selected_step->step_id.step_het_comp = NO_VAL;
-
-	if ((dot = xstrstr(name, "."))) {
-		*dot++ = 0;
-		/* can't use NO_VAL since that means all */
-		if (!xstrcmp(dot, "batch"))
-			selected_step->step_id.step_id = SLURM_BATCH_SCRIPT;
-		else if (!xstrcmp(dot, "extern"))
-			selected_step->step_id.step_id = SLURM_EXTERN_CONT;
-		else if (!xstrcmp(dot, "interactive"))
-			selected_step->step_id.step_id = SLURM_INTERACTIVE_STEP;
-		else if (!xstrcmp(dot, "TBD"))
-			selected_step->step_id.step_id = SLURM_PENDING_STEP;
-		else if (isdigit(*dot))
-			selected_step->step_id.step_id = atoi(dot);
-		else
-			fatal("Bad step specified: %s", name);
-		plus = xstrchr(dot, '+');
-		if (plus) {
-			/* het step */
-			plus++;
-			selected_step->step_id.step_het_comp =
-				slurm_atoul(plus);
-		}
-	} else {
-		debug2("No jobstep requested");
-		selected_step->step_id.step_id = NO_VAL;
+	rc = unfmt_job_id_string(name, selected_step, NO_VAL);
+	if (rc) {
+		fatal("Bad job/step specified: %s: %s", name,
+		      slurm_strerror(rc));
 	}
-
-	if ((under = xstrstr(name, "_"))) {
-		*under++ = 0;
-		if (isdigit(*under))
-			selected_step->array_task_id = atoi(under);
-		else
-			fatal("Bad job array element specified: %s", name);
-		selected_step->het_job_offset = NO_VAL;
-	} else if (!plus && (plus = xstrstr(name, "+"))) {
-		selected_step->array_task_id = NO_VAL;
-		*plus++ = 0;
-		if (isdigit(*plus))
-			selected_step->het_job_offset = atoi(plus);
-		else
-			fatal("Bad hetjob offset specified: %s", name);
-	} else {
-		debug2("No jobarray or hetjob requested");
-		selected_step->array_task_id = NO_VAL;
-		selected_step->het_job_offset = NO_VAL;
-	}
-
-	selected_step->step_id.job_id = atoi(name);
 
 	return selected_step;
 }
@@ -1327,6 +1345,7 @@ slurm_copy_resource_allocation_response_msg(
 	new->partition = xstrdup(msg->partition);
 	new->qos = xstrdup(msg->qos);
 	new->resv_name = xstrdup(msg->resv_name);
+	new->stepmgr_host = xstrdup(msg->stepmgr_host);
 	new->uid = msg->uid;
 	new->user_name = xstrdup(msg->user_name);
 	new->working_cluster_rec = NULL;
@@ -1355,6 +1374,7 @@ extern void slurm_free_reboot_msg(reboot_msg_t * msg)
 		xfree(msg->features);
 		xfree(msg->node_list);
 		xfree(msg->reason);
+		xfree(msg->power_action_name);
 		xfree(msg);
 	}
 }
@@ -1393,6 +1413,11 @@ extern void slurm_free_reroute_msg(reroute_msg_t *msg)
 		slurmdb_destroy_cluster_rec(msg->working_cluster_rec);
 		xfree(msg);
 	}
+}
+
+extern void slurm_free_het_step_id_msg(het_step_id_msg_t *msg)
+{
+	xfree(msg);
 }
 
 extern void slurm_free_batch_script_msg(char *msg)
@@ -1448,7 +1473,7 @@ extern container_state_msg_t *slurm_create_container_state_msg(void)
 	container_state_msg_t *msg = xmalloc(sizeof(*msg));
 	msg->status = CONTAINER_ST_UNKNOWN;
 	msg->pid = NO_VAL;
-	msg->annotations = list_create(destroy_config_key_pair);
+	/* Callers will allocate msg->annotations */
 
 	return msg;
 }
@@ -1625,6 +1650,11 @@ extern void slurm_free_node_info_request_msg(node_info_request_msg_t *msg)
 	xfree(msg);
 }
 
+extern void slurm_free_node_health_check_msg(node_health_check_msg_t *msg)
+{
+	xfree(msg);
+}
+
 extern void slurm_free_node_info_single_msg(node_info_single_msg_t *msg)
 {
 	if (msg) {
@@ -1661,6 +1691,7 @@ extern void slurm_free_job_desc_msg(job_desc_msg_t *msg)
 		xfree(msg->comment);
 		xfree(msg->container);
 		xfree(msg->container_id);
+		xfree(msg->runtime);
 		xfree(msg->cpu_bind);
 		xfree(msg->cpus_per_tres);
 		free_cron_entry(msg->crontab_entry);
@@ -1684,6 +1715,7 @@ extern void slurm_free_job_desc_msg(job_desc_msg_t *msg)
 		xfree(msg->network);
 		xfree(msg->origin_cluster);
 		xfree(msg->partition);
+		xfree(msg->prefer);
 		xfree(msg->qos);
 		xfree(msg->req_context);
 		xfree(msg->req_nodes);
@@ -1798,6 +1830,7 @@ extern void slurm_free_job_launch_msg(batch_job_launch_msg_t * msg)
 			xfree(msg->argv);
 		}
 		xfree(msg->container);
+		xfree(msg->runtime);
 		xfree(msg->cpu_bind);
 		xfree(msg->cpus_per_node);
 		xfree(msg->cpu_count_reps);
@@ -1858,6 +1891,7 @@ extern void slurm_free_job_info_members(job_info_t * job)
 		xfree(job->comment);
 		xfree(job->container);
 		xfree(job->container_id);
+		xfree(job->runtime);
 		xfree(job->cpus_per_tres);
 		xfree(job->cronspec);
 		xfree(job->dependency);
@@ -1878,6 +1912,7 @@ extern void slurm_free_job_info_members(job_info_t * job)
 		xfree(job->het_job_id_set);
 		xfree(job->job_size_str);
 		xfree(job->licenses);
+		xfree(job->licenses_allocated);
 		xfree(job->mail_user);
 		xfree(job->mcs_label);
 		xfree(job->mem_per_tres);
@@ -1894,6 +1929,7 @@ extern void slurm_free_job_info_members(job_info_t * job)
 		xfree(job->req_node_inx);
 		xfree(job->req_nodes);
 		xfree(job->resv_name);
+		xfree(job->resv_ports);
 		free_job_resources(&job->job_resrcs);
 		xfree(job->selinux_context);
 		xfree(job->state_desc);
@@ -2001,6 +2037,30 @@ extern void slurm_free_sbcast_cred_req_msg(sbcast_cred_req_msg_t *msg)
 	xfree(msg);
 }
 
+extern void slurm_free_hres_update_msg(hres_update_msg_t *msg)
+{
+	if (!msg)
+		return;
+
+	FREE_NULL_LIST(msg->base);
+	xfree(msg->hres_name);
+	xfree(msg->layer_name);
+	xfree(msg->nodes);
+	xfree(msg);
+}
+
+extern void slurm_free_node_hres_info(void *x)
+{
+	node_hres_info_t *hres_info = x;
+
+	if (!hres_info)
+		return;
+
+	xfree(hres_info->hres_name);
+	xfree(hres_info->layer_name);
+	xfree(hres_info);
+}
+
 extern void slurm_free_node_reg_resp_msg(
 	slurm_node_reg_resp_msg_t *msg)
 {
@@ -2026,16 +2086,27 @@ extern void slurm_free_update_node_msg(update_node_msg_t * msg)
 		xfree(msg->node_addr);
 		xfree(msg->node_hostname);
 		xfree(msg->node_names);
+		xfree(msg->power_action_name);
 		xfree(msg->reason);
 		xfree(msg->topology_str);
 		xfree(msg);
 	}
 }
 
-extern void slurm_free_update_part_msg(update_part_msg_t * msg)
+extern void slurm_free_run_power_action_msg(run_power_action_msg_t *msg)
 {
 	if (msg) {
-		slurm_free_partition_info_members((partition_info_t *)msg);
+		xfree(msg->action_name);
+		xfree(msg->file_content);
+		xfree(msg->file_env_name);
+		xfree(msg);
+	}
+}
+
+extern void slurm_free_update_part_msg(partition_info_t *msg)
+{
+	if (msg) {
+		slurm_free_partition_info_members(msg);
 		xfree(msg);
 	}
 }
@@ -2108,16 +2179,55 @@ extern void slurm_free_resv_info_request_msg(resv_info_request_msg_t * msg)
 	xfree(msg);
 }
 
+extern void slurm_free_launch_parameters(slurm_step_launch_params_t *params)
+{
+	if (!params)
+		return;
+	xfree_array(params->argv);
+	env_array_free(params->env);
+	xfree(params->container);
+	xfree(params->runtime);
+	xfree(params->cwd);
+	xfree(params->output_filename);
+	xfree(params->error_filename);
+	xfree(params->input_filename);
+	xfree(params->het_job_step_task_cnts);
+	if (params->het_job_nnodes != NO_VAL) {
+		xfree(params->het_job_task_cnts);
+		if (params->het_job_tids) {
+			for (uint32_t i = 0; i < params->het_job_nnodes; i++)
+				xfree(params->het_job_tids[i]);
+			xfree(params->het_job_tids);
+		}
+		xfree(params->het_job_tid_offsets);
+	}
+	xfree(params->het_job_node_list);
+	xfree(params->task_prolog);
+	xfree(params->task_epilog);
+	xfree(params->cpu_bind);
+	xfree(params->mem_bind);
+	xfree(params->cpt_compact_array);
+	xfree(params->cpt_compact_reps);
+	xfree(params->mpi_plugin_name);
+	xfree(params->acctg_freq);
+	xfree_array(params->spank_job_env);
+	xfree(params->tres_bind);
+	xfree(params->tres_freq);
+	xfree(params);
+}
+
 extern void slurm_free_job_step_create_request_msg(
 		job_step_create_request_msg_t *msg)
 {
 	if (msg) {
 		xfree(msg->container);
 		xfree(msg->container_id);
+		xfree(msg->runtime);
 		xfree(msg->cpus_per_tres);
 		xfree(msg->exc_nodes);
 		xfree(msg->features);
 		xfree(msg->host);
+		slurm_free_launch_parameters(msg->launch_params);
 		xfree(msg->mem_per_tres);
 		xfree(msg->name);
 		xfree(msg->network);
@@ -2210,6 +2320,7 @@ extern void slurm_free_launch_tasks_request_msg(launch_tasks_request_msg_t * msg
 	}
 	xfree(msg->acctg_freq);
 	xfree(msg->container);
+	xfree(msg->runtime);
 	xfree(msg->cwd);
 	xfree(msg->cpt_compact_array);
 	xfree(msg->cpt_compact_reps);
@@ -2254,9 +2365,6 @@ extern void slurm_free_launch_tasks_request_msg(launch_tasks_request_msg_t * msg
 	xfree(msg->task_prolog);
 	xfree(msg->task_epilog);
 	xfree(msg->complete_nodelist);
-
-	if (msg->switch_step)
-		switch_g_stepinfo_free(msg->switch_step);
 
 	FREE_NULL_LIST(msg->options);
 
@@ -2310,6 +2418,30 @@ extern void slurm_free_reattach_tasks_response_msg(
 extern void slurm_free_signal_tasks_msg(signal_tasks_msg_t *msg)
 {
 	xfree(msg);
+}
+
+extern void slurm_free_job_mem_usage_msg(job_mem_usage_msg_t *msg)
+{
+	xfree(msg);
+}
+
+extern void slurm_free_job_mem_usage_resp_msg(job_mem_usage_resp_msg_t *msg)
+{
+	xfree(msg);
+}
+
+extern void slurm_free_update_job_mem_msg(update_job_mem_msg_t *msg)
+{
+	xfree(msg);
+}
+
+extern void slurm_free_response_update_job_mem_msg(response_update_job_mem_msg_t
+							   *msg)
+{
+	if (msg) {
+		xfree(msg->node_name);
+		xfree(msg);
+	}
 }
 
 extern void slurm_free_epilog_complete_msg(epilog_complete_msg_t * msg)
@@ -2368,6 +2500,15 @@ extern void slurm_free_srun_user_msg(srun_user_msg_t * user_msg)
 	}
 }
 
+extern void slurm_free_steps_drained_sub_msg(steps_drained_sub_msg_t *msg)
+{
+	if (msg) {
+		xfree(msg->host);
+		xfree(msg->tls_cert);
+		xfree(msg);
+	}
+}
+
 extern void slurm_free_suspend_msg(suspend_msg_t *msg)
 {
 	if (msg) {
@@ -2405,6 +2546,14 @@ slurm_free_requeue_msg(requeue_msg_t *msg)
 {
 	if (msg) {
 		xfree(msg->job_id_str);
+		xfree(msg);
+	}
+}
+
+extern void slurm_free_resize_msg(resize_msg_t *msg)
+{
+	if (msg) {
+		xfree(msg->nodelist);
 		xfree(msg);
 	}
 }
@@ -2733,6 +2882,42 @@ extern char *job_share_string(uint16_t shared)
 		return "OK";
 }
 
+/*
+ * Oversubscribe display string for cred/env: NO|YES|OK (JOB_OVERSUBSCRIBE_*).
+ */
+extern char *job_oversubscribe_string(uint16_t val)
+{
+	if (val == JOB_OVERSUBSCRIBE_NO)
+		return "NO";
+	if (val == JOB_OVERSUBSCRIBE_YES)
+		return "YES";
+	if (val == JOB_OVERSUBSCRIBE_OK)
+		return "OK";
+	return "NO";
+}
+
+/*
+ * Exclusive display string for cred/env: NO|NODE|USER|MCS|TOPO.
+ * val is JOB_EXCLUSIVE_* (single value, no combinations).
+ */
+extern char *job_exclusive_display_string(uint16_t val)
+{
+	switch (val) {
+	case JOB_EXCLUSIVE_NONE:
+		return "NO";
+	case JOB_EXCLUSIVE_NODE:
+		return "NODE";
+	case JOB_EXCLUSIVE_USER:
+		return "USER";
+	case JOB_EXCLUSIVE_MCS:
+		return "MCS";
+	case JOB_EXCLUSIVE_TOPO:
+		return "TOPO";
+	default:
+		return "NO";
+	}
+}
+
 extern char *job_state_string(uint32_t inx)
 {
 	/* Process JOB_STATE_FLAGS */
@@ -3047,6 +3232,10 @@ extern char *health_check_node_state_str(uint32_t node_state)
 	}
 	if (node_state & HEALTH_CHECK_NODE_NONDRAINED_IDLE) {
 		xstrfmtcat(state_str, "%s%s", sep, "NONDRAINED_IDLE");
+		sep = ",";
+	}
+	if (node_state & HEALTH_CHECK_REBOOT_ONLY) {
+		xstrfmtcat(state_str, "%s%s", sep, "REBOOT_ONLY");
 		sep = ",";
 	}
 	if (node_state & HEALTH_CHECK_START_ONLY) {
@@ -3514,6 +3703,15 @@ extern uint32_t parse_node_state_flag(char *flag_str)
 	return 0; /* No flags */
 }
 
+extern const char *node_state_flag_index(int index, uint32_t *flag)
+{
+	if ((index < 0) || (index >= (int) ARRAY_SIZE(node_state_flags)))
+		return NULL;
+	if (flag)
+		*flag = node_state_flags[index].flag;
+	return node_state_flags[index].str;
+}
+
 extern char *node_state_string(uint32_t inx)
 {
 	int  base            = (inx & NODE_STATE_BASE);
@@ -3791,6 +3989,10 @@ extern char *node_state_string_compact(uint32_t inx)
 
 	if (inx & NODE_STATE_INVALID_REG)
 		return "INVAL";
+	if (inx == NODE_STATE_PLANNED)
+		return "PLND";
+	if (inx == NODE_STATE_RES)
+		return "RESV";
 
 	inx = (inx & NODE_STATE_BASE);
 
@@ -4144,6 +4346,7 @@ extern void slurm_free_resource_allocation_response_msg_members (
 		xfree(msg->partition);
 		xfree(msg->qos);
 		xfree(msg->resv_name);
+		xfree(msg->stepmgr_host);
 		xfree(msg->tres_per_node);
 		xfree(msg->tres_per_task);
 		slurmdb_destroy_cluster_rec(msg->working_cluster_rec);
@@ -4193,9 +4396,6 @@ extern void slurm_free_job_step_create_response_msg(
 		xfree(msg->stepmgr);
 		slurm_step_layout_destroy(msg->step_layout);
 		slurm_cred_destroy(msg->cred);
-		if (msg->switch_step)
-			switch_g_stepinfo_free(msg->switch_step);
-
 		xfree(msg);
 	}
 
@@ -4216,13 +4416,12 @@ extern void slurm_free_submit_response_response_msg(submit_response_msg_t * msg)
 	}
 }
 
-
 /*
- * slurm_free_ctl_conf - free slurm control information response message
+ * slurm_free_conf - free slurm control information response message
  * IN msg - pointer to slurm control information response message
  * NOTE: buffer is loaded by slurm_load_jobs
  */
-extern void slurm_free_ctl_conf(slurm_ctl_conf_info_msg_t * config_ptr)
+extern void slurm_free_conf(slurm_conf_t *config_ptr)
 {
 	if (config_ptr) {
 		free_slurm_conf(config_ptr, 0);
@@ -4288,6 +4487,7 @@ extern void slurm_free_job_step_info_response_msg(job_step_info_response_msg_t *
 			_free_all_step_info(msg);
 			xfree(msg->job_steps);
 		}
+		FREE_NULL_LIST(msg->stepmgr_jobs);
 		xfree(msg);
 	}
 }
@@ -4310,6 +4510,7 @@ extern void slurm_free_job_step_info_members(job_step_info_t * msg)
 		xfree(msg->cluster);
 		xfree(msg->container);
 		xfree(msg->container_id);
+		xfree(msg->runtime);
 		xfree(msg->job_name);
 		xfree(msg->cwd);
 		xfree(msg->tres_per_node);
@@ -4984,7 +5185,7 @@ extern void slurm_free_msg_data(slurm_msg_type_t type, void *data)
 		slurm_free_last_update_msg(data);
 		break;
 	case RESPONSE_BUILD_INFO:
-		slurm_free_ctl_conf(data);
+		slurm_free_conf(data);
 		break;
 	case REQUEST_JOB_INFO:
 		slurm_free_job_info_request_msg(data);
@@ -5063,6 +5264,9 @@ extern void slurm_free_msg_data(slurm_msg_type_t type, void *data)
 	case RESPONSE_ACCT_GATHER_ENERGY:
 		slurm_free_acct_gather_node_resp_msg(data);
 		break;
+	case REQUEST_UPDATE_HRES:
+		slurm_free_hres_update_msg(data);
+		break;
 	case RESPONSE_NODE_REGISTRATION:
 		slurm_free_node_reg_resp_msg(data);
 		break;
@@ -5088,6 +5292,9 @@ extern void slurm_free_msg_data(slurm_msg_type_t type, void *data)
 	case REQUEST_UPDATE_NODE:
 	case REQUEST_DELETE_NODE:
 		slurm_free_update_node_msg(data);
+		break;
+	case REQUEST_RUN_POWER_ACTION:
+		slurm_free_run_power_action_msg(data);
 		break;
 	case REQUEST_CREATE_PARTITION:
 	case REQUEST_UPDATE_PARTITION:
@@ -5134,6 +5341,9 @@ extern void slurm_free_msg_data(slurm_msg_type_t type, void *data)
 		break;
 	case REQUEST_JOB_REQUEUE:
 		slurm_free_requeue_msg(data);
+		break;
+	case REQUEST_STEPMGR_RESIZE_KILL_STEPS:
+		slurm_free_resize_msg(data);
 		break;
 	case RESPONSE_RESOURCE_LAYOUT:
 		slurm_free_resource_layout_msg(data);
@@ -5195,6 +5405,18 @@ extern void slurm_free_msg_data(slurm_msg_type_t type, void *data)
 	case REQUEST_KILL_TIMELIMIT:
 		slurm_free_timelimit_msg(data);
 		break;
+	case REQUEST_JOB_MEM_USAGE:
+		slurm_free_job_mem_usage_msg(data);
+		break;
+	case RESPONSE_JOB_MEM_USAGE:
+		slurm_free_job_mem_usage_resp_msg(data);
+		break;
+	case REQUEST_UPDATE_JOB_MEM:
+		slurm_free_update_job_mem_msg(data);
+		break;
+	case RESPONSE_UPDATE_JOB_MEM:
+		slurm_free_response_update_job_mem_msg(data);
+		break;
 	case REQUEST_REATTACH_TASKS:
 		slurm_free_reattach_tasks_request_msg(data);
 		break;
@@ -5236,6 +5458,10 @@ extern void slurm_free_msg_data(slurm_msg_type_t type, void *data)
 	case RESPONSE_SLURM_REROUTE_MSG:
 		slurm_free_reroute_msg(data);
 		break;
+	case REQUEST_HET_STEP_ID:
+	case RESPONSE_HET_STEP_ID:
+		slurm_free_het_step_id_msg(data);
+		break;
 	case RESPONSE_JOB_STEP_CREATE:
 		slurm_free_job_step_create_response_msg(data);
 		break;
@@ -5248,6 +5474,9 @@ extern void slurm_free_msg_data(slurm_msg_type_t type, void *data)
 	case REQUEST_SET_DEBUG_LEVEL:
 	case REQUEST_SET_SCHEDLOG_LEVEL:
 		slurm_free_set_debug_level_msg(data);
+		break;
+	case REQUEST_NODE_HEALTH_CHECK:
+		slurm_free_node_health_check_msg(data);
 		break;
 	case REQUEST_CONTAINER_PTY:
 	case REQUEST_CONTAINER_START:
@@ -5265,16 +5494,17 @@ extern void slurm_free_msg_data(slurm_msg_type_t type, void *data)
 	case REQUEST_BURST_BUFFER_INFO:
 	case ACCOUNTING_REGISTER_CTLD:
 	case REQUEST_FED_INFO:
+	case SRUN_STEPS_DRAINED:
 		/* No body to free */
 		break;
 	case RESPONSE_FED_INFO:
 		slurmdb_destroy_federation_rec(data);
 		break;
 	case REQUEST_PERSIST_INIT:
-		slurm_persist_free_init_req_msg(data);
+		slurm_free_persist_init_req_msg(data);
 		break;
 	case PERSIST_RC:
-		slurm_persist_free_rc_msg(data);
+		slurm_free_persist_rc_msg(data);
 		break;
 	case REQUEST_REBOOT_NODES:
 		slurm_free_reboot_msg(data);
@@ -5343,6 +5573,9 @@ extern void slurm_free_msg_data(slurm_msg_type_t type, void *data)
 	case SRUN_JOB_COMPLETE:
 		slurm_free_srun_job_complete_msg(data);
 		break;
+	case REQUEST_STEPS_DRAINED_SUBSCRIBE:
+		slurm_free_steps_drained_sub_msg(data);
+		break;
 	case SRUN_PING:
 		slurm_free_srun_ping_msg(data);
 		break;
@@ -5399,9 +5632,16 @@ extern void slurm_free_msg_data(slurm_msg_type_t type, void *data)
 		slurm_free_suspend_exc_update_msg(data);
 		break;
 	case REQUEST_DBD_RELAY:
-		slurmdbd_free_msg(data);
+	{
+		persist_msg_t *pmsg = data;
+		slurmdbd_msg_t dbd_msg = {
+			.data = pmsg->data,
+			.msg_type = pmsg->msg_type,
+		};
+		slurmdbd_free_msg(&dbd_msg);
 		xfree(data);
 		break;
+	}
 	case RESPONSE_CONTROL_STATUS:
 		slurm_free_control_status_msg(data);
 		break;
@@ -5537,6 +5777,18 @@ extern bool valid_spank_job_env(char **spank_job_env,
 	return true;
 }
 
+extern void hres_variable_free(void *x)
+{
+	hres_variable_t *variable = x;
+
+	if (variable) {
+		xfree(variable->name);
+		xfree(variable);
+	}
+}
+
+strong_alias(hres_variable_free, slurm_destroy_hres_variable);
+
 /* slurm_free_license_info()
  *
  * Free the license info returned previously
@@ -5554,6 +5806,9 @@ slurm_free_license_info_msg(license_info_msg_t *msg)
 		for (cc = 0; cc < msg->num_lic; cc++) {
 			xfree(msg->lic_array[cc].name);
 			xfree(msg->lic_array[cc].nodes);
+			xfree(msg->lic_array[cc].layer_name);
+			xfree(msg->lic_array[cc].parent_name);
+			FREE_NULL_LIST(msg->lic_array[cc].base);
 		}
 		xfree(msg->lic_array);
 	}
@@ -5807,8 +6062,13 @@ extern uint64_t suffix_mult(char *suffix)
 
 extern bool verify_step_id(slurm_step_id_t *object, slurm_step_id_t *key)
 {
-	if (key->job_id != object->job_id)
+	/* If the SLUID is set on both, then reject if they're not equal. */
+	if (key->sluid && object->sluid) {
+		if (key->sluid != object->sluid)
+			return 0;
+	} else if (key->job_id != object->job_id) {
 		return 0;
+	}
 
 	/* Any step will do */
 	if (key->step_id == NO_VAL)
@@ -5833,22 +6093,28 @@ extern char *slurm_get_selected_step_id(
 {
 	int pos = 0;
 
-	pos = snprintf(job_id_str, len, "%u",
-		       selected_step->step_id.job_id);
-	if (pos > len)
-		goto endit;
+	if (selected_step->step_id.sluid) {
+		print_sluid(selected_step->step_id.sluid, job_id_str, len);
+		pos = strlen(job_id_str);
+	} else {
+		pos = snprintf(job_id_str, len, "%u",
+			       selected_step->step_id.job_id);
 
-	if (selected_step->array_task_id != NO_VAL)
-		pos += snprintf(job_id_str + pos, len - pos, "_%u",
-				selected_step->array_task_id);
-	if (pos > len)
-		goto endit;
+		if (pos > len)
+			goto endit;
 
-	if (selected_step->het_job_offset != NO_VAL)
-		pos += snprintf(job_id_str + pos, len - pos, "+%u",
-				selected_step->het_job_offset);
-	if (pos > len)
-		goto endit;
+		if (selected_step->array_task_id != NO_VAL)
+			pos += snprintf(job_id_str + pos, len - pos, "_%u",
+					selected_step->array_task_id);
+		if (pos > len)
+			goto endit;
+
+		if (selected_step->het_job_offset != NO_VAL)
+			pos += snprintf(job_id_str + pos, len - pos, "+%u",
+					selected_step->het_job_offset);
+		if (pos > len)
+			goto endit;
+	}
 
 	if (selected_step->step_id.step_id != NO_VAL) {
 		job_id_str[pos++] = '.';
@@ -6071,6 +6337,53 @@ extern void slurm_format_tres_string(char **s, char *tres_type)
 	xfree(*s);
 	*s = ret_str;
 	xfree(prefix);
+}
+
+/*
+ * Fuzzy name comparison for remote licenses, the "name" MUST refer to a
+ * remote license with the key assumption that no '@' characters exist in
+ * the server name.
+ * query IN - query string
+ * name IN - license name
+ * RET rc - 0 for no match, 1 for exact match, 2 for fuzzy match
+ */
+extern int slurm_remote_license_fuzzy_match(const char *query, const char *name)
+{
+	char *split = NULL, *query_split = NULL;
+	size_t cnt = 0;
+
+	if ((query == NULL) || (name == NULL))
+		return LIC_NO_MATCH;
+
+	query_split = xstrrchr(query, '@');
+	split = xstrrchr(name, '@');
+	if (split)
+		cnt = split - name;
+
+	/*
+	 * fuzzy match cases
+	 * check1:
+	 * 	"matlab" querying "matlab@test" -> should match
+	 * check2:
+	 * 	"matla"  querying "matlab@test" -> should fail
+	 * check3:
+	 * 	"matlab2" querying "matlab@test" -> should fail
+	 * check4:
+	 * 	"matlab@test" querying "matlab@test" -> should match
+	 * thus, the proper fuzzy matching logic is something like
+	 * If the query string has an '@', match the whole string,
+	 * if the query string does not have an '@', match only the
+	 * pre-@ portion of the string
+	 */
+	if (!query_split) {
+		if (strlen(query) != cnt)
+			return LIC_NO_MATCH;
+		if (xstrncmp(name, query, cnt))
+			return LIC_NO_MATCH;
+		return LIC_FUZZY_MATCH;
+	} else if (xstrcmp(name, query))
+		return LIC_NO_MATCH;
+	return LIC_EXACT_MATCH;
 }
 
 extern int slurm_get_next_tres(
@@ -6420,10 +6733,16 @@ extern void purge_agent_args(agent_arg_t *agent_arg_ptr)
 			slurm_free_prolog_launch_msg(agent_arg_ptr->msg_args);
 		else if (agent_arg_ptr->msg_type == REQUEST_REBOOT_NODES)
 			slurm_free_reboot_msg(agent_arg_ptr->msg_args);
+		else if (agent_arg_ptr->msg_type == REQUEST_RUN_POWER_ACTION)
+			slurm_free_run_power_action_msg(agent_arg_ptr
+								->msg_args);
 		else if (agent_arg_ptr->msg_type == REQUEST_RECONFIGURE_SACKD)
 			slurm_free_config_response_msg(agent_arg_ptr->msg_args);
 		else if (agent_arg_ptr->msg_type == REQUEST_RECONFIGURE_WITH_CONFIG)
 			slurm_free_config_response_msg(agent_arg_ptr->msg_args);
+		else if (agent_arg_ptr->msg_type == REQUEST_NODE_HEALTH_CHECK)
+			slurm_free_node_health_check_msg(
+				agent_arg_ptr->msg_args);
 		else
 			xfree(agent_arg_ptr->msg_args);
 	}
@@ -6496,6 +6815,69 @@ extern uint16_t get_job_share_value(job_record_t *job_ptr)
 	return shared;
 }
 
+/*
+ * Return oversubscribe display value for cred/env: 0=NO, 1=YES, 2=OK.
+ */
+extern uint16_t get_job_oversubscribe_value(job_record_t *job_ptr)
+{
+	job_details_t *d = job_ptr->details;
+
+	if (!d)
+		return JOB_OVERSUBSCRIBE_NO;
+	if (d->share_res == 1)
+		return JOB_OVERSUBSCRIBE_YES;
+	if ((d->share_res == NO_VAL8) && job_ptr->part_ptr) {
+		uint16_t m = job_ptr->part_ptr->max_share;
+		if ((m > 1) || (m & SHARED_FORCE))
+			return JOB_OVERSUBSCRIBE_OK;
+	}
+	return JOB_OVERSUBSCRIBE_NO;
+}
+
+/*
+ * Return exclusive display value for cred/env (JOB_EXCLUSIVE_*).
+ * Single value: NONE|NODE|USER|MCS|TOPO.
+ */
+extern uint16_t get_job_exclusive_display_value(job_record_t *job_ptr)
+{
+	job_details_t *d = job_ptr->details;
+	part_record_t *p = job_ptr->part_ptr;
+	bool part_topo = p && (p->flags & PART_FLAG_EXCLUSIVE_TOPO);
+
+	if (d) {
+		if (d->share_res == 1)
+			return JOB_EXCLUSIVE_NONE;
+		if (d->whole_node & WHOLE_TOPO)
+			return JOB_EXCLUSIVE_TOPO;
+		/*
+		 * WHOLE_NODE_REQUIRED takes precedence over USER/MCS so the
+		 * display reflects actual scheduling behavior. The scheduler
+		 * (linear, or any partition with max_share=0) may add
+		 * WHOLE_NODE_REQUIRED on top of a job's WHOLE_NODE_USER /
+		 * WHOLE_NODE_MCS request, in which case the job actually gets
+		 * a whole node.
+		 */
+		if (d->whole_node & WHOLE_NODE_REQUIRED) {
+			if (part_topo)
+				return JOB_EXCLUSIVE_TOPO;
+			return JOB_EXCLUSIVE_NODE;
+		}
+		if (d->whole_node & WHOLE_NODE_USER)
+			return JOB_EXCLUSIVE_USER;
+		if (d->whole_node & WHOLE_NODE_MCS)
+			return JOB_EXCLUSIVE_MCS;
+	}
+	if (p) {
+		if (p->flags & PART_FLAG_EXCLUSIVE_TOPO)
+			return JOB_EXCLUSIVE_TOPO;
+		if (p->flags & PART_FLAG_EXCLUSIVE_USER)
+			return JOB_EXCLUSIVE_USER;
+		if (p->max_share == 0)
+			return JOB_EXCLUSIVE_NODE;
+	}
+	return JOB_EXCLUSIVE_NONE;
+}
+
 extern void slurm_free_stepmgr_job_info(stepmgr_job_info_t *object)
 {
 	if (!object)
@@ -6503,6 +6885,22 @@ extern void slurm_free_stepmgr_job_info(stepmgr_job_info_t *object)
 
 	xfree(object->stepmgr);
 	xfree(object);
+}
+
+extern void slurm_free_persist_init_req_msg(persist_init_req_msg_t *msg)
+{
+	if (msg) {
+		xfree(msg->cluster_name);
+		xfree(msg);
+	}
+}
+
+extern void slurm_free_persist_rc_msg(persist_rc_msg_t *msg)
+{
+	if (msg) {
+		xfree(msg->comment);
+		xfree(msg);
+	}
 }
 
 /* Resv creation msg client validation. On error err_msg is set */
@@ -6585,6 +6983,10 @@ extern int validate_resv_create_desc(resv_desc_msg_t *resv_msg, char **err_msg,
 			resv_msg->flags = RESERVE_FLAG_PART_NODES;
 		else
 			resv_msg->flags |= RESERVE_FLAG_PART_NODES;
+
+		if (res_free_flags && (*res_free_flags & RESV_FREE_STR_NODES))
+			xfree(resv_msg->node_list);
+
 		resv_msg->node_list = xstrdup("ALL");
 
 		if (res_free_flags)

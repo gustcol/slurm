@@ -1,4 +1,4 @@
-.TH slurmrestd "8" "Slurm REST Daemon" "Slurm 26.05" "Slurm REST Daemon"
+.TH slurmrestd "8" "Slurm REST Daemon" "Slurm 26.11" "Slurm REST Daemon"
 
 .SH "NAME"
 slurmrestd \- Interface to Slurm via REST API.
@@ -397,7 +397,7 @@ the debug options such as SlurmctldDebug in slurm.conf(5). Increased if
 .IP
 
 .TP
-\fBSLURMRESTD_JSON\fR or \fBSLURM_JSON\fR
+\fBSLURM_JSON\fR
 Control JSON serialization:
 .IP
 .RS
@@ -411,6 +411,9 @@ Output JSON as compact as possible.
 Output JSON in pretty format to make it more readable.
 .IP
 .RE
+.IP
+\fBNOTE\fR: The \fBSLURMRESTD_JSON\fR environment variable is a deprecated alias
+for \fBSLURM_JSON\fR and will be removed in a future release.
 
 .TP
 \fBSLURM_JWT\fR
@@ -491,6 +494,9 @@ that user/group and then complete all requests as the given user. This mode is
 only intended for inet mode as the user change is permanent for the life of the
 process. This mode is incompatible with \fBrest_auth/jwt\fR and it is suggested
 to start \fBslurmrestd\fR with "-a \fBrest_auth/local\fR" arguments.
+.sp 1
+\fBNote\fR: \fBbecome_user\fR mode is deprecated and will be removed in a future
+release.
 .IP
 
 .TP
@@ -513,7 +519,7 @@ this daemon to run anything as the root user on the cluster.
 .IP
 
 .TP
-\fBSLURMRESTD_YAML\fR or \fBSLURM_YAML\fR
+\fBSLURM_YAML\fR
 Control YAML serialization:
 .IP
 .RS
@@ -532,6 +538,8 @@ Output YAML without datatype !!tags.
 Output YAML in pretty format to make it more readable.
 .RE
 .IP
+\fBNOTE\fR: The \fBSLURMRESTD_YAML\fR environment variable is a deprecated alias
+for \fBSLURM_YAML\fR and will be removed in a future release.
 
 .SH "SIGNALS"
 

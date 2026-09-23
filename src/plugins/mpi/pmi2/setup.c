@@ -291,6 +291,7 @@ static int
 _setup_stepd_sockets(const stepd_step_rec_t *step, char ***env)
 {
 	struct sockaddr_un sa;
+	socklen_t blen;
 	int i;
 	char *spool;
 
@@ -339,7 +340,8 @@ _setup_stepd_sockets(const stepd_step_rec_t *step, char ***env)
 
 	unlink(sa.sun_path);    /* remove possible old socket */
 
-	if (bind(tree_sock, (struct sockaddr *)&sa, SUN_LEN(&sa)) < 0) {
+	blen = sockaddr_fixlen((struct sockaddr *) &sa, (socklen_t) sizeof(sa));
+	if (bind(tree_sock, (struct sockaddr *) &sa, blen) < 0) {
 		error("mpi/pmi2: failed to bind tree socket: %m");
 		unlink(sa.sun_path);
 		return SLURM_ERROR;
@@ -704,16 +706,8 @@ _setup_srun_tree_info(void)
 static int
 _setup_srun_socket(const mpi_step_info_t *mpi_step)
 {
-	int rc;
-	uint16_t *ports;
-
-	if ((ports = slurm_get_srun_port_range()))
-		rc = net_stream_listen_ports(&tree_sock, &tree_info.pmi_port,
-					     ports, false);
-	else
-		rc = net_stream_listen(&tree_sock, &tree_info.pmi_port);
-
-	if (rc < 0) {
+	if (slurm_init_msg_engine_srun_ports(&tree_sock, &tree_info.pmi_port) !=
+	    SLURM_SUCCESS) {
 		error("mpi/pmi2: Failed to create tree socket");
 		return SLURM_ERROR;
 	}

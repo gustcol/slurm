@@ -87,6 +87,7 @@ void slurm_init_job_desc_msg(job_desc_msg_t * job_desc_msg)
 	job_desc_msg->reboot		= NO_VAL16;
 	job_desc_msg->requeue		= NO_VAL16;
 	job_desc_msg->req_switch	= NO_VAL;
+	job_desc_msg->segment_size = NO_VAL16;
 	job_desc_msg->shared		= NO_VAL16;
 	job_desc_msg->site_factor	= NO_VAL;
 	job_desc_msg->sockets_per_node	= NO_VAL16;
@@ -117,9 +118,9 @@ extern void slurm_init_update_step_msg (step_update_request_msg_t * step_msg)
  *	default values
  * IN/OUT update_part_msg - user defined partition descriptor
  */
-void slurm_init_part_desc_msg (update_part_msg_t * update_part_msg)
+void slurm_init_part_desc_msg(partition_info_t *update_part_msg)
 {
-	memset(update_part_msg, 0, sizeof(update_part_msg_t));
+	memset(update_part_msg, 0, sizeof(*update_part_msg));
 	update_part_msg->default_time   = NO_VAL;
 	update_part_msg->def_mem_per_cpu = NO_VAL64;
 	update_part_msg->grace_time     = NO_VAL;
@@ -175,4 +176,17 @@ void slurm_init_trigger_msg (trigger_info_t *trigger_info_msg)
 {
 	memset(trigger_info_msg, 0, sizeof(trigger_info_t));
 	trigger_info_msg->user_id = NO_VAL;
+}
+
+/*
+ * slurm_init_hres_update_msg - initialize HRES update message with default
+ *	values
+ * OUT hres_msg - user defined HRES update descriptor
+ */
+extern void slurm_init_hres_update_msg(hres_update_msg_t *hres_msg)
+{
+	memset(hres_msg, 0, sizeof(*hres_msg));
+	hres_msg->count = NO_VAL;
+	hres_msg->disable_hres = NO_VAL16;
+	hres_msg->disable_layer = NO_VAL16;
 }

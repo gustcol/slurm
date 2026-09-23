@@ -1,14 +1,20 @@
 ############################################################################
 # Copyright (C) SchedMD LLC.
 ############################################################################
-import atf
-import pytest
 import getpass
 import json
-import random
 import logging
-import time
 import os
+import random
+import time
+
+import pytest
+import requests
+import yaml
+
+import atf
+
+pytestmark = pytest.mark.slow
 
 random.seed()
 
@@ -39,8 +45,8 @@ def setup():
     atf.require_config_parameter("AllowNoDefAcct", "Yes", source="slurmdbd")
     atf.require_config_parameter("TrackWCKey", "Yes", source="slurmdbd")
     atf.require_config_parameter("TrackWCKey", "Yes")
-    atf.require_config_parameter("AuthAltTypes", "auth/jwt")
-    atf.require_config_parameter("AuthAltTypes", "auth/jwt", source="slurmdbd")
+    atf.require_config_parameter_includes("AuthAltTypes", "auth/jwt")
+    atf.require_config_parameter_includes("AuthAltTypes", "auth/jwt", source="slurmdbd")
     atf.require_slurmrestd("slurmctld,slurmdbd,util", "v0.0.45")
     atf.require_version((26, 5), "sbin/slurmdbd")
     atf.require_version((26, 5), "sbin/slurmctld")
@@ -62,12 +68,6 @@ def setup():
     partition_name = atf.default_partition()
     if not partition_name:
         partition_name = "debug"
-
-
-@pytest.fixture(scope="function", autouse=True)
-def cancel_jobs(setup):
-    yield
-    atf.cancel_all_jobs()
 
 
 @pytest.fixture(scope="function")
@@ -316,12 +316,12 @@ def test_specification(openapi_spec):
 def test_db_accounts(slurm, slurmdb, create_wckeys, admin_level):
     from openapi_client import ApiClient as Client
     from openapi_client import Configuration as Config
-    from openapi_client.models.v0045_openapi_accounts_resp import (
-        V0045OpenapiAccountsResp,
-    )
     from openapi_client.models.v0045_account import V0045Account
     from openapi_client.models.v0045_assoc_short import V0045AssocShort
     from openapi_client.models.v0045_coord import V0045Coord
+    from openapi_client.models.v0045_openapi_accounts_resp import (
+        V0045OpenapiAccountsResp,
+    )
 
     # make sure account doesn't already exist
     resp = slurmdb.slurmdb_v0045_get_account_with_http_info(account_name)
@@ -446,8 +446,8 @@ def test_db_diag(slurmdb, admin_level):
 
 
 def test_db_wckeys(slurmdb, create_coords, admin_level):
-    from openapi_client.models.v0045_wckey import V0045Wckey
     from openapi_client.models.v0045_openapi_wckey_resp import V0045OpenapiWckeyResp
+    from openapi_client.models.v0045_wckey import V0045Wckey
 
     wckeys = V0045OpenapiWckeyResp(
         wckeys=[
@@ -515,10 +515,10 @@ def test_db_wckeys(slurmdb, create_coords, admin_level):
 
 
 def test_db_clusters(slurmdb, admin_level):
+    from openapi_client.models.v0045_cluster_rec import V0045ClusterRec
     from openapi_client.models.v0045_openapi_clusters_resp import (
         V0045OpenapiClustersResp,
     )
-    from openapi_client.models.v0045_cluster_rec import V0045ClusterRec
 
     clusters = V0045OpenapiClustersResp(
         clusters=[
@@ -574,9 +574,9 @@ def test_db_clusters(slurmdb, admin_level):
 
 
 def test_db_users(slurmdb, admin_level):
-    from openapi_client.models.v0045_openapi_users_resp import V0045OpenapiUsersResp
     from openapi_client.models.v0045_assoc_short import V0045AssocShort
     from openapi_client.models.v0045_coord import V0045Coord
+    from openapi_client.models.v0045_openapi_users_resp import V0045OpenapiUsersResp
     from openapi_client.models.v0045_user import V0045User
     from openapi_client.models.v0045_user_default import V0045UserDefault
     from openapi_client.models.v0045_wckey import V0045Wckey
@@ -700,16 +700,15 @@ def test_db_users(slurmdb, admin_level):
 
 
 def test_db_assoc(slurmdb, create_coords, create_qos, admin_level):
-    from openapi_client.models.v0045_openapi_assocs_resp import V0045OpenapiAssocsResp
     from openapi_client.models.v0045_assoc import V0045Assoc
     from openapi_client.models.v0045_assoc_short import V0045AssocShort
     from openapi_client.models.v0045_coord import V0045Coord
-    from openapi_client.models.v0045_user import V0045User
-    from openapi_client.models.v0045_wckey import V0045Wckey
-
+    from openapi_client.models.v0045_openapi_assocs_resp import V0045OpenapiAssocsResp
     from openapi_client.models.v0045_uint32_no_val_struct import (
         V0045Uint32NoValStruct as V0045Uint32NoVal,
     )
+    from openapi_client.models.v0045_user import V0045User
+    from openapi_client.models.v0045_wckey import V0045Wckey
 
     associations = V0045OpenapiAssocsResp(
         associations=[
@@ -950,15 +949,14 @@ def test_db_assoc(slurmdb, create_coords, create_qos, admin_level):
 
 
 def test_db_qos(slurmdb, create_coords, admin_level):
-    from openapi_client.models.v0045_qos import V0045Qos
-    from openapi_client.models.v0045_tres import V0045Tres
-    from openapi_client.models.v0045_openapi_slurmdbd_qos_resp import (
-        V0045OpenapiSlurmdbdQosResp,
-    )
     from openapi_client.models.v0045_float64_no_val_struct import (
         V0045Float64NoValStruct as V0045Float64NoVal,
     )
-
+    from openapi_client.models.v0045_openapi_slurmdbd_qos_resp import (
+        V0045OpenapiSlurmdbdQosResp,
+    )
+    from openapi_client.models.v0045_qos import V0045Qos
+    from openapi_client.models.v0045_tres import V0045Tres
     from openapi_client.models.v0045_uint32_no_val_struct import (
         V0045Uint32NoValStruct as V0045Uint32NoVal,
     )
@@ -1106,26 +1104,25 @@ def test_db_config(slurmdb, admin_level):
 
 
 def test_jobs(slurm, slurmdb, non_admin):
-    from openapi_client.models.v0045_job_submit_req import V0045JobSubmitReq
+    from openapi_client.models.v0045_job_comment import V0045JobComment
     from openapi_client.models.v0045_job_desc_msg import V0045JobDescMsg
     from openapi_client.models.v0045_job_info import V0045JobInfo
     from openapi_client.models.v0045_job_modify import V0045JobModify
-    from openapi_client.models.v0045_job_comment import V0045JobComment
+    from openapi_client.models.v0045_job_modify_tres import V0045JobModifyTres
+    from openapi_client.models.v0045_job_submit_req import V0045JobSubmitReq
+    from openapi_client.models.v0045_openapi_job_modify_req import (
+        V0045OpenapiJobModifyReq,
+    )
     from openapi_client.models.v0045_process_exit_code_verbose import (
         V0045ProcessExitCodeVerbose,
     )
-    from openapi_client.models.v0045_job_modify_tres import V0045JobModifyTres
-    from openapi_client.models.v0045_tres import V0045Tres
-    from openapi_client.models.v0045_uint32_no_val_struct import V0045Uint32NoValStruct
     from openapi_client.models.v0045_process_exit_code_verbose_signal import (
         V0045ProcessExitCodeVerboseSignal,
     )
-
+    from openapi_client.models.v0045_tres import V0045Tres
+    from openapi_client.models.v0045_uint32_no_val_struct import V0045Uint32NoValStruct
     from openapi_client.models.v0045_uint32_no_val_struct import (
         V0045Uint32NoValStruct as V0045Uint32NoVal,
-    )
-    from openapi_client.models.v0045_openapi_job_modify_req import (
-        V0045OpenapiJobModifyReq,
     )
 
     script = "#!/bin/bash\n/bin/true"
@@ -1255,21 +1252,23 @@ def test_jobs(slurm, slurmdb, non_admin):
     resp = slurmdb.slurmdb_v0045_get_jobs()
     assert len(resp.errors) == 0
 
-    requery = True
-    while requery:
+    for t in atf.timer():
         resp = slurmdb.slurmdb_v0045_get_job(str(jobid3))
         assert len(resp.warnings) == 0
         assert len(resp.errors) == 0
         assert resp.jobs
+        updated_job_found = False
         for job in resp.jobs:
-            if job.name != "updated test job":
-                # job change hasn't settled at slurmdbd yet
-                requery = True
-            else:
-                requery = False
+            if job.name == "updated test job":
                 assert job.job_id == jobid3
                 assert job.name == "updated test job"
                 assert job.partition == partition_name
+                updated_job_found = True
+                break
+        if updated_job_found:
+            break
+    else:
+        assert False, "Updated job should reach the DB"
 
     resp = slurmdb.slurmdb_v0045_get_jobs(users=local_user_name)
     assert len(resp.warnings) == 0
@@ -1412,6 +1411,219 @@ def test_partitions(slurm):
     assert resp.partitions
 
 
+def test_partition_get_post_roundtrip(slurm, admin_level):
+    """GET one partition, POST the same partition descriptions as an update.
+
+    Echoing read-only fields (cluster, totals, tres, etc.) may produce warnings
+    but must not produce errors.
+    """
+    from openapi_client.models.v0045_openapi_partitions_mod_req import (
+        V0045OpenapiPartitionsModReq,
+    )
+
+    get_resp = slurm.slurm_v0045_get_partition(partition_name)
+    assert len(get_resp.errors) == 0, "GET partition should not return errors"
+    assert len(get_resp.warnings) == 0, "GET partition should not return warnings"
+    assert len(get_resp.partitions) == 1, "GET partition should return one partition"
+
+    for part in get_resp.partitions:
+        assert part.name == partition_name, "GET should return the requested partition"
+
+    req = V0045OpenapiPartitionsModReq(partitions=get_resp.partitions)
+    post_resp = slurm.slurm_v0045_post_partitions(req)
+    assert len(post_resp.errors) == 0, "POST echoed partition must not return errors"
+
+
+def test_post_partitions(slurm, admin_level):
+    from openapi_client.models.v0045_openapi_partitions_mod_req import (
+        V0045OpenapiPartitionsModReq,
+    )
+    from openapi_client.models.v0045_partition_info import V0045PartitionInfo
+    from openapi_client.models.v0045_partition_info_defaults import (
+        V0045PartitionInfoDefaults,
+    )
+    from openapi_client.models.v0045_partition_info_nodes import V0045PartitionInfoNodes
+    from openapi_client.models.v0045_partition_info_partition import (
+        V0045PartitionInfoPartition,
+    )
+    from openapi_client.models.v0045_uint64_no_val_struct import V0045Uint64NoValStruct
+
+    part_1_name = "part_1"
+    part_2_name = "part_2"
+
+    nodes = list(atf.get_nodes().keys())
+    part_1_nodes = atf.run_command_output(
+        f"scontrol show hostlist {','.join(nodes[0:5])}"
+    ).strip()
+    part_2_nodes = atf.run_command_output(
+        f"scontrol show hostlist {','.join(nodes[5:10])}"
+    ).strip()
+
+    req = V0045OpenapiPartitionsModReq(
+        partitions=[
+            V0045PartitionInfo(
+                name=part_1_name,
+                nodes=V0045PartitionInfoNodes(configured=part_1_nodes),
+                flags=[
+                    "HIDDEN",
+                    "NO_ROOT",
+                    "ROOT_ONLY",
+                    "REQ_RESV",
+                    "LLN",
+                    "PDOI",
+                ],
+                preempt_mode=[
+                    "REQUEUE",
+                ],
+                defaults=V0045PartitionInfoDefaults(
+                    partition_memory_per_cpu=V0045Uint64NoValStruct(
+                        set=True,
+                        number=10,
+                    ),
+                ),
+                partition=V0045PartitionInfoPartition(
+                    oversubscribe="FORCE:5", exclusive="USER"
+                ),
+            ),
+            V0045PartitionInfo(
+                name=part_2_name,
+                nodes=V0045PartitionInfoNodes(configured=part_2_nodes),
+                flags=[
+                    "LLN",
+                ],
+                preempt_mode=["DISABLED"],
+                defaults=V0045PartitionInfoDefaults(
+                    partition_memory_per_node=V0045Uint64NoValStruct(
+                        set=True,
+                        number=12,
+                    )
+                ),
+                partition=V0045PartitionInfoPartition(
+                    oversubscribe="YES:6", exclusive="NO"
+                ),
+            ),
+        ]
+    )
+
+    # Create partitions part_1 and part_2
+    resp = slurm.slurm_v0045_post_partitions(req)
+    assert len(resp.warnings) == 0
+    assert len(resp.errors) == 0
+    # Check that they were created
+    resp = slurm.slurm_v0045_get_partitions()
+    assert len(resp.errors) == 0
+    match_cnt = 0
+    inx = 0
+    for part in resp.partitions:
+        if part.name == part_1_name:
+            inx = 0
+        elif part.name == part_2_name:
+            inx = 1
+        else:
+            continue
+
+        match_cnt += 1
+
+        assert (
+            req.partitions[inx].nodes.configured == part.nodes.configured
+        ), "Partition was not created with the correct nodes"
+        assert set(req.partitions[inx].flags) == set(
+            part.flags
+        ), "Partition was not create with the correct flags"
+        assert set(req.partitions[inx].preempt_mode) == set(
+            part.preempt_mode
+        ), "Partition was not create with the correct PreemptMode"
+        if req.partitions[inx].defaults.partition_memory_per_cpu:
+            assert (
+                req.partitions[inx].defaults.partition_memory_per_cpu.number
+                == part.defaults.partition_memory_per_cpu.number
+            ), "Partition was not create with the correct DefMemPerCpu"
+        if req.partitions[inx].defaults.partition_memory_per_node:
+            assert (
+                req.partitions[inx].defaults.partition_memory_per_node.number
+                == part.defaults.partition_memory_per_node.number
+            ), "Partition was not create with the correct DefMemPerNode"
+        assert req.partitions[inx].partition is not None
+        assert part.partition is not None
+        assert (
+            req.partitions[inx].partition.oversubscribe == part.partition.oversubscribe
+        ), "Partition oversubscribe string did not round-trip"
+
+    assert match_cnt == 2
+
+    # Test updating
+    req.partitions[0].nodes.configured = part_2_nodes  # swap nodes
+    req.partitions[1].nodes.configured = part_1_nodes
+    req.partitions[0].flags = [  # clear all flags
+        "HIDDEN_CLEAR",
+        "NO_ROOT_CLEAR",
+        "ROOT_ONLY_CLEAR",
+        "REQ_RESV_CLEAR",
+        "LLN_CLEAR",
+        "PDOI_CLEAR",
+    ]
+    req.partitions[1].flags = [  # append HIDDEN to existing LLN
+        "HIDDEN",
+    ]
+    req.partitions[0].partition.oversubscribe = "NO"
+    req.partitions[0].partition.exclusive = "TOPO"
+    req.partitions[1].partition.oversubscribe = "FORCE:1"
+    req.partitions[1].partition.exclusive = "USER"
+
+    resp = slurm.slurm_v0045_post_partitions(req)
+    assert len(resp.warnings) == 0
+    assert len(resp.errors) == 0
+
+    # Check that they were updated
+    resp = slurm.slurm_v0045_get_partitions()
+    assert len(resp.errors) == 0
+    match_cnt = 0
+    for part in resp.partitions:
+        if part.name == part_1_name:
+            inx = 0
+        elif part.name == part_2_name:
+            inx = 1
+        else:
+            continue
+
+        match_cnt += 1
+
+        assert (
+            req.partitions[inx].nodes.configured == part.nodes.configured
+        ), "Partition nodes failed to update"
+        if inx == 0:
+            assert (
+                len(part.flags) == 0
+            ), f"Partition flags were not all cleared during update: {part.flags}"
+        else:
+            assert set(part.flags) == {
+                "HIDDEN",
+                "LLN",
+            }, "Partition flags did not update correctly"
+
+        assert (
+            req.partitions[inx].partition.oversubscribe == part.partition.oversubscribe
+        ), "Partition oversubscribe failed to update"
+        assert (
+            req.partitions[inx].partition.exclusive == part.partition.exclusive
+        ), "Partition exclusive failed to update"
+
+    assert match_cnt == 2
+
+    atf.run_command_output(f"scontrol delete partition {part_1_name}")
+    atf.run_command_output(f"scontrol delete partition {part_2_name}")
+
+
+def test_delete_partition(slurm, admin_level):
+    partition_name = "new_partition"
+    atf.run_command_output(f"scontrol create partitionname={partition_name}")
+    assert partition_name in atf.get_partitions(), "Failed to create partition"
+    resp = slurm.slurm_v0045_delete_partition(partition_name)
+    assert len(resp.warnings) == 0
+    assert len(resp.errors) == 0
+    assert partition_name not in atf.get_partitions(), "Failed to delete partition"
+
+
 def test_nodes(slurm, admin_level):
     from openapi_client.models.v0045_update_node_msg import V0045UpdateNodeMsg
 
@@ -1498,6 +1710,70 @@ def test_nodes(slurm, admin_level):
         assert node.extra == extra
 
 
+def test_slurmrestd_slurm_nodes_update_time(slurm, admin_level):
+    """GET /nodes with update_time from a prior last_update succeeds."""
+    resp = slurm.slurm_v0045_get_nodes()
+    assert not resp.errors, f"unexpected errors: {resp.errors}"
+    assert resp.last_update is not None, "GET /nodes missing last_update"
+    node_name = None
+    for node in resp.nodes:
+        if node.name:
+            node_name = node.name
+            break
+    assert node_name, "expected at least one node from GET /nodes"
+    expected_nodes = {node.name for node in resp.nodes if node.name}
+    before_update = resp.last_update.number
+
+    atf.run_command(
+        f"scontrol update nodename={node_name} comment=slurmrestd-nodes-update-time",
+        user=atf.properties["slurm-user"],
+        fatal=True,
+    )
+
+    update_time = str(before_update)
+    r = atf.request_slurmrestd(f"slurm/v0.0.45/nodes?update_time={update_time}")
+    assert r.status_code == 200, (
+        f"GET /nodes with update_time={update_time} "
+        f"returned HTTP {r.status_code}: {r.text[:500]}"
+    )
+    body = r.json()
+    assert not body.get("errors"), (
+        f"GET /nodes with update_time={update_time} "
+        f"returned errors: {body.get('errors')}"
+    )
+    assert not body.get("warnings"), (
+        f"GET /nodes with update_time={update_time} "
+        f"returned warnings: {body.get('warnings')}"
+    )
+    nodes = body.get("nodes")
+    assert nodes, "expected the changed node to be returned for a diverged update_time"
+    changed = next((n for n in nodes if n.get("name") == node_name), None)
+    assert changed, f"changed node {node_name} missing from response"
+    assert (
+        changed.get("comment") == "slurmrestd-nodes-update-time"
+    ), f"changed node {node_name} did not reflect the updated comment"
+    returned_nodes = {n.get("name") for n in nodes if n.get("name")}
+    assert returned_nodes >= expected_nodes, (
+        "expected the entire node collection to be returned for a diverged "
+        f"update_time, missing: {expected_nodes - returned_nodes}"
+    )
+    after_update = body.get("last_update", {}).get("number")
+    assert after_update, "response missing last_update"
+    assert (
+        after_update >= before_update
+    ), f"last_update ({after_update}) went backwards past update_time ({before_update})"
+
+
+def test_slurmrestd_slurm_nodes_update_time_no_change(slurm):
+    """GET /nodes with a future update_time returns 304 Not Modified."""
+    r = atf.request_slurmrestd("slurm/v0.0.45/nodes?update_time=4102444800")
+    assert r.status_code == 304, (
+        f"GET /nodes with a future update_time "
+        f"returned HTTP {r.status_code}: {r.text[:500]}"
+    )
+    assert not r.text, f"expected an empty body on 304, got: {r.text[:500]}"
+
+
 def test_ping(slurm):
     resp = slurm.slurm_v0045_get_ping()
     assert len(resp.warnings) == 0
@@ -1521,10 +1797,10 @@ def test_licenses(slurm):
     [[], ["IGNORE_JOBS"], ["IGNORE_JOBS", "MAGNETIC"]],
 )
 def test_reservations(slurm, flags, admin_level):
-    from openapi_client.models.v0045_reservation_mod_req import V0045ReservationModReq
     from openapi_client.models.v0045_reservation_desc_msg import V0045ReservationDescMsg
-    from openapi_client.models.v0045_uint64_no_val_struct import V0045Uint64NoValStruct
+    from openapi_client.models.v0045_reservation_mod_req import V0045ReservationModReq
     from openapi_client.models.v0045_uint32_no_val_struct import V0045Uint32NoValStruct
+    from openapi_client.models.v0045_uint64_no_val_struct import V0045Uint64NoValStruct
 
     resv_name = "test_resv"
     users = ["root", "atf"]
@@ -1764,10 +2040,10 @@ def test_util_hostlist(util_api):
 
 def test_resv_crash(slurm, admin_level, cleanup_crash):
     """Check for xfree crash (bug 23038)"""
-    from openapi_client.models.v0045_reservation_mod_req import V0045ReservationModReq
     from openapi_client.models.v0045_reservation_desc_msg import V0045ReservationDescMsg
-    from openapi_client.models.v0045_uint64_no_val_struct import V0045Uint64NoValStruct
+    from openapi_client.models.v0045_reservation_mod_req import V0045ReservationModReq
     from openapi_client.models.v0045_uint32_no_val_struct import V0045Uint32NoValStruct
+    from openapi_client.models.v0045_uint64_no_val_struct import V0045Uint64NoValStruct
 
     # Don't overlap with other resv in case of restd crash/restart
     resv_name = "crash_test_resv"
@@ -1795,3 +2071,153 @@ def test_resv_crash(slurm, admin_level, cleanup_crash):
     assert (
         not resp.warnings and not resp.errors
     ), "We should be able to get the server response from this message"
+
+
+# Fields that legitimately differ between two independent dumps of the same
+# config: runtime counters and the build/boot/update timestamps. The CLI and
+# REST calls each sample a separate RPC, so these can disagree without a bug.
+conf_volatile_fields = {
+    "BOOT_TIME",
+    "NEXT_JOB_ID",
+    "next_job_id",
+    "LastUpdate",
+    "controllers",
+}
+
+
+def test_slurmrestd_slurm_conf(slurm):
+    """GET /slurm/v0.0.45/conf returns a well-formed slurm.conf payload."""
+    resp = slurm.slurm_v0045_get_conf()
+    assert not resp.errors, f"unexpected errors: {resp.errors}"
+    assert not resp.warnings, f"unexpected warnings: {resp.warnings}"
+    assert resp.slurm_conf, "empty slurm_conf payload"
+    assert resp.slurm_conf.cluster_name == atf.get_config_parameter(
+        "ClusterName"
+    ), "slurm_conf ClusterName does not match the running config"
+
+
+def test_slurmrestd_slurm_conf_update_time_no_change(slurm):
+    """A future update_time yields a no-change response with an empty body."""
+    resp = slurm.slurm_v0045_get_conf(update_time="4102444800")
+    assert not resp.errors, f"unexpected errors: {resp.errors}"
+    assert resp.warnings, "expected a no-change warning"
+    assert not resp.slurm_conf, "expected empty body on no-change"
+
+
+def test_slurmrestd_slurm_conf_update_time_past(slurm):
+    """A past update_time still returns the full slurm.conf payload."""
+    resp = slurm.slurm_v0045_get_conf(update_time="1")
+    assert not resp.errors, f"unexpected errors: {resp.errors}"
+    assert resp.slurm_conf, "expected a full payload for a past update_time"
+
+
+def test_slurmrestd_slurm_conf_rejects_non_get():
+    """Only GET is registered for /slurm/v0.0.45/conf."""
+    r = requests.post(
+        f"{atf.properties['slurmrestd_url']}/slurm/v0.0.45/conf",
+        headers=atf.properties["slurmrestd-headers"],
+        timeout=30,
+    )
+    # A non-GET on a GET-only path is not served: slurmrestd's router returns
+    # 404 (ESLURM_REST_UNKNOWN_URL) today. Accept 405 too so a future change to
+    # the more correct status doesn't break this.
+    assert r.status_code in (
+        404,
+        405,
+    ), f"expected 404/405, got {r.status_code}: {r.text[:200]}"
+
+
+def test_scontrol_show_config_json():
+    """`scontrol show config --json=v0.0.45` emits a well-formed slurm_conf."""
+    blob = json.loads(
+        atf.run_command_output("scontrol show config --json=v0.0.45", fatal=True)
+    )
+    assert blob["errors"] == [], f"unexpected errors: {blob['errors']}"
+    assert blob["slurm_conf"], "empty slurm_conf payload"
+
+
+def test_scontrol_show_config_yaml():
+    """`scontrol show config --yaml=v0.0.45` produces the same shape as --json."""
+    blob = yaml.safe_load(
+        atf.run_command_output("scontrol show config --yaml=v0.0.45", fatal=True)
+    )
+    assert blob["errors"] == [], f"unexpected errors: {blob['errors']}"
+    assert blob["slurm_conf"], "empty slurm_conf payload"
+
+
+def test_scontrol_show_config_json_list():
+    """`scontrol show config --json=list` lists the data_parser plugins."""
+    out = atf.run_command_output("scontrol show config --json=list", fatal=True)
+    assert "v0.0.45" in out, f"v0.0.45 not listed in: {out}"
+
+
+def test_slurm_conf_cli_matches_slurmrestd():
+    """scontrol --json=v0.0.45 and /slurm/v0.0.45/conf yield equivalent payloads."""
+    cli = json.loads(
+        atf.run_command_output("scontrol show config --json=v0.0.45", fatal=True)
+    )["slurm_conf"]
+    rest = atf.request_slurmrestd("slurm/v0.0.45/conf").json()["slurm_conf"]
+    assert cli.get("ClusterName"), "slurm_conf payload missing ClusterName"
+    cli = {k: v for k, v in cli.items() if k not in conf_volatile_fields}
+    rest = {k: v for k, v in rest.items() if k not in conf_volatile_fields}
+    assert cli == rest, "scontrol and slurmrestd slurm_conf payloads differ"
+
+
+def test_slurmrestd_slurmdbd_conf(slurmdb):
+    """GET /slurmdb/v0.0.45/conf returns a well-formed slurmdbd.conf payload."""
+    resp = slurmdb.slurmdb_v0045_get_conf()
+    assert not resp.errors, f"unexpected errors: {resp.errors}"
+    assert not resp.warnings, f"unexpected warnings: {resp.warnings}"
+    assert resp.slurmdbd_conf, "empty slurmdbd_conf payload"
+    assert resp.slurmdbd_conf.dbd_host, "slurmdbd_conf missing DbdHost"
+
+
+def test_slurmrestd_slurmdbd_conf_rejects_non_get():
+    """Only GET is registered for /slurmdb/v0.0.45/conf."""
+    r = requests.post(
+        f"{atf.properties['slurmrestd_url']}/slurmdb/v0.0.45/conf",
+        headers=atf.properties["slurmrestd-headers"],
+        timeout=30,
+    )
+    # See test_slurmrestd_slurm_conf_rejects_non_get: a non-GET on a
+    # GET-only path is not served (404 today, 405 acceptable).
+    assert r.status_code in (
+        404,
+        405,
+    ), f"expected 404/405, got {r.status_code}: {r.text[:200]}"
+
+
+def test_sacctmgr_show_config_json():
+    """`sacctmgr show config --json=v0.0.45` emits a well-formed slurmdbd_conf."""
+    blob = json.loads(
+        atf.run_command_output("sacctmgr show config --json=v0.0.45", fatal=True)
+    )
+    assert blob["errors"] == [], f"unexpected errors: {blob['errors']}"
+    assert blob["slurmdbd_conf"], "empty slurmdbd_conf payload"
+
+
+def test_sacctmgr_show_config_yaml():
+    """`sacctmgr show config --yaml=v0.0.45` produces the same shape as --json."""
+    blob = yaml.safe_load(
+        atf.run_command_output("sacctmgr show config --yaml=v0.0.45", fatal=True)
+    )
+    assert blob["errors"] == [], f"unexpected errors: {blob['errors']}"
+    assert blob["slurmdbd_conf"], "empty slurmdbd_conf payload"
+
+
+def test_sacctmgr_show_config_json_list():
+    """`sacctmgr show config --json=list` lists the data_parser plugins."""
+    out = atf.run_command_output("sacctmgr show config --json=list", fatal=True)
+    assert "v0.0.45" in out, f"v0.0.45 not listed in: {out}"
+
+
+def test_slurmdbd_conf_cli_matches_slurmrestd():
+    """sacctmgr --json=v0.0.45 and /slurmdb/v0.0.45/conf yield equivalent payloads."""
+    cli = json.loads(
+        atf.run_command_output("sacctmgr show config --json=v0.0.45", fatal=True)
+    )["slurmdbd_conf"]
+    rest = atf.request_slurmrestd("slurmdb/v0.0.45/conf").json()["slurmdbd_conf"]
+    assert cli.get("DbdHost"), "slurmdbd_conf payload missing DbdHost"
+    cli = {k: v for k, v in cli.items() if k not in conf_volatile_fields}
+    rest = {k: v for k, v in rest.items() if k not in conf_volatile_fields}
+    assert cli == rest, "sacctmgr and slurmrestd slurmdbd_conf payloads differ"

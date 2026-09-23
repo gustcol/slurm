@@ -132,6 +132,7 @@ enum {
 	SORTID_DEPENDENCY,
 	SORTID_DERIVED_EC,
 	SORTID_EXIT_CODE,
+	SORTID_EXCLUSIVE,
 	SORTID_EXTRA,
 	SORTID_FEATURES,
 	SORTID_FED_ACTIVE_SIBS,
@@ -324,7 +325,9 @@ static display_data_t display_data_job[] = {
 	{G_TYPE_STRING, SORTID_TASKS, "Task Count",
 	 false, EDIT_TEXTBOX, refresh_job, create_model_job, admin_edit_job},
 	{G_TYPE_STRING, SORTID_OVER_SUBSCRIBE, "OverSubscribe", false,
-	 EDIT_MODEL, refresh_job, create_model_job, admin_edit_job},
+	 EDIT_NONE, refresh_job, create_model_job, admin_edit_job},
+	{G_TYPE_STRING, SORTID_EXCLUSIVE, "Exclusive", false,
+	 EDIT_NONE, refresh_job, create_model_job, admin_edit_job},
 	{G_TYPE_STRING, SORTID_STD_ERR, "Standard Error",
 	 false, EDIT_NONE, refresh_job, create_model_job, admin_edit_job},
 	{G_TYPE_STRING, SORTID_STD_IN, "Standard In",
@@ -567,7 +570,7 @@ static uint16_t _xlate_signal_name(const char *signal_name)
 	return NO_VAL16;
 }
 
-static int _cancel_job_id (uint32_t job_id, uint16_t signal)
+static int _cancel_job_id(slurm_step_id_t step_id, uint16_t signal)
 {
 	int error_code = SLURM_SUCCESS, i;
 	char *temp = NULL;
@@ -577,13 +580,13 @@ static int _cancel_job_id (uint32_t job_id, uint16_t signal)
 	for (i = 0; i < MAX_CANCEL_RETRY; i++) {
 		/* NOTE: RPC always sent to slurmctld rather than directly
 		 * to slurmd daemons */
-		error_code = slurm_kill_job(job_id, signal, false);
+		error_code = slurm_kill_job(step_id, signal, false);
 		if (error_code == 0
 		    || (errno != ESLURM_TRANSITION_STATE_NO_UPDATE
 			&& errno != ESLURM_JOB_PENDING))
 			break;
-		temp = g_strdup_printf("Sending signal %u to job %u",
-				       signal, job_id);
+		temp = g_strdup_printf("Sending signal %u to job %u", signal,
+				       step_id.job_id);
 		display_edit_note(temp);
 		g_free(temp);
 		sleep ( 5 + i );
@@ -594,7 +597,7 @@ static int _cancel_job_id (uint32_t job_id, uint16_t signal)
 		    (error_code != ESLURM_INVALID_JOB_ID)) {
 			temp = g_strdup_printf(
 				"Kill job error on job id %u: %s",
-				job_id, slurm_strerror(errno));
+				step_id.job_id, slurm_strerror(errno));
 			display_edit_note(temp);
 			g_free(temp);
 		} else {
@@ -605,19 +608,13 @@ static int _cancel_job_id (uint32_t job_id, uint16_t signal)
 	return error_code;
 }
 
-static int _cancel_step_id(uint32_t job_id, uint32_t step_id,
-			   uint16_t signal)
+static int _cancel_step_id(slurm_step_id_t step_id, uint16_t signal)
 {
 	int error_code = SLURM_SUCCESS, i;
 	char *temp = NULL;
 	char tmp_char[45];
-	slurm_step_id_t step_id_tmp = {
-		.job_id = job_id,
-		.step_het_comp = NO_VAL,
-		.step_id = step_id,
-	};
 
-	log_build_step_id_str(&step_id_tmp, tmp_char, sizeof(tmp_char),
+	log_build_step_id_str(&step_id, tmp_char, sizeof(tmp_char),
 			      STEP_ID_FLAG_NONE);
 
 	if (signal == (uint16_t)-1)
@@ -626,7 +623,7 @@ static int _cancel_step_id(uint32_t job_id, uint32_t step_id,
 	for (i = 0; i < MAX_CANCEL_RETRY; i++) {
 		/* NOTE: RPC always sent to slurmctld rather than directly
 		 * to slurmd daemons */
-		error_code = slurm_kill_job_step(&step_id_tmp, signal, 0);
+		error_code = slurm_kill_job_step(&step_id, signal, 0);
 
 		if (error_code == 0
 		    || (errno != ESLURM_TRANSITION_STATE_NO_UPDATE
@@ -685,7 +682,6 @@ static void _set_active_combo_job(GtkComboBox *combo,
 	case SORTID_CONTIGUOUS:
 	case SORTID_REBOOT:
 	case SORTID_REQUEUE:
-	case SORTID_OVER_SUBSCRIBE:
 		if (!xstrcasecmp(temp_char, "yes"))
 			action = 0;
 		else if (!xstrcasecmp(temp_char, "no"))
@@ -891,14 +887,6 @@ static const char *_set_job_msg(job_desc_msg_t *job_msg, const char *new_text,
 		job_msg->wckey = xstrdup(new_text);
 		type = "wckey";
 		break;
-	case SORTID_OVER_SUBSCRIBE:
-		if (!xstrcasecmp(new_text, "yes"))
-			job_msg->shared = 1;
-		else
-			job_msg->shared = 0;
-
-		type = "oversubscribe";
-		break;
 	case SORTID_CONTIGUOUS:
 		if (!xstrcasecmp(new_text, "yes"))
 			job_msg->contiguous = 1;
@@ -1013,7 +1001,7 @@ static const char *_set_job_msg(job_desc_msg_t *job_msg, const char *new_text,
 		job_msg->argv = xmalloc(sizeof(char *) * job_msg->argc);
 		if (new_text[0] == '/') {
 			job_msg->argv[0] = xstrdup(new_text);
-			token = strrchr(new_text, (int) '/');
+			token = xstrrchr(new_text, (int) '/');
 			if (token)
 				job_msg->name = xstrdup(token + 1);
 		} else {
@@ -1609,7 +1597,14 @@ static void _layout_job_record(GtkTreeView *treeview,
 	add_display_treestore_line(update, treestore, &iter,
 				   find_col_name(display_data_job,
 						 SORTID_OVER_SUBSCRIBE),
-				   job_share_string(job_ptr->shared));
+				   job_oversubscribe_string(
+					   job_ptr->oversubscribe));
+
+	add_display_treestore_line(update, treestore, &iter,
+				   find_col_name(display_data_job,
+						 SORTID_EXCLUSIVE),
+				   job_exclusive_display_string(
+					   job_ptr->exclusive));
 
 	if (job_ptr->het_job_id) {
 		snprintf(tmp_char, sizeof(tmp_char), "%u",
@@ -2251,6 +2246,10 @@ static void _update_job_record(sview_job_info_t *sview_job_info_ptr,
 				   SORTID_COMMENT,      job_ptr->comment,
 				   SORTID_CONTIGUOUS,   tmp_cont,
 				   SORTID_EXTRA, job_ptr->extra,
+				   SORTID_OVER_SUBSCRIBE,
+				   job_oversubscribe_string(job_ptr->oversubscribe),
+				   SORTID_EXCLUSIVE,
+				   job_exclusive_display_string(job_ptr->exclusive),
 				   SORTID_JOBID,        tmp_job_id,
 				   SORTID_JOBID_FORMATTED, tmp_job_id,
 				   SORTID_HET_JOB_ID,     tmp_het_job_id,
@@ -2322,7 +2321,11 @@ static void _update_job_record(sview_job_info_t *sview_job_info_ptr,
 				   SORTID_NODES_MAX,    tmp_nodes_max,
 				   SORTID_NODES_MIN,    tmp_nodes_min,
 				   SORTID_OVER_SUBSCRIBE,
-				   job_share_string(job_ptr->shared),
+				   job_oversubscribe_string(
+					   job_ptr->oversubscribe),
+				   SORTID_EXCLUSIVE,
+				   job_exclusive_display_string(
+					   job_ptr->exclusive),
 				   SORTID_HET_JOB_ID,     tmp_het_job_id,
 				   SORTID_HET_JOB_ID_SET, tmp_het_job_id_set,
 				   SORTID_HET_JOB_OFFSET, tmp_het_job_offset,
@@ -3607,7 +3610,6 @@ extern GtkListStore *create_model_job(int type)
 	case SORTID_CONTIGUOUS:
 	case SORTID_REBOOT:
 	case SORTID_REQUEUE:
-	case SORTID_OVER_SUBSCRIBE:
 		model = gtk_list_store_new(2, G_TYPE_STRING, G_TYPE_INT);
 		gtk_list_store_append(model, &iter);
 		gtk_list_store_set(model, &iter,
@@ -4332,9 +4334,7 @@ extern void popup_all_job(GtkTreeModel *model, GtkTreeIter *iter, int id)
 
 static void process_foreach_list(jobs_foreach_common_t *jobs_foreach_common)
 {
-	int jobid;
 	int state;
-	int stepid;
 	uint16_t signal = SIGKILL;
 	int response = 0;
 	char *tmp_char_ptr = "";
@@ -4361,8 +4361,6 @@ static void process_foreach_list(jobs_foreach_common_t *jobs_foreach_common)
 		if (global_error_code)
 			break;
 
-		jobid = job_foreach->step_id.job_id;
-		stepid = job_foreach->step_id.step_id;
 		state = job_foreach->state;
 
 		switch(jobs_foreach_common->edit_type) {
@@ -4372,16 +4370,17 @@ static void process_foreach_list(jobs_foreach_common_t *jobs_foreach_common)
 			 * just a regular cancel).
 			 */
 		case EDIT_CANCEL:
-			if (stepid == NO_VAL)
+			if (job_foreach->step_id.step_id == NO_VAL)
 				global_error_code =
-					_cancel_job_id(jobid, signal);
+					_cancel_job_id(job_foreach->step_id,
+						       signal);
 			else
 				global_error_code =
-					_cancel_step_id(jobid,
-							stepid, signal);
+					_cancel_step_id(job_foreach->step_id,
+							signal);
 			break;
 		case EDIT_REQUEUE:
-			response = slurm_requeue(jobid, 0);
+			response = slurm_requeue(job_foreach->step_id, 0);
 
 			if (response) {
 				/* stop rest of jobs */
@@ -4389,7 +4388,8 @@ static void process_foreach_list(jobs_foreach_common_t *jobs_foreach_common)
 				tmp_char_ptr = g_strdup_printf(
 					"Error happened trying "
 					"to requeue job %u: %s",
-					jobid, slurm_strerror(response));
+					job_foreach->step_id.job_id,
+					slurm_strerror(response));
 				display_edit_note(tmp_char_ptr);
 				g_free(tmp_char_ptr);
 			}
@@ -4397,16 +4397,16 @@ static void process_foreach_list(jobs_foreach_common_t *jobs_foreach_common)
 		case EDIT_SUSPEND:
 			//note: derive state from job_foreach..
 			if (state == JOB_SUSPENDED)
-				response = slurm_resume(jobid);
+				response = slurm_resume(job_foreach->step_id);
 			else
-				response = slurm_suspend(jobid);
+				response = slurm_suspend(job_foreach->step_id);
 			if (!response) {
 				/* stop rest of jobs */
 				global_error_code = response;
 				tmp_char_ptr = g_strdup_printf(
 					"Error happened trying to "
 					"SUSPEND/RESUME job %u.",
-					jobid);
+					job_foreach->step_id.job_id);
 				display_edit_note(tmp_char_ptr);
 				g_free(tmp_char_ptr);
 			}

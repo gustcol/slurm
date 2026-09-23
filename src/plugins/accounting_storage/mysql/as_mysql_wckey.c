@@ -88,9 +88,9 @@ static int _reset_default_wckey(mysql_conn_t *mysql_conn,
 		return SLURM_ERROR;
 
 	xstrfmtcat(query, "update \"%s_%s\" set is_def=0, mod_time=%ld "
-		   "where (user='%s' && wckey_name!='%s' && is_def=1);"
+		   "where (user='%s' and wckey_name!='%s' and is_def=1);"
 		   "select id_wckey from \"%s_%s\" "
-		   "where (user='%s' && wckey_name!='%s' && is_def=1);",
+		   "where (user='%s' and wckey_name!='%s' and is_def=1);",
 		   wckey->cluster, wckey_table, (long)now,
 		   wckey->user, wckey->name,
 		   wckey->cluster, wckey_table,
@@ -231,25 +231,25 @@ static int _setup_wckey_cond_limits(slurmdb_wckey_cond_t *wckey_cond,
 		return 0;
 
 	if (wckey_cond->with_deleted)
-		xstrfmtcat(*extra, " where (%s.deleted=0 || %s.deleted=1)",
+		xstrfmtcat(*extra, " where (%s.deleted=0 or %s.deleted=1)",
 			   prefix, prefix);
 	else
 		xstrfmtcat(*extra, " where %s.deleted=0", prefix);
 
 	if (wckey_cond->only_defs) {
 		set = 1;
-		xstrfmtcat(*extra, " && (%s.is_def=1)", prefix);
+		xstrfmtcat(*extra, " and (%s.is_def=1)", prefix);
 	}
 
 	if (wckey_cond->name_list && list_count(wckey_cond->name_list)) {
 		set = 0;
-		xstrcat(*extra, " && (");
+		xstrcat(*extra, " and (");
 		itr = list_iterator_create(wckey_cond->name_list);
 		while ((object = list_next(itr))) {
 			if (set)
-				xstrcat(*extra, " || ");
+				xstrcat(*extra, " or ");
 			xstrfmtcat(*extra,
-				   "%s.wckey_name='%s' || %s.wckey_name='*%s'",
+				   "%s.wckey_name='%s' or %s.wckey_name='*%s'",
 				   prefix, object, prefix, object);
 			set = 1;
 		}
@@ -259,11 +259,11 @@ static int _setup_wckey_cond_limits(slurmdb_wckey_cond_t *wckey_cond,
 
 	if (wckey_cond->id_list && list_count(wckey_cond->id_list)) {
 		set = 0;
-		xstrcat(*extra, " && (");
+		xstrcat(*extra, " and (");
 		itr = list_iterator_create(wckey_cond->id_list);
 		while ((object = list_next(itr))) {
 			if (set)
-				xstrcat(*extra, " || ");
+				xstrcat(*extra, " or ");
 			xstrfmtcat(*extra, "%s.id_wckey=%s", prefix, object);
 			set = 1;
 		}
@@ -273,11 +273,11 @@ static int _setup_wckey_cond_limits(slurmdb_wckey_cond_t *wckey_cond,
 
 	if (wckey_cond->user_list && list_count(wckey_cond->user_list)) {
 		set = 0;
-		xstrcat(*extra, " && (");
+		xstrcat(*extra, " and (");
 		itr = list_iterator_create(wckey_cond->user_list);
 		while ((object = list_next(itr))) {
 			if (set)
-				xstrcat(*extra, " || ");
+				xstrcat(*extra, " or ");
 			xstrfmtcat(*extra, "%s.user='%s'", prefix, object);
 			set = 1;
 		}
@@ -321,7 +321,7 @@ static int _cluster_remove_wckeys(remove_common_args_t *args,
 		if (!assoc_char)
 			xstrfmtcat(assoc_char, "id_wckey='%s'", row[0]);
 		else
-			xstrfmtcat(assoc_char, " || id_wckey='%s'", row[0]);
+			xstrfmtcat(assoc_char, " or id_wckey='%s'", row[0]);
 
 		wckey_rec = xmalloc(sizeof(slurmdb_wckey_rec_t));
 		/* we only need id and cluster when removing
@@ -399,7 +399,7 @@ static int _cluster_modify_wckeys(mysql_conn_t *mysql_conn,
 		if (!wckey_char)
 			xstrfmtcat(wckey_char, "id_wckey='%s'", row[0]);
 		else
-			xstrfmtcat(wckey_char, " || id_wckey='%s'", row[0]);
+			xstrfmtcat(wckey_char, " or id_wckey='%s'", row[0]);
 
 		wckey_rec = xmalloc(sizeof(slurmdb_wckey_rec_t));
 		/* we only need id and cluster when removing
@@ -746,6 +746,13 @@ extern int as_mysql_add_wckeys(mysql_conn_t *mysql_conn, uint32_t uid,
 			continue;
 		}
 
+		if (as_mysql_validate_cluster_name(object->cluster) !=
+		    SLURM_SUCCESS) {
+			rc = ESLURM_INVALID_CLUSTER_NAME;
+			list_delete_item(itr);
+			continue;
+		}
+
 		if (!added_user_list)
 			added_user_list = list_create(NULL);
 		if (!list_find_first(added_user_list,
@@ -791,7 +798,8 @@ extern int as_mysql_add_wckeys(mysql_conn_t *mysql_conn, uint32_t uid,
 		xfree(query);
 		if (!object->id) {
 			error("Couldn't add wckey %s", object->name);
-			added=0;
+			rc = SLURM_ERROR;
+			added = 0;
 			xfree(cols);
 			xfree(extra);
 			xfree(vals);
@@ -846,7 +854,9 @@ extern int as_mysql_add_wckeys(mysql_conn_t *mysql_conn, uint32_t uid,
 	xfree(user_name);
 
 	if (!added) {
-		reset_mysql_conn(mysql_conn);
+		/* Idempotent duplicate rows must not roll back this txn. */
+		if (rc != SLURM_SUCCESS)
+			reset_mysql_conn(mysql_conn);
 		goto end_it;
 	}
 
@@ -894,6 +904,10 @@ extern char *as_mysql_add_wckeys_cond(mysql_conn_t *mysql_conn, uint32_t uid,
 		errno = ESLURM_ACCESS_DENIED;
 		return NULL;
 	}
+
+	if (as_mysql_validate_cluster_list(add_assoc->cluster_list) !=
+	    SLURM_SUCCESS)
+		return NULL;
 
 	if (add_assoc->cluster_list && list_count(add_assoc->cluster_list))
 		use_cluster_list = add_assoc->cluster_list;
@@ -963,6 +977,10 @@ extern list_t *as_mysql_modify_wckeys(mysql_conn_t *mysql_conn,
 	}
 
 	if (check_connection(mysql_conn) != SLURM_SUCCESS)
+		return NULL;
+
+	if (as_mysql_validate_cluster_list(wckey_cond->cluster_list) !=
+	    SLURM_SUCCESS)
 		return NULL;
 
 	if (!is_user_min_admin_level(mysql_conn, uid, SLURMDB_ADMIN_OPERATOR)) {
@@ -1064,6 +1082,10 @@ extern list_t *as_mysql_remove_wckeys(mysql_conn_t *mysql_conn,
 		return NULL;
 	}
 
+	if (as_mysql_validate_cluster_list(wckey_cond->cluster_list) !=
+	    SLURM_SUCCESS)
+		return NULL;
+
 	(void) _setup_wckey_cond_limits(wckey_cond, &extra);
 
 empty:
@@ -1138,6 +1160,10 @@ extern list_t *as_mysql_get_wckeys(mysql_conn_t *mysql_conn, uid_t uid,
 	memset(&user, 0, sizeof(slurmdb_user_rec_t));
 	user.uid = uid;
 
+	if (as_mysql_validate_cluster_list(wckey_cond->cluster_list) !=
+	    SLURM_SUCCESS)
+		return NULL;
+
 	if (slurm_conf.private_data & PRIVATE_DATA_USERS) {
 		if (!(is_admin = is_user_min_admin_level(
 			      mysql_conn, uid, SLURMDB_ADMIN_OPERATOR))) {
@@ -1165,7 +1191,7 @@ empty:
 	 * coordinator of.
 	 */
 	if (!is_admin && (slurm_conf.private_data & PRIVATE_DATA_USERS))
-		xstrfmtcat(extra, " && t1.user='%s'", user.name);
+		xstrfmtcat(extra, " and t1.user='%s'", user.name);
 
 	wckey_list = list_create(slurmdb_destroy_wckey_rec);
 

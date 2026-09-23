@@ -40,6 +40,9 @@
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
+
+#include "src/interfaces/hash.h"
+
 #include "src/plugins/cred/common/cred_common.h"
 
 /* Required Slurm plugin symbols: */
@@ -86,6 +89,11 @@ extern slurm_cred_t *cred_p_unpack(buf_t *buf, uint16_t protocol_version)
 	return credential;
 }
 
+extern char *cred_p_get_signature_key(char *signature)
+{
+	return hash_g_compute_hex(signature);
+}
+
 extern char *cred_p_create_net_cred(void *addrs, uint16_t protocol_version)
 {
 	return NULL;
@@ -106,6 +114,7 @@ extern sbcast_cred_t *sbcast_p_create(sbcast_cred_arg_t *cred_arg,
 }
 
 extern sbcast_cred_t *sbcast_p_unpack(buf_t *buf, bool verify,
+				      bool replay_okay,
 				      uint16_t protocol_version)
 {
 	uint32_t siglen;

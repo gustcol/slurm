@@ -277,8 +277,7 @@ extern bool running_configless;
 /*****************************************************************************\
  *  NODE parameters and data structures, mostly in src/common/node_conf.h
 \*****************************************************************************/
-extern bool ping_nodes_now;		/* if set, ping nodes immediately */
-extern bool want_nodes_reboot;		/* if set, check for idle nodes */
+extern bool ping_nodes_now; /* if set, ping nodes immediately */
 extern bool ignore_state_errors;
 
 extern list_t *conf_includes_list;  /* list of conf_includes_map_t */
@@ -410,6 +409,7 @@ typedef struct slurmctld_resv {
 	char *users;		/* names of users permitted to use	*/
 	int user_cnt;		/* count of users permitted to use	*/
 	uid_t *user_list;	/* array of users permitted to use	*/
+	char **username_list; /* array of usernames permitted to use */
 } slurmctld_resv_t;
 
 typedef struct {
@@ -618,12 +618,6 @@ extern int dump_all_part_state ( void );
  */
 extern void dump_job_desc(job_desc_msg_t *job_desc);
 
-/*
- * dump_step_desc - dump the incoming step initiate request message
- * IN step_spec - job step request specification from RPC
- */
-extern void dump_step_desc(job_step_create_request_msg_t *step_spec);
-
 /* Remove one node from a job's allocation */
 extern void excise_node_from_job(job_record_t *job_ptr,
 				 node_record_t *node_ptr);
@@ -755,11 +749,32 @@ extern job_record_t *find_sluid(sluid_t sluid);
 extern job_record_t *find_job(const slurm_step_id_t *step_id);
 
 /*
+ * Get a step_id from the het leader's counter.
+ *
+ * IN het_job_id - leader's job_id.
+ * OUT step_id_out - allocated step_id.
+ * RET SLURM_SUCCESS or ESLURM_INVALID_JOB_ID.
+ */
+extern int get_het_step_id(uint32_t het_job_id, uint32_t *step_id_out);
+
+/*
  * find_part_record - find a record for partition with specified name
  * IN name - name of the desired partition
  * RET pointer to partition or NULL if not found
  */
 extern part_record_t *find_part_record(char *name);
+
+/*
+ * find_alloc_part_record - find a non-pending job's allocated partition from
+ *	its state saved alloc_partition, falling back to the first token of
+ *	the partition string when alloc_partition is NULL.
+ * IN job_ptr - the job to look up
+ * OUT part_name - if not NULL, set to a copy of the partition name only when
+ *	the return is NULL, letting the caller name the removed partition
+ * RET the allocated partition, or NULL if it no longer exists
+ */
+extern part_record_t *find_alloc_part_record(job_record_t *job_ptr,
+					     char **part_name);
 
 /*
  * get_job_env - return the environment variables and their count for a
@@ -795,15 +810,15 @@ extern uint32_t get_next_job_id(bool test_only);
 /*
  * get_part_list - find record for named partition(s)
  * IN name - partition name(s) in a comma separated list
- * OUT part_ptr_list - sorted list of pointers to the partitions or NULL
- * OUT prim_part_ptr - pointer to the primary partition
- * OUT err_part - The first invalid partition name.
+ * OUT part_ptr_list - list of pointers to the partitions sorted by
+ *		       PriorityTier, or NULL
+ * OUT prim_part_ptr - pointer to the highest PriorityTier partition
+ * OUT err_part - All the invalid partition names.
  * NOTE: Caller must free the returned list
  * NOTE: Caller must free err_part
  */
 extern void get_part_list(char *name, list_t **part_ptr_list,
-			  part_record_t **prim_part_ptr, char **err_part,
-			  bool *first_valid);
+			  part_record_t **prim_part_ptr, char **err_part);
 
 /*
  * init_depend_policy()
@@ -905,7 +920,7 @@ extern int job_alloc_info_ptr(uint32_t uid, job_record_t *job_ptr);
  * IN will_run - don't initiate the job if set, just test if it could run
  *	now or later
  * OUT resp - will run response (includes start location, time, etc.)
- * IN allocate - resource allocation request only if set, batch job if zero
+ * IN allocate - resource allocation request if true, batch job if false
  * IN submit_uid -uid of user issuing the request
  * IN cron - true if cron
  * OUT job_pptr - set to pointer to job record
@@ -922,10 +937,9 @@ extern int job_alloc_info_ptr(uint32_t uid, job_record_t *job_ptr);
  *	default_part_loc - pointer to default partition
  * NOTE: lock_slurmctld on entry: Read config Write job, Write node, Read part
  */
-extern int job_allocate(job_desc_msg_t *job_desc, int immediate,
-			int will_run, will_run_response_msg_t **resp,
-			int allocate, uid_t submit_uid, bool cron,
-			job_record_t **job_pptr,
+extern int job_allocate(job_desc_msg_t *job_desc, int immediate, int will_run,
+			will_run_response_msg_t **resp, bool allocate,
+			uid_t submit_uid, bool cron, job_record_t **job_pptr,
 			char **err_msg, uint16_t protocol_version);
 
 /* If this is a job array meta-job, prepare it for being scheduled */
@@ -1034,6 +1048,22 @@ extern void job_pre_resize_acctg(job_record_t *job_ptr);
 
 /* Record accounting information for a job immediately after changing size */
 extern void job_post_resize_acctg(job_record_t *job_ptr);
+
+/*
+ * Complete a memory reduction after the agent confirms slurmd applied
+ * the new cgroup limits. Updates select plugin accounting and creates
+ * a new SlurmDBD record with the reduced memory.
+ */
+extern void job_mem_resize_complete(job_record_t *job_ptr);
+
+/*
+ * Begin memory reduction for a running job. Validates that new_mem is
+ * a strict reduction, then updates pn_min_memory and marks JOB_RESIZING.
+ * IN job_ptr - running job to reduce
+ * IN new_mem - new per-node memory limit in MB (must not have MEM_PER_CPU)
+ * RET SLURM_SUCCESS or ESLURM error code
+ */
+extern int job_mem_resize_begin(job_record_t *job_ptr, uint64_t new_mem);
 
 /*
  * job_signal - signal the specified job, access checks already done
@@ -1560,6 +1590,13 @@ extern bool partition_in_use(char *part_name);
 extern int pick_batch_host(job_record_t *job_ptr);
 
 /*
+ * is_prolog_running - test whether any node prolog is still running for a job
+ * IN job_ptr - pointer to job table entry
+ * RET true while at least one node has not reported its prolog complete
+ */
+extern bool is_prolog_running(job_record_t *job_ptr);
+
+/*
  * prolog_complete - note the normal termination of the prolog
  * RET - 0 on success, otherwise ESLURM error code
  * global: job_list - pointer global job list
@@ -1579,7 +1616,8 @@ extern void handle_invalid_dependency(job_record_t *job_ptr);
  *	The jobs must have completed at least MIN_JOB_AGE minutes ago.
  *	Test job dependencies, handle after_ok, after_not_ok before
  *	purging any jobs.
- * NOTE: READ lock slurmctld config and WRITE lock jobs before entry
+ * NOTE: slurmctld config and fed READ locks and job and node WRITE locks are
+ *       acquired by this function.
  */
 void purge_old_job(void);
 
@@ -1637,15 +1675,22 @@ extern int on_backup_msg(conmgr_callback_args_t conmgr_args, slurm_msg_t *msg,
  */
 extern int ping_controllers(bool active_controller);
 
+/* Spawn health check function for a single node */
+extern void run_health_check_individual(node_record_t *node_ptr);
+
 /* Spawn health check function for every node that is not DOWN */
 extern void run_health_check(void);
 
 /* save_all_state - save entire slurmctld state for later recovery */
 extern void save_all_state(void);
 
-/* make sure the assoc_mgr lists are up and running and state is
- * restored */
-extern void ctld_assoc_mgr_init(void);
+/*
+ * Make sure the assoc_mgr lists are up and running and state is restored.
+ * IN update_now - If true update job, partition, and burst_buffer assoc
+ *                 pointers (basically if read_slurm_conf() will not be called
+ *                 later).
+ */
+extern void ctld_assoc_mgr_init(bool update_now);
 
 /* Make sure the assoc_mgr thread is terminated */
 extern void ctld_assoc_mgr_fini(void);
@@ -1811,6 +1856,20 @@ extern bool permit_job_expansion(void);
 extern bool permit_job_shrink(void);
 
 /*
+ * job_expand_merge - move every resource of job_ptr (a job started with an
+ *	"expand:<jobid>" dependency) into the job it expands, then complete
+ *	job_ptr.
+ * RET SLURM_SUCCESS or an error code
+ */
+extern int job_expand_merge(job_record_t *job_ptr);
+
+/* True if SchedulerParameters=ignore_prefer_validation is set. */
+extern bool ignore_prefer_validation(void);
+
+/* True if SchedulerParameters=ignore_constraint_validation is set. */
+extern bool ignore_constraint_validation(void);
+
+/*
  * update_job - update a job's parameters per the supplied specifications
  * IN msg - RPC to update job, including change specification
  * IN uid - uid of user issuing RPC
@@ -1926,14 +1985,14 @@ extern int set_partition_billing_weights(char *billing_weights_str,
  * global: part_list - list of partition entries
  *	last_part_update - update time of partition records
  */
-extern int update_part (update_part_msg_t * part_desc, bool create_flag);
+extern int update_part(partition_info_t *part_desc, bool create_flag);
 
 /*
- * Sort all jobs' part_ptr_list to be in descending order according to
- * partition priority tier. This Should be called anytime a partition's priority
- * tier is modified.
+ * Sort every job's part_ptr_list by PriorityTier (descending) and rebuild its
+ * partition string to match, repointing a pending job's part_ptr to the new
+ * highest-tier partition. Call whenever a partition's PriorityTier changes.
  */
-extern void sort_all_jobs_partition_lists();
+extern void sort_all_jobs_partition_lists(void);
 
 /*
  * Common code to handle a job when a cred can't be created.
@@ -2312,6 +2371,11 @@ extern void listeners_unquiesce(void);
 
 /* Stop listener sockets from accept()ing new incoming requests */
 extern void listeners_quiesce(void);
+
+/*
+ * True when the controller is in run_backup() standby
+ */
+extern bool slurmctld_listeners_in_standby(void);
 
 /* Set/update a node's topology */
 extern int node_mgr_set_node_topology(node_record_t *node_ptr,

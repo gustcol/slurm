@@ -24,10 +24,8 @@ sacct [<OPTION>]
                    is a '|'. This options is ignored if -p or -P options
                    are not specified.
      -D, --duplicates:
-                   If Slurm job ids are reset, some job numbers may
-                   appear more than once referring to different jobs.
-                   Without this option only the most recent jobs will be
-                   displayed.
+                   Allow multiple job records for the same job ID to be shown,
+                   instead of just the most recent matching record.
      -e, --helpformat:
                    Print a list of fields that can be specified with the
                    '--format' option
@@ -125,6 +123,9 @@ sacct [<OPTION>]
      -r, --partition:
                    Comma separated list of partitions to select jobs and
                    job steps from. The default is all partitions.
+     -R, --reason=<reason_list>:
+		   Comma separated list to filter jobs based on what reason the
+		   job wasn't scheduled outside resources/priority.
      -s, --state:
                    Select jobs based on their current state or the state
                    they were in during the time period given: running (r),

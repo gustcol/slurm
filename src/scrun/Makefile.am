@@ -14,13 +14,11 @@ SRCS = \
 
 convenience_libs = $(LIB_SLURM)
 
-if HAVE_LUA
-
-AM_CPPFLAGS = -I$(top_srcdir) $(lua_CFLAGS)
+AM_CPPFLAGS = -I$(top_srcdir) $(lua_CFLAGS) -DHAVE_LUA
 
 bin_PROGRAMS = scrun
 scrun_SOURCES = $(SRCS)
-scrun_DEPENDENCIES = $(LIB_SLURM_BUILD)
+scrun_DEPENDENCIES = $(LIB_SLURM_BUILD) $(top_builddir)/src/lua/libslurm_lua.la
 scrun_LDFLAGS = -export-dynamic $(CMD_LDFLAGS)
 scrun_LDADD = $(convenience_libs) $(top_builddir)/src/lua/libslurm_lua.la $(lua_LIBS)
 
@@ -33,7 +31,3 @@ scrun_LDADD += $(LIB_REF)
 force:
 $(convenience_libs) : force
 	@cd `dirname $@` && $(MAKE) `basename $@`
-
-else
-EXTRA_scrun_SOURCES = $(SRCS)
-endif

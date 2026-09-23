@@ -70,9 +70,6 @@ list_t *allocate_het_job_nodes(void);
 /* dummy function to handle all signals we want to ignore */
 void ignore_signal(int signo);
 
-/* clean up the msg thread polling for information from the controller */
-int cleanup_allocation(void);
-
 /*
  * Test if an allocation would occur now given the job request.
  * Do not actually allocate resources
@@ -95,16 +92,6 @@ void job_desc_msg_destroy (job_desc_msg_t *j);
  * Returns NULL if SLURM_JOB_ID is not present or is invalid.
  */
 extern list_t *existing_allocation(void);
-
-/*
- * Create a job step given the job information stored in 'j'
- * After returning, 'j' is filled in with information for job step.
- * IN use_all_cpus - true to use every CPU allocated to the job
- * IN opt_local - options used to create job step
- *
- * Returns -1 if job step creation failure, 0 otherwise
- */
-int create_job_step(srun_job_t *j, bool use_all_cpus, slurm_opt_t *opt_local);
 
 /* set the job for debugging purpose */
 void set_allocate_job(srun_job_t *job);

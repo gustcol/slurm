@@ -2,6 +2,7 @@
 # Copyright (C) SchedMD LLC.
 ############################################################################
 import pytest
+
 import atf
 
 script_name = "./script.sh"
@@ -11,12 +12,6 @@ script_out = "./script.out"
 @pytest.fixture(scope="module", autouse=True)
 def setup():
     atf.require_slurm_running()
-
-
-@pytest.fixture(scope="function", autouse=True)
-def cancel_jobs():
-    yield
-    atf.cancel_all_jobs()
 
 
 def make_and_run_bash(command) -> None:

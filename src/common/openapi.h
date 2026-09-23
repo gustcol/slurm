@@ -37,8 +37,12 @@
 #define SLURM_OPENAPI_H
 
 #include "slurm/slurmdb.h"
+
 #include "src/common/data.h"
+#include "src/common/http.h"
 #include "src/common/macros.h"
+
+#include "src/interfaces/data_parser.h"
 
 typedef enum {
 	OPENAPI_TYPE_INVALID = 0,
@@ -76,6 +80,7 @@ extern const char *openapi_type_format_to_type_string(
 	openapi_type_format_t format);
 extern data_type_t openapi_type_format_to_data_type(
 	openapi_type_format_t format);
+extern data_type_t openapi_type_to_data_type(openapi_type_t type);
 extern openapi_type_format_t openapi_string_to_type_format(const char *str);
 extern openapi_type_format_t openapi_data_type_to_type_format(data_type_t type);
 extern openapi_type_t openapi_type_format_to_type(openapi_type_format_t format);
@@ -140,6 +145,71 @@ extern data_t *openapi_fork_rel_path_list(data_t *relative_path, int index);
  * RET SLURM_SUCCESS or error
  */
 extern int openapi_append_rel_path(data_t *relative_path, const char *sub_path);
+
+typedef struct {
+	int rc;
+	list_t *errors;
+	list_t *warnings;
+	data_parser_t *parser;
+	const char *id; /* string identifying client (usually IP) */
+	void *db_conn;
+	http_request_method_t method;
+	data_t *parameters;
+	data_t *query;
+	data_t *resp;
+	data_t *parent_path;
+	int tag;
+} openapi_ctxt_t;
+
+/*
+ * Callback from openapi caller.
+ * RET SLURM_SUCCESS or error to kill the connection
+ */
+typedef int (*openapi_ctxt_handler_t)(openapi_ctxt_t *ctxt);
+
+typedef enum {
+	OPENAPI_BIND_INVALID = 0,
+	OPENAPI_BIND_NONE = SLURM_BIT(1),
+	/* populate {data_parser} in URL */
+	OPENAPI_BIND_DATA_PARSER = SLURM_BIT(2),
+	/* populate errors,warnings,meta */
+	OPENAPI_BIND_OPENAPI_RESP_FMT = SLURM_BIT(3),
+	/* Hide from OpenAPI specification */
+	OPENAPI_BIND_HIDDEN_OAS = SLURM_BIT(4),
+	/* Do not prepare slurmdbd connection */
+	OPENAPI_BIND_NO_SLURMDBD = SLURM_BIT(5),
+	/* Require slurmdbd connection or don't call path */
+	OPENAPI_BIND_REQUIRE_SLURMDBD = SLURM_BIT(6),
+	OPENAPI_BIND_INVALID_MAX = INFINITE16
+} openapi_bind_flags_t;
+
+typedef struct {
+	http_request_method_t method;
+	const char *const *tags;
+	const char *summary;
+	const char *description;
+
+	struct {
+		data_parser_type_t type;
+		const char *description;
+	} response;
+
+	data_parser_type_t parameters;
+	data_parser_type_t query;
+
+	struct {
+		data_parser_type_t type;
+		const char *description;
+		bool optional;
+	} body;
+} openapi_path_binding_method_t;
+
+typedef struct {
+	const char *path;
+	openapi_ctxt_handler_t callback;
+	const openapi_path_binding_method_t *methods;
+	openapi_bind_flags_t flags;
+} openapi_path_binding_t;
 
 /* For list_for_each() to emit error() message for openapi_resp_error_t */
 extern int openapi_error_log_foreach(void *x, void *arg);
@@ -228,6 +298,14 @@ typedef struct {
 	list_t *wckeys;
 	list_t *associations;
 } openapi_resp_slurmdbd_config_t;
+
+/* represents the actual slurmdbd.conf file */
+typedef struct {
+	OPENAPI_RESP_STRUCT_META_FIELD;
+	OPENAPI_RESP_STRUCT_ERRORS_FIELD;
+	OPENAPI_RESP_STRUCT_WARNINGS_FIELD;
+	slurmdbd_conf_t *slurmdb_conf;
+} openapi_resp_slurmdbd_conf_t;
 
 typedef struct {
 	slurm_selected_step_t *id;
@@ -462,5 +540,32 @@ typedef struct {
 	list_t *job_id_list; /* list of slurm_selected_step_t* */
 	slurmdb_job_rec_t *job_rec;
 } openapi_job_modify_req_t;
+
+typedef struct {
+	OPENAPI_RESP_STRUCT_META_FIELD;
+	OPENAPI_RESP_STRUCT_ERRORS_FIELD;
+	OPENAPI_RESP_STRUCT_WARNINGS_FIELD;
+	list_t *partition_list; /* list of partition_info_t* */
+} openapi_part_mod_req_t;
+
+typedef struct {
+	OPENAPI_RESP_STRUCT_META_FIELD;
+	OPENAPI_RESP_STRUCT_ERRORS_FIELD;
+	OPENAPI_RESP_STRUCT_WARNINGS_FIELD;
+	slurm_conf_t *slurm_conf;
+} openapi_resp_config_t;
+
+typedef struct {
+	time_t update_time;
+} openapi_config_query_t;
+
+typedef struct {
+	uint32_t flags;
+} openapi_job_requeue_query_t;
+
+typedef struct {
+	list_t *jobs;
+	uint32_t flags;
+} openapi_jobs_requeue_query_t;
 
 #endif /* SLURM_OPENAPI_H */

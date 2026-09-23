@@ -40,6 +40,7 @@
 #include "src/common/log.h"
 #include "src/common/parse_time.h"
 #include "src/common/read_config.h"
+#include "src/common/slurm_protocol_defs.h"
 #include "src/common/xassert.h"
 #include "src/common/xmalloc.h"
 #include "src/common/xstring.h"
@@ -71,6 +72,7 @@ static const slurm_err_t nonfatal_errors[] = {
 	ESLURM_BURST_BUFFER_WAIT,
 	ESLURM_PARTITION_DOWN,
 	ESLURM_LICENSES_UNAVAILABLE,
+	ESLURM_HRES_DISABLED,
 	ESLURM_PORTS_BUSY,
 };
 
@@ -159,7 +161,7 @@ static void _handle_job_get(ctxt_t *ctxt, slurm_selected_step_t *job_id)
 	openapi_job_info_query_t query = {0};
 	int rc = SLURM_SUCCESS;
 	job_info_msg_t *job_info_ptr = NULL;
-	uint32_t id;
+	slurm_step_id_t step_id = SLURM_STEP_ID_INITIALIZER;
 	openapi_resp_job_info_msg_t resp = {0};
 
 	if (DATA_PARSE(ctxt->parser, OPENAPI_JOB_INFO_QUERY, query, ctxt->query,
@@ -169,10 +171,10 @@ static void _handle_job_get(ctxt_t *ctxt, slurm_selected_step_t *job_id)
 		return;
 	}
 
+	step_id = job_id->step_id;
+
 	if (job_id->het_job_offset != NO_VAL)
-		id = job_id->step_id.job_id + job_id->het_job_offset;
-	else
-		id = job_id->step_id.job_id;
+		step_id.job_id += job_id->het_job_offset;
 
 	if (job_id->array_task_id != NO_VAL)
 		resp_warn(ctxt, __func__, "Job array Ids are not currently supported for job searches. Showing all jobs in array instead.");
@@ -183,7 +185,7 @@ static void _handle_job_get(ctxt_t *ctxt, slurm_selected_step_t *job_id)
 	if (!query.show_flags)
 		query.show_flags = SHOW_ALL | SHOW_DETAIL;
 
-	if ((rc = slurm_load_job(&job_info_ptr, id, query.show_flags))) {
+	if ((rc = slurm_load_job(&job_info_ptr, step_id, query.show_flags))) {
 		char *id = NULL;
 
 		fmt_job_id_string(job_id, &id);
@@ -411,10 +413,14 @@ static void _job_post_het_submit(ctxt_t *ctxt, list_t *jobs, char *script)
 	}
 
 	{
-		/* Always verify first Het Component has a batch script */
+		/*
+		 * Verify the first Het Component has a batch script, unless it
+		 * is an external job (external jobs must not have a script).
+		 */
 		job_desc_msg_t *jdesc = list_peek(jobs);
 
-		if (!jdesc->script || !jdesc->script[0]) {
+		if ((!jdesc->script || !jdesc->script[0]) &&
+		    !(jdesc->bitflags & EXTERNAL_JOB)) {
 			resp_error(ctxt, ESLURM_JOB_SCRIPT_MISSING, __func__,
 				   "Refusing HetJob submission without batch script or empty batch script for first component");
 			goto cleanup;
@@ -519,9 +525,10 @@ extern int op_handler_job(openapi_ctxt_t *ctxt)
 
 	job_id = &params.job_id;
 
-	if ((job_id->step_id.job_id == NO_VAL) ||
-	    (job_id->step_id.job_id <= 0) ||
-	    (job_id->step_id.job_id >= MAX_JOB_ID)) {
+	if (!job_id->step_id.sluid &&
+	    ((job_id->step_id.job_id == NO_VAL) ||
+	     (job_id->step_id.job_id <= 0) ||
+	     (job_id->step_id.job_id >= MAX_JOB_ID))) {
 		return resp_error(ctxt, ESLURM_INVALID_JOB_ID, __func__,
 				  "Invalid JobID=%u rejected",
 				  job_id->step_id.job_id);
@@ -634,7 +641,7 @@ static void _job_post_allocate(ctxt_t *ctxt, job_desc_msg_t *job)
 
 	(void) _foreach_alloc_job(job, NULL);
 
-	if (!(resp = slurm_allocate_resources_blocking(job, 0, NULL))) {
+	if (!(resp = slurm_allocate_resources_blocking(job, 0, NULL, -1))) {
 		resp_error(ctxt, errno, "slurm_allocate_resources_blocking()",
 			   "Job allocation request failed");
 	} else {
@@ -674,7 +681,7 @@ static void _job_post_het_allocate(ctxt_t *ctxt, list_t *hetjob)
 
 	(void) list_for_each(hetjob, _foreach_alloc_job, NULL);
 
-	if (!(resp = slurm_allocate_het_job_blocking(hetjob, 0, NULL))) {
+	if (!(resp = slurm_allocate_het_job_blocking(hetjob, 0, NULL, -1))) {
 		resp_error(ctxt, errno, "slurm_allocate_het_job_blocking()",
 			   "Job allocation request failed");
 	} else {
@@ -794,5 +801,138 @@ extern int op_handler_job_states(openapi_ctxt_t *ctxt)
 	slurm_free_job_state_response_msg(resp.jobs);
 	FREE_NULL_LIST(query.job_id_list);
 	xfree(job_ids);
+	return rc;
+}
+
+extern int op_handler_job_requeue(openapi_ctxt_t *ctxt)
+{
+	openapi_job_requeue_query_t query = { 0 };
+	job_array_resp_msg_t *resp = NULL;
+	openapi_job_info_param_t params = { { 0 } };
+	char *job_str = NULL;
+	int rc = EINVAL;
+
+	if (ctxt->method != HTTP_REQUEST_GET) {
+		return resp_error(ctxt, (rc = ESLURM_REST_INVALID_QUERY),
+				  __func__,
+				  "Unsupported HTTP method requested: %s",
+				  get_http_method_string(ctxt->method));
+	}
+
+	if (DATA_PARSE(ctxt->parser, OPENAPI_JOB_INFO_PARAM, params,
+		       ctxt->parameters, ctxt->parent_path)) {
+		rc = ESLURM_REST_INVALID_QUERY;
+		resp_error(ctxt, rc, __func__,
+			   "Rejecting request. Failure parsing parameters");
+		goto cleanup;
+	}
+
+	if (DATA_PARSE(ctxt->parser, OPENAPI_JOB_REQUEUE_QUERY, query,
+		       ctxt->query, ctxt->parent_path)) {
+		rc = ESLURM_REST_INVALID_QUERY;
+		resp_error(ctxt, rc, __func__,
+			   "Rejecting request. Failure parsing query");
+		goto cleanup;
+	}
+
+	if ((rc = fmt_job_id_string(&params.job_id, &job_str))) {
+		resp_error(ctxt, rc, __func__, "Invalid JobID");
+		goto cleanup;
+	}
+
+	if ((query.flags & JOB_SPECIAL_EXIT) &&
+	    !(query.flags & JOB_REQUEUE_HOLD)) {
+		rc = ESLURM_REST_BAD_REQUEST;
+		resp_error(ctxt, rc, __func__,
+			   "SpecialExit requires Hold mode");
+		goto cleanup;
+	}
+
+	errno = SLURM_SUCCESS;
+	if ((rc = slurm_requeue2(job_str, query.flags, &resp))) {
+		if ((rc == SLURM_ERROR) && errno)
+			rc = errno;
+
+		(void) resp_error(ctxt, rc, __func__, "Requeue JobID=%s failed",
+				  job_str);
+	}
+
+	DUMP_OPENAPI_RESP_SINGLE(OPENAPI_JOB_REQUEUE_RESP, resp, ctxt);
+
+cleanup:
+	FREE_NULL_BITMAP(params.job_id.array_bitmap);
+	xfree(job_str);
+	slurm_free_job_array_resp(resp);
+	return rc;
+}
+
+extern int op_handler_jobs_requeue(openapi_ctxt_t *ctxt)
+{
+	openapi_jobs_requeue_query_t query = { 0 };
+	list_t *responses = NULL;
+	slurm_selected_step_t *step = NULL;
+	int rc = SLURM_SUCCESS;
+
+	if (ctxt->method != HTTP_REQUEST_POST)
+		return resp_error(ctxt, ESLURM_REST_INVALID_QUERY, __func__,
+				  "Unsupported HTTP method requested: %s",
+				  get_http_method_string(ctxt->method));
+
+	if (DATA_PARSE(ctxt->parser, OPENAPI_JOBS_REQUEUE_QUERY, query,
+		       ctxt->query, ctxt->parent_path)) {
+		rc = ESLURM_REST_INVALID_QUERY;
+		resp_error(ctxt, rc, __func__,
+			   "Rejecting request. Failure parsing query");
+		goto cleanup;
+	}
+
+	if (!query.jobs || list_is_empty(query.jobs)) {
+		rc = ESLURM_INVALID_JOB_ID;
+		resp_error(ctxt, rc, __func__, "Query missing JobIds");
+		goto cleanup;
+	}
+
+	if ((query.flags & JOB_SPECIAL_EXIT) &&
+	    !(query.flags & JOB_REQUEUE_HOLD)) {
+		rc = ESLURM_REST_BAD_REQUEST;
+		resp_error(ctxt, rc, __func__,
+			   "SpecialExit requires Hold mode");
+		goto cleanup;
+	}
+
+	responses = list_create((ListDelF) slurm_free_job_array_resp);
+
+	while ((step = list_pop(query.jobs))) {
+		char *str = NULL;
+		job_array_resp_msg_t *resp = NULL;
+
+		if ((rc = fmt_job_id_string(step, &str))) {
+			(void) resp_error(ctxt, rc, __func__, "Invalid JobID");
+			slurm_destroy_selected_step(step);
+			break;
+		}
+
+		errno = SLURM_SUCCESS;
+		if ((rc = slurm_requeue2(str, query.flags, &resp))) {
+			if ((rc == SLURM_ERROR) && errno)
+				rc = errno;
+
+			(void) resp_error(ctxt, rc, __func__,
+					  "Requeue JobId=%s failed", str);
+		}
+
+		if (resp)
+			list_append(responses, resp);
+
+		slurm_destroy_selected_step(step);
+		xfree(str);
+	}
+
+	DUMP_OPENAPI_RESP_SINGLE(OPENAPI_JOBS_REQUEUE_RESP, responses, ctxt);
+	rc = SLURM_SUCCESS;
+
+cleanup:
+	FREE_NULL_LIST(query.jobs);
+	FREE_NULL_LIST(responses);
 	return rc;
 }

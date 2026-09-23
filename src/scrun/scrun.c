@@ -104,7 +104,7 @@ extern void update_logging(void)
 
 	if (json) {
 		/* docker requires RFC3339 timestamps */
-		log_set_timefmt(LOG_FMT_RFC3339);
+		log_set_timefmt(LOG_FMT_RFC3339, LOG_FLAGS_NONE);
 	}
 }
 
@@ -624,7 +624,7 @@ static int _try_tmp_path(const char *path)
 	return rc;
 }
 
-static void _set_root()
+static void _set_root(void)
 {
 	const char *epath;
 	char *path;

@@ -75,16 +75,23 @@ extern int net_stream_listen_ports(int *, uint16_t *, uint16_t *, bool);
  * dump sockaddr into a string
  * IN addr address to dump
  * IN addrlen size of addr
+ * IN resolve - true to attempt reverse DNS hostname resolution; false to
+ *	use the IP literal (via inet_ntop()). Reverse DNS lookups are
+ *	synchronous and may block, so prefer false on hot paths and reserve
+ *	true for debug/logging contexts where the resolved name is read.
  * RET ptr to string (must xfree) or NULL
  */
-extern char *sockaddr_to_string(const slurm_addr_t *addr, socklen_t addrlen);
+extern char *sockaddr_to_string(const slurm_addr_t *addr, socklen_t addrlen,
+				bool resolve);
 
 /*
  * dump addrinfo into a string
  * IN addr address to dump
+ * IN resolve - true to attempt reverse DNS hostname resolution; false to
+ *	use the IP literal. See sockaddr_to_string() for guidance.
  * RET ptr to string (must xfree) or NULL
  */
-extern char *addrinfo_to_string(const struct addrinfo *addr);
+extern char *addrinfo_to_string(const struct addrinfo *addr, bool resolve);
 
 /*
  * Initialize socket address for named unix socket
@@ -106,5 +113,32 @@ extern slurm_addr_t sockaddr_from_unix_path(const char *path);
  */
 extern int net_get_peer(int fd, uid_t *cred_uid, gid_t *cred_gid,
 			pid_t *cred_pid);
+
+/*
+ * Set length fields (sin_len/sin6_len/sun_len/sa_len) where the platform
+ * defines them, and return the canonical socklen_t to pass to
+ * bind()/connect()/getnameinfo() for the address family.
+ *
+ * IN sa - address to fix up (may be NULL)
+ * IN provided_len - caller's input length; returned unchanged when sa is NULL,
+ *                   for AF_UNIX abstract-namespace sockets, and for unknown
+ *                   address families
+ * RET length appropriate for the syscall
+ */
+extern socklen_t sockaddr_fixlen(struct sockaddr *sa, socklen_t provided_len);
+
+/*
+ * Copy src into dst and apply sockaddr_fixlen() on dst. Use when src is const
+ * and its length fields need to be written.
+ *
+ * IN dst - destination buffer (zeroed before copy)
+ * IN src - source address (must be non-NULL)
+ * IN src_len - bytes of src to copy (clamped to sizeof(*dst))
+ * OUT out_len - canonical length for dst, as from sockaddr_fixlen()
+ * RET 0 on success, -1 if dst/src/out_len is NULL
+ */
+extern int sockaddr_copy_fix(struct sockaddr_storage *dst,
+			     const struct sockaddr *src, socklen_t src_len,
+			     socklen_t *out_len);
 
 #endif /* !_NET_H */

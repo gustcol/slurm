@@ -53,6 +53,7 @@ extern int op_handler_reconfigure(openapi_ctxt_t *ctxt);
 extern int op_handler_diag(openapi_ctxt_t *ctxt);
 extern int op_handler_ping(openapi_ctxt_t *ctxt);
 extern int op_handler_licenses(openapi_ctxt_t *ctxt);
+extern int op_handler_hres(openapi_ctxt_t *ctxt);
 extern int op_handler_submit_job(openapi_ctxt_t *ctxt);
 extern int op_handler_alloc_job(openapi_ctxt_t *ctxt);
 extern int op_handler_job(openapi_ctxt_t *ctxt);
@@ -67,5 +68,8 @@ extern int op_handler_reservations(openapi_ctxt_t *ctxt);
 extern int op_handler_reservation(openapi_ctxt_t *ctxt);
 extern int op_handler_reservations_update(openapi_ctxt_t *ctxt);
 extern int op_handler_resources(openapi_ctxt_t *ctxt);
+extern int op_handler_config(openapi_ctxt_t *ctxt);
+extern int op_handler_job_requeue(openapi_ctxt_t *ctxt);
+extern int op_handler_jobs_requeue(openapi_ctxt_t *ctxt);
 
 #endif

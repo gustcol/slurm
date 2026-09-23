@@ -108,6 +108,23 @@
 #define bit_copybits		slurm_bit_copybits
 #define	bit_get_bit_num		slurm_bit_get_bit_num
 
+/* data.[ch] functions */
+#define _data_set_string_own slurm__data_set_string_own
+#define data_dict_for_each_const slurm_data_dict_for_each_const
+#define data_free slurm_data_free
+#define data_get_string slurm_data_get_string
+#define data_key_get slurm_data_key_get
+#define data_key_set slurm_data_key_set
+#define data_list_for_each_const slurm_data_list_for_each_const
+#define data_new slurm_data_new
+#define data_set_bool slurm_data_set_bool
+#define data_set_dict slurm_data_set_dict
+#define data_set_float slurm_data_set_float
+#define data_set_int slurm_data_set_int
+#define data_set_list slurm_data_set_list
+#define data_set_null slurm_data_set_null
+#define data_set_string slurm_data_set_string
+
 /* fd.[ch] functions */
 #define closeall		slurm_closeall
 #define closeall_except		slurm_closeall_except
@@ -274,7 +291,7 @@
 #define	free_buf		slurm_free_buf
 #define grow_buf		slurm_grow_buf
 #define	init_buf		slurm_init_buf
-#define	xfer_buf_data		slurm_xfer_buf_data
+#define xfer_buf_data_ptr slurm_xfer_buf_data_ptr
 #define	pack_time		slurm_pack_time
 #define	unpack_time		slurm_unpack_time
 #define	packfloat 		slurm_packfloat
@@ -309,6 +326,10 @@
 #define	unpackstr_array		slurm_unpackstr_array
 #define	packmem_array		slurm_packmem_array
 #define	unpackmem_array		slurm_unpackmem_array
+
+/* pack_data.[ch] functions */
+#define pack_data slurm_pack_data
+#define unpack_data slurm_unpack_data
 
 /* parse_time.[ch] functions */
 #define parse_time              slurm_parse_time
@@ -367,6 +388,10 @@
 /* xassert.[ch] functions */
 #define	__xassert_failed	slurm_xassert_failed
 
+/* xbase64.[ch] functions */
+#define xbase64_encode slurm_xbase64_encode
+#define xbase64_decode slurm_xbase64_decode
+
 /* xmalloc.[ch] functions */
 #define xsize			slurm_xsize
 #define xfree_ptr		slurm_xfree_ptr
@@ -380,35 +405,45 @@
 #define	xsignal_sigset_create	slurm_xsignal_sigset_create
 
 /* xstring.[ch] functions */
-#define	_xstrcat		slurm_xstrcat
-#define	_xstrcatat		slurm_xstrcatat
-#define	_xstrncat		slurm_xstrncat
-#define	_xstrcatchar		slurm_xstrcatchar
-#define	_xstrftimecat		slurm_xstrftimecat
-#define	_xiso8601timecat	slurm_xiso8601timecat
-#define	_xrfc5424timecat	slurm_xrfc5424timecat
-#define	_xstrfmtcat		slurm_xstrfmtcat
-#define	_xstrfmtcatat		slurm_xstrfmtcatat
-#define	_xmemcat		slurm_xmemcat
-#define	xstrdup			slurm_xstrdup
-#define	xstrdup_printf		slurm_xstrdup_printf
-#define _xstrdup_vprintf	slurm_xstrdup_vprintf
-#define	xstrndup		slurm_xstrndup
-#define	xbasename		slurm_xbasename
-#define	xdirname		slurm_xdirname
-#define	_xstrsubstitute		slurm_xstrsubstitute
-#define	xshort_hostname		slurm_xshort_hostname
-#define xstring_is_whitespace   slurm_xstring_is_whitespace
-#define	xstrtolower		slurm_xstrtolower
-#define xstrchr			slurm_xstrchr
-#define xstrrchr		slurm_xstrrchr
-#define xstrcmp			slurm_xstrcmp
-#define xstrncmp		slurm_xstrncmp
-#define xstrcasecmp		slurm_xstrcasecmp
-#define xstrncasecmp		slurm_xstrncasecmp
-#define	xstrstr			slurm_xstrstr
-#define xstrcasestr		slurm_xstrcasestr
-#define xbase64_from_base64url	slurm_xbase64_from_base64url
+#define _xstrcat slurm_xstrcat
+#define _xstrcatat slurm_xstrcatat
+#define _xstrncat slurm_xstrncat
+#define _xstrcatchar slurm_xstrcatchar
+#define _xstrftimecat slurm_xstrftimecat
+#define _xiso8601timecat slurm_xiso8601timecat
+#define _xstrfmtcat slurm_xstrfmtcat
+#define _xstrfmtcatat slurm_xstrfmtcatat
+#define _xmemcat slurm_xmemcat
+#define xstrdup slurm_xstrdup
+#define try_xstrndup slurm_try_xstrndup
+#define xstrdup_printf slurm_xstrdup_printf
+#define _xstrdup_vprintf slurm_xstrdup_vprintf
+#define xstrndup slurm_xstrndup
+#define xbasename slurm_xbasename
+#define xdirname slurm_xdirname
+#define _xstrsubstitute slurm_xstrsubstitute
+#define xshort_hostname slurm_xshort_hostname
+#define xstring_is_whitespace slurm_xstring_is_whitespace
+#define xstrtolower slurm_xstrtolower
+#define xstrchr slurm_xstrchr
+#define xstrrchr slurm_xstrrchr
+#define xstrcmp slurm_xstrcmp
+#define xstrncmp slurm_xstrncmp
+#define xstrcasecmp slurm_xstrcasecmp
+#define xstrncasecmp slurm_xstrncasecmp
+#define xstrstr slurm_xstrstr
+#define xstrcasestr slurm_xstrcasestr
+#define xbase64_from_base64url slurm_xbase64_from_base64url
+
+/* xutf.[ch] functions */
+#define utf_encoding_scheme_to_string slurm_utf_encoding_scheme_to_string
+#define utf8_strlen slurm_utf8_strlen
+#define utf8_ndup slurm_utf8_ndup
+#define utf8_dup slurm_utf8_dup
+#define utf_read_encoding_schema slurm_utf_read_encoding_schema
+#define utf8_get_loggable slurm_utf8_get_loggable
+#define utf16_to_coding slurm_utf16_to_coding
+#define utf16_from_coding slurm_utf16_from_coding
 
 /* slurm_protocol_api.[ch] functions */
 #define convert_num_unit2       slurm_convert_num_unit2
@@ -421,6 +456,8 @@
 #define preempt_mode_string	slurm_preempt_mode_string
 #define preempt_mode_num	slurm_preempt_mode_num
 #define job_share_string	slurm_job_share_string
+#define job_oversubscribe_string slurm_job_oversubscribe_string
+#define job_exclusive_display_string slurm_job_exclusive_display_string
 #define job_state_string	slurm_job_state_string
 #define job_state_string_compact slurm_job_state_string_compact
 #define job_state_num		slurm_job_state_num
@@ -526,6 +563,7 @@
 #define xfree_struct_hostent		slurm_xfree_struct_hostent
 #define stepd_get_namespace_fd		slurm_stepd_get_namespace_fd
 #define stepd_get_namespace_fds slurm_stepd_get_namespace_fds
+#define stepd_destroy_ns_fd_map slurm_stepd_destroy_ns_fd_map
 
 /* cgroup.[ch] functions */
 #define cgroup_conf_init		slurm_cgroup_conf_init
@@ -547,6 +585,8 @@
 #define serialize_g_data_to_string slurm_serialize_g_data_to_string
 #define serialize_g_string_to_data slurm_serialize_g_string_to_data
 #define serializer_g_fini slurm_serializer_g_fini
+#define serialize_g_parse slurm_serialize_g_parse
+#define serialize_g_dump slurm_serialize_g_dump
 
 /* certgen.[ch] functions */
 #define certgen_g_init slurm_certgen_g_init
@@ -558,6 +598,9 @@
 
 /* run_command.[ch] functions */
 #define run_command slurm_run_command
+
+/* openssl_helper.[ch] functions */
+#define openssl_helper_disable_atexit slurm_openssl_helper_disable_atexit
 
 /* http_parser.[ch] functions */
 #define http_parser_g_init slurm_http_parser_g_init

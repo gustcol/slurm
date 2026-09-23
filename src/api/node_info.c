@@ -401,6 +401,12 @@ char *slurm_sprint_node_table(node_info_t *node_ptr, int one_liner)
 	} else {
 		xstrcat(out, "ResumeAfterTime=None");
 	}
+
+	if (node_ptr->suspend_time == INFINITE)
+		xstrcat(out, " SuspendTime=INFINITE");
+	else
+		xstrfmtcat(out, " SuspendTime=%d", node_ptr->suspend_time);
+
 	xstrcat(out, line_end);
 
 	/****** TRES Line ******/
@@ -938,6 +944,12 @@ extern int slurm_get_node_alias_addrs(char *node_list,
 	int rc;
 	slurm_msg_t req_msg, resp_msg;
 	slurm_node_alias_addrs_t data = {.node_list = node_list};
+
+	/*
+	 * Callers free this unconditionally, without looking at the return
+	 * code, so always define it.
+	 */
+	*alias_addrs = NULL;
 
 	xassert(node_list);
 	if (!node_list)

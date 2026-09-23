@@ -1,10 +1,13 @@
 ############################################################################
 # Copyright (C) SchedMD LLC.
 ############################################################################
-import atf
 import pytest
 
+import atf
+
 # import re
+
+pytestmark = pytest.mark.slow
 
 
 # Setup

@@ -35,7 +35,7 @@ We recommend a limit of at least 32,832.</li>
 <li><b>/proc/sys/net/ipv4/tcp_max_syn_backlog</b>:
 The maximum number of SYN requests to keep in memory that we have yet to get
 the third packet in a 3-way handshake from.
-The default value is 1024 for systems with more than 128Mb of memory, and 128
+The default value is 1024 for systems with more than 128MiB of memory, and 128
 for low memory machines. If server suffers of overload, try to increase this
 number.</li>
 <li><b>/proc/sys/net/ipv4/tcp_syncookies</b>:
@@ -54,8 +54,9 @@ The default value of 5, which results in a timeout of passive TCP connections
 of approximately 180 seconds and is generally satisfactory.
 <li><b>/proc/sys/net/core/somaxconn</b>:
 Limit of socket listen() backlog, known in userspace as SOMAXCONN. Defaults to
-128. The value should be raised substantially to support bursts of request.
-For example, to support a burst of 1024 requests, set somaxconn to 1024.</li>
+128 or more depending on OS version. Sites should consider a minimum value of
+4096 or 8192, or a higher value that is greater the sum of all nodes plus all
+active clients in the cluster.</li>
 <li><b>/proc/sys/net/ipv4/ip_local_port_range</b>:
 Identify the ephemeral ports available, which are used for many Slurm
 communications. The value may be raised to support a high volume of
@@ -215,8 +216,9 @@ accounting. Sites are advised to try changing <b>MessageTimeout</b> and
 <b>TCPTimeout</b> before changing the <b>conmgr_max_connections</b> parameter.
 </li>
 <li>
-The <b>conmgr_threads</b> option controls the size of the thread pool that is
-used to process communications. Threads are used as needed to handle I/O or to
+The <b>workerpool_threads</b> option (formerly <b>conmgr_threads</b> prior to
+Slurm 26.11) controls the size of the thread pool that is used for internal
+processing. Threads are used as needed to handle I/O or to
 process incoming RPCs and generate replies. The trade off is that slurmctld will
 use more memory for each additional thread. Increasing thread counts will also
 cause increased kernel scheduler contention when there are more threads than
@@ -226,18 +228,18 @@ more of the global slurmctld locks. Each thread attempting to obtain a lock can
 cause increased contention with the scheduler threads. Lock contention will
 result in the job scheduler running slower or with noticeable delays, and
 increase the average time per RPC.
-Sites wishing for more RPC throughput can increase <b>conmgr_threads</b> from
-the defaults, while sites wishing to prioritize scheduler threads can decrease
-the thread count. We recommend trying to modify <b>conmgr_max_connections</b>
-and the <b>SchedulerParameters</b> to get the performance you want, before
-attempting to change <b>conmgr_threads</b>.
+Sites wishing for more RPC throughput can increase <b>workerpool_threads</b>
+from the default, while sites wishing to prioritize scheduler threads can
+decrease the thread count. We recommend trying to modify
+<b>conmgr_max_connections</b> and the <b>SchedulerParameters</b> to get the
+performance you want, before attempting to change <b>workerpool_threads</b>.
 You should monitor for changes in <code>sdiag</code>'s job start statistics
 when changing this parameter. In most cases, sites should consider reducing
-<b>conmgr_threads</b> instead of adding more threads, as having too many
+<b>workerpool_threads</b> instead of adding more threads, as having too many
 threads can cause locking overhead and cause <code>slurmctld</code> to hang.
-Increasing <b>conmgr_threads</b> also uses more memory, potentially causing an
-<i>Out of Memory</i> event for <code>slurmctld</code>, which could result in
-lost jobs and accounting.
+Increasing <b>workerpool_threads</b> also uses more memory, potentially
+causing an <i>Out of Memory</i> event for <code>slurmctld</code>, which could
+result in lost jobs and accounting.
 </li>
 </ul>
 <li><b>SchedulerType</b>:
@@ -247,15 +249,24 @@ and eliminates logic used to sort the queue by priority.
 <li><b>SlurmctldDebug</b>:
 More detailed logging will decrease system throughput. Set to <i>error</i> or
 <i>info</i> for regular operations with high throughput workload.</li>
-<li><b>SlurmctldPort</b>:
-It is desirable to configure the <b>slurmctld</b> daemon to accept incoming
-messages on more than one port in order to avoid having incoming messages
-discarded by the operating system due to exceeding the SOMAXCONN limit
-described above. Using between two and ten ports is suggested when large
-numbers of simultaneous requests are to be supported.</li>
 <li><b>SlurmdDebug</b>:
 More detailed logging will decrease system throughput. Set to <i>error</i> or
 <i>info</i> for regular operations with high throughput workload.</li>
+<li><b>SlurmdParameters</b>:
+<ul>
+<li>Increasing <b>conmgr_max_connections</b> will allow slurmd to accept more
+simultaneous connections from slurmctld. On nodes running many concurrent jobs,
+each job may generate multiple inbound connections from slurmctld (e.g., job
+launch, signals, termination). If the number of concurrent jobs approaches or
+exceeds the default connection limit, slurmctld will time out trying to reach
+slurmd, causing jobs to become stuck in the COMPLETING state until slurmctld
+retries successfully. Sites should set this to at least the number of jobs
+expected to run concurrently on a single node. The same memory trade-off
+described under <b>SlurmctldParameters=conmgr_max_connections</b> applies here.
+<br><b>NOTE</b>: When <b>SlurmctldParameters=enable_stepmgr</b> is set,
+slurmctld manages step lifecycles directly, which increases the number of
+connections to each slurmd and makes tuning this parameter more important.</li>
+</ul></li>
 <li><b>SlurmdLogFile</b>:
 Writing to local storage is recommended.</li>
 <li>The ability to do RPC rate limiting on a per-user basis is a new feature

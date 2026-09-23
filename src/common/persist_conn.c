@@ -77,6 +77,13 @@ static void _conn_destroy(persist_conn_t *persist_conn)
 	if (!persist_conn->conn)
 		return;
 
+	/*
+	 * Clear last_fd before any teardown so that external wake paths
+	 * (e.g. _connection_fini_callback() in slurmdbd) won't see a
+	 * stale fd that the kernel might subsequently reuse.
+	 */
+	persist_conn->last_fd = -1;
+
 	if (!persist_conn->skip_conn_shutdown)
 		(void) conn_blocking_g_shutdown(persist_conn->conn);
 
@@ -208,9 +215,13 @@ static void _sig_handler(int signal)
 static void _persist_free_msg_members(persist_conn_t *persist_conn,
 				      persist_msg_t *persist_msg)
 {
-	if (persist_conn->flags & PERSIST_FLAG_DBD)
-		slurmdbd_free_msg(persist_msg);
-	else
+	if (persist_conn->flags & PERSIST_FLAG_DBD) {
+		slurmdbd_msg_t dbd_msg = {
+			.data = persist_msg->data,
+			.msg_type = persist_msg->msg_type,
+		};
+		slurmdbd_free_msg(&dbd_msg);
+	} else
 		slurm_free_msg_data(persist_msg->msg_type, persist_msg->data);
 }
 
@@ -341,40 +352,60 @@ static int _process_service_connection(persist_conn_t *persist_conn, int fd,
 static void *_service_connection(void *arg)
 {
 	persist_service_conn_t *service_conn = arg;
+	int thread_loc;
+	persist_conn_callback_fini_t callback_fini = NULL;
+	void *callback_fini_arg = NULL;
 
 	xassert(service_conn);
 	xassert(service_conn->pcon);
 
+	/*
+	 * Backup this value for later usage, service_conn can be already freed
+	 * after leaving _process_service_connection on shutdown
+	 */
+	thread_loc = service_conn->thread_loc;
+	xassert(!service_conn->thread_id ||
+		pthread_equal(service_conn->thread_id, pthread_self()));
 	service_conn->thread_id = pthread_self();
 
 	_process_service_connection(service_conn->pcon, service_conn->fd,
 				    service_conn->arg);
 
-	if (service_conn->pcon->callback_fini)
-		(service_conn->pcon->callback_fini)(service_conn->arg);
-	else
+	/*
+	 * service_conn may have already been freed by
+	 * slurm_persist_conn_recv_server_fini(), so re-fetch from the
+	 * global array under lock and null-check before dereferencing.
+	 *
+	 * Copy callback info and unlock before invoking callback_fini to
+	 * avoid lock-ordering inversion with slurmctld federation locks
+	 * (fed_mgr_add_sibling_conn holds fed_read_lock then acquires
+	 * thread_count_lock; calling callback_fini under thread_count_lock
+	 * would acquire fed_write_lock — ABBA deadlock).
+	 *
+	 * The copied pointers remain valid because recv_server_fini() joins
+	 * this thread before destroying the slot, and free_thread_loc()
+	 * defers cleanup to fini during shutdown.
+	 */
+	slurm_mutex_lock(&thread_count_lock);
+	service_conn = persist_service_conn[thread_loc];
+	if (service_conn && service_conn->pcon &&
+	    service_conn->pcon->callback_fini) {
+		SWAP(callback_fini, service_conn->pcon->callback_fini);
+		SWAP(callback_fini_arg, service_conn->arg);
+	} else if (service_conn && service_conn->pcon) {
 		log_flag(NET, "%s: Persist connection from cluster %s has disconnected",
 			 __func__, service_conn->pcon->cluster_name);
+	} else {
+		log_flag(NET, "%s: Persist connection has disconnected",
+			 __func__);
+	}
+	slurm_mutex_unlock(&thread_count_lock);
 
-	/* service_conn is freed inside here */
-	slurm_persist_conn_free_thread_loc(service_conn->thread_loc);
-//	xfree(service_conn);
+	if (callback_fini)
+		callback_fini(callback_fini_arg);
 
-	/* In order to avoid zombie threads, detach the thread now before
-	 * exiting.  slurm_persist_conn_recv_server_fini() will not try to join
-	 * the thread because slurm_persist_conn_free_thread_loc() will have
-	 * free'd the connection. If their are threads at shutdown, the join
-	 * will happen before the detach so recv_fini() will wait until the
-	 * thread is done.
-	 *
-	 * pthread_join man page:
-	 * Failure to join with a thread that is joinable (i.e., one that is not
-	 * detached), produces a "zombie thread". Avoid doing this, since each
-	 * zombie thread consumes some system resources, and when enough zombie
-	 * threads have accumulated, it will no longer be possible to create new
-	 * threads (or processes).
-	 */
-	pthread_detach(pthread_self());
+	/* service_conn is freed inside here, unless already freed */
+	slurm_persist_conn_free_thread_loc(thread_loc, true);
 
 	return NULL;
 }
@@ -398,8 +429,8 @@ extern void slurm_persist_conn_recv_server_fini(void)
 {
 	int i;
 
-	shutdown_time = time(NULL);
 	slurm_mutex_lock(&thread_count_lock);
+	shutdown_time = time(NULL);
 	for (i=0; i<MAX_THREAD_COUNT; i++) {
 		if (!persist_service_conn[i])
 			continue;
@@ -413,10 +444,8 @@ extern void slurm_persist_conn_recv_server_fini(void)
 	for (i=0; i<MAX_THREAD_COUNT; i++) {
 		if (!persist_service_conn[i])
 			continue;
-		if (persist_service_conn[i]->thread_id) {
-			pthread_t thread_id =
-				persist_service_conn[i]->thread_id;
-
+		pthread_t thread_id = persist_service_conn[i]->thread_id;
+		if (thread_id && !pthread_equal(pthread_self(), thread_id)) {
 			/*
 			 * Let go of lock in case the persistent connection
 			 * thread is cleaning itself up.
@@ -425,11 +454,9 @@ extern void slurm_persist_conn_recv_server_fini(void)
 			 * thread_count mutex which this has locked.
 			 * After joining persist_service_conn[i] could be NULL
 			 */
-			if (thread_id != pthread_self()) {
-				slurm_mutex_unlock(&thread_count_lock);
-				slurm_thread_join(thread_id);
-				slurm_mutex_lock(&thread_count_lock);
-			}
+			slurm_mutex_unlock(&thread_count_lock);
+			slurm_thread_join(thread_id);
+			slurm_mutex_lock(&thread_count_lock);
 		}
 		if (persist_service_conn[i] && persist_service_conn[i]->pcon) {
 			persist_service_conn[i]->pcon->skip_conn_shutdown =
@@ -442,6 +469,20 @@ extern void slurm_persist_conn_recv_server_fini(void)
 	slurm_mutex_unlock(&thread_count_lock);
 }
 
+/* Run and clear persist_conn->callback_fini().  */
+static void _run_callback_fini(persist_conn_t *persist_conn, void *arg)
+{
+	persist_conn_callback_fini_t callback_fini = NULL;
+
+	if (!persist_conn)
+		return;
+
+	SWAP(callback_fini, persist_conn->callback_fini);
+
+	if (callback_fini)
+		callback_fini(arg);
+}
+
 extern void slurm_persist_conn_recv_thread_init(persist_conn_t *persist_conn,
 						int fd, int thread_loc,
 						void *arg)
@@ -451,14 +492,40 @@ extern void slurm_persist_conn_recv_thread_init(persist_conn_t *persist_conn,
 
 	if (thread_loc < 0)
 		thread_loc = slurm_persist_conn_wait_for_thread_loc();
-	if (thread_loc < 0)
+	if (thread_loc < 0) {
+		/*
+		 * Shutdown started before a slot could be claimed, so no thread
+		 * will ever service this connection.
+		 */
+		_run_callback_fini(persist_conn, arg);
 		return;
+	}
 
 	slurm_mutex_lock(&thread_count_lock);
 	service_conn = persist_service_conn[thread_loc];
-	xassert(service_conn);
+	/*
+	 * Between call for slurm_persist_conn_wait_for_thread_loc and this
+	 * point we have unlocked and locked again, so we may have let the
+	 * shutdown procedure to start.
+	 *
+	 * This causes persist_service_conn to be freed, thus service_conn may
+	 * be NULL at this point.
+	 *
+	 * If this is the case, just return immediately.
+	 */
+	if (!service_conn) {
+		xassert(thread_count > 0);
+		thread_count--;
+
+		slurm_cond_broadcast(&thread_count_cond);
+		slurm_mutex_unlock(&thread_count_lock);
+
+		_run_callback_fini(persist_conn, arg);
+		slurm_persist_conn_destroy(persist_conn);
+		fd_close(&fd);
+		return;
+	}
 	xassert(!service_conn->arg);
-	slurm_mutex_unlock(&thread_count_lock);
 
 	service_conn->arg = arg;
 	service_conn->pcon = persist_conn;
@@ -472,8 +539,16 @@ extern void slurm_persist_conn_recv_thread_init(persist_conn_t *persist_conn,
 	(void) snprintf(name, sizeof(name), "p-%s",
 			service_conn->pcon->cluster_name);
 
+	/*
+	 * Hold thread_count_lock through slurm_thread_create() so that
+	 * recv_server_fini() cannot destroy this slot before thread_id is
+	 * set. Without the lock, fini sees thread_id == 0, skips the join,
+	 * and frees persist_service_conn[thread_loc] while we are still
+	 * writing to it.
+	 */
 	slurm_thread_create(name, &persist_service_conn[thread_loc]->thread_id,
 			    _service_connection, service_conn);
+	slurm_mutex_unlock(&thread_count_lock);
 }
 
 /* Increment thread_count and don't return until its value is no larger
@@ -531,21 +606,45 @@ extern int slurm_persist_conn_wait_for_thread_loc(void)
 }
 
 /* my_tid IN - Thread ID of spawned thread, 0 if no thread spawned */
-extern void slurm_persist_conn_free_thread_loc(int thread_loc)
+extern void slurm_persist_conn_free_thread_loc(int thread_loc, bool detach)
 {
-	/* we will handle this in the fini */
-	if (shutdown_time)
-		return;
+	pthread_t thread_id;
 
 	slurm_mutex_lock(&thread_count_lock);
+
+	/* we will handle this in the fini */
+	if (shutdown_time)
+		goto end;
+
 	if (thread_count > 0)
 		thread_count--;
 	else
 		error("thread_count underflow");
 
+	thread_id = persist_service_conn[thread_loc]->thread_id;
 	_destroy_persist_service(persist_service_conn[thread_loc]);
 	persist_service_conn[thread_loc] = NULL;
 
+	/*
+	 * In order to avoid zombie threads, detach the thread now before
+	 * exiting. slurm_persist_conn_recv_server_fini() will not try to join
+	 * the thread because here we have just free'd the connection. If the
+	 * threads are at shutdown, the join will happen before the detach so
+	 * slurm_persist_conn_recv_server_fini() will wait at the join until the
+	 * thread is done.
+	 */
+	if (detach)
+		slurm_thread_detach(thread_id);
+
+end:
+	/*
+	 * We need to ensure we broadcast cond even if no thread is cleaned,
+	 * something that happens if we delegate cleanup to the shutdown
+	 * procedure; or we, otherwise, can cause slurm_cond_wait in
+	 * slurm_persist_conn_wait_for_thread_loc to wait forever.
+	 *
+	 * If this happens, the daemon will never finish.
+	 */
 	slurm_cond_broadcast(&thread_count_cond);
 	slurm_mutex_unlock(&thread_count_lock);
 }
@@ -594,6 +693,13 @@ static int _open_persist_conn(persist_conn_t *persist_conn)
 	}
 
 	fd = conn_g_get_fd(persist_conn->conn);
+
+	/*
+	 * Publish the fd in a stable scalar field readable lock-free by
+	 * external wake paths. last_fd is cleared back to -1 in
+	 * _conn_destroy() before the conn is torn down.
+	 */
+	persist_conn->last_fd = fd;
 
 	fd_set_nonblocking(fd);
 	net_set_keep_alive(fd);
@@ -707,7 +813,7 @@ extern int slurm_persist_conn_open(persist_conn_t *persist_conn)
 
 end_it:
 
-	slurm_persist_free_rc_msg(resp);
+	slurm_free_persist_rc_msg(resp);
 
 	return rc;
 }
@@ -1075,9 +1181,13 @@ extern buf_t *slurm_persist_msg_pack(persist_conn_t *persist_conn,
 
 	xassert(persist_conn);
 
-	if (persist_conn->flags & PERSIST_FLAG_DBD)
-		buffer = pack_slurmdbd_msg(req_msg, persist_conn->version);
-	else {
+	if (persist_conn->flags & PERSIST_FLAG_DBD) {
+		slurmdbd_msg_t dbd_msg = {
+			.data = req_msg->data,
+			.msg_type = req_msg->msg_type,
+		};
+		buffer = pack_slurmdbd_msg(&dbd_msg, persist_conn->version);
+	} else {
 		slurm_msg_t msg;
 
 		slurm_msg_t_init(&msg);
@@ -1107,9 +1217,12 @@ extern int slurm_persist_msg_unpack(persist_conn_t *persist_conn,
 	xassert(resp_msg);
 
 	if (persist_conn->flags & PERSIST_FLAG_DBD) {
-		rc = unpack_slurmdbd_msg(resp_msg,
-					 persist_conn->version,
+		slurmdbd_msg_t dbd_msg = { 0 };
+
+		rc = unpack_slurmdbd_msg(&dbd_msg, persist_conn->version,
 					 buffer);
+		resp_msg->msg_type = dbd_msg.msg_type;
+		resp_msg->data = dbd_msg.data;
 	} else {
 		slurm_msg_t msg;
 
@@ -1147,108 +1260,6 @@ extern int slurm_persist_msg_unpack(persist_conn_t *persist_conn,
 	return rc;
 unpack_error:
 	return SLURM_ERROR;
-}
-
-extern void slurm_persist_pack_init_req_msg(persist_init_req_msg_t *msg,
-					    buf_t *buffer)
-{
-	/* always send version field first for backwards compatibility */
-	pack16(msg->version, buffer);
-
-	if (msg->version >= SLURM_MIN_PROTOCOL_VERSION) {
-		packstr(msg->cluster_name, buffer);
-		pack16(msg->persist_type, buffer);
-		pack16(msg->port, buffer);
-	} else {
-		error("%s: invalid protocol version %u",
-		      __func__, msg->version);
-	}
-}
-
-extern int slurm_persist_unpack_init_req_msg(persist_init_req_msg_t **msg,
-					     buf_t *buffer)
-{
-	persist_init_req_msg_t *msg_ptr =
-		xmalloc(sizeof(persist_init_req_msg_t));
-
-	*msg = msg_ptr;
-
-	safe_unpack16(&msg_ptr->version, buffer);
-
-	if (msg_ptr->version >= SLURM_MIN_PROTOCOL_VERSION) {
-		safe_unpackstr(&msg_ptr->cluster_name, buffer);
-		safe_unpack16(&msg_ptr->persist_type, buffer);
-		safe_unpack16(&msg_ptr->port, buffer);
-	} else {
-		error("%s: invalid protocol_version %u",
-		      __func__, msg_ptr->version);
-		goto unpack_error;
-	}
-
-	return SLURM_SUCCESS;
-
-unpack_error:
-	slurm_persist_free_init_req_msg(msg_ptr);
-	*msg = NULL;
-	return SLURM_ERROR;
-}
-
-extern void slurm_persist_free_init_req_msg(persist_init_req_msg_t *msg)
-{
-	if (msg) {
-		xfree(msg->cluster_name);
-		xfree(msg);
-	}
-}
-
-extern void slurm_persist_pack_rc_msg(persist_rc_msg_t *msg,
-				      buf_t *buffer,
-				      uint16_t protocol_version)
-{
-	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
-		packstr(msg->comment, buffer);
-		pack16(msg->flags, buffer);
-		pack32(msg->rc, buffer);
-		pack16(msg->ret_info, buffer);
-	} else {
-		error("%s: invalid protocol version %u",
-		      __func__, protocol_version);
-	}
-}
-
-extern int slurm_persist_unpack_rc_msg(persist_rc_msg_t **msg,
-				       buf_t *buffer,
-				       uint16_t protocol_version)
-{
-	persist_rc_msg_t *msg_ptr = xmalloc(sizeof(persist_rc_msg_t));
-
-	*msg = msg_ptr;
-
-	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
-		safe_unpackstr(&msg_ptr->comment, buffer);
-		safe_unpack16(&msg_ptr->flags, buffer);
-		safe_unpack32(&msg_ptr->rc, buffer);
-		safe_unpack16(&msg_ptr->ret_info, buffer);
-	} else {
-		error("%s: invalid protocol_version %u",
-		      __func__, protocol_version);
-		goto unpack_error;
-	}
-
-	return SLURM_SUCCESS;
-
-unpack_error:
-	slurm_persist_free_rc_msg(msg_ptr);
-	*msg = NULL;
-	return SLURM_ERROR;
-}
-
-extern void slurm_persist_free_rc_msg(persist_rc_msg_t *msg)
-{
-	if (msg) {
-		xfree(msg->comment);
-		xfree(msg);
-	}
 }
 
 extern buf_t *slurm_persist_make_rc_msg(persist_conn_t *persist_conn,

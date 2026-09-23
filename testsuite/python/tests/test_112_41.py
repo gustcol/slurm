@@ -1,16 +1,18 @@
 ############################################################################
 # Copyright (C) SchedMD LLC.
 ############################################################################
-import atf
 import getpass
-import pytest
-import random
 import os
+import random
+
+import jsonpatch
+import pytest
+
+import atf
 
 # import json
 # import logging
 
-import jsonpatch
 
 random.seed()
 
@@ -41,8 +43,8 @@ def setup():
     atf.require_config_parameter("AllowNoDefAcct", "Yes", source="slurmdbd")
     atf.require_config_parameter("TrackWCKey", "Yes", source="slurmdbd")
     atf.require_config_parameter("TrackWCKey", "Yes")
-    atf.require_config_parameter("AuthAltTypes", "auth/jwt")
-    atf.require_config_parameter("AuthAltTypes", "auth/jwt", source="slurmdbd")
+    atf.require_config_parameter_includes("AuthAltTypes", "auth/jwt")
+    atf.require_config_parameter_includes("AuthAltTypes", "auth/jwt", source="slurmdbd")
     atf.require_slurmrestd("slurmctld,slurmdbd", "v0.0.41+prefer_refs")
     atf.require_version((24, 5), "sbin/slurmdbd", max_version=(26, 5))
     atf.require_version((24, 5), "sbin/slurmctld", max_version=(26, 5))
@@ -58,12 +60,6 @@ def setup():
     partition_name = atf.default_partition()
     if not partition_name:
         partition_name = "debug"
-
-
-@pytest.fixture(scope="function", autouse=True)
-def cancel_jobs(setup):
-    yield
-    atf.cancel_all_jobs()
 
 
 @pytest.fixture(scope="function")
@@ -295,12 +291,12 @@ def test_specification(openapi_spec):
 def test_db_accounts(slurm, slurmdb, create_wckeys, admin_level):
     from openapi_client import ApiClient as Client
     from openapi_client import Configuration as Config
-    from openapi_client.models.v0041_openapi_accounts_resp import (
-        V0041OpenapiAccountsResp,
-    )
     from openapi_client.models.v0041_account import V0041Account
     from openapi_client.models.v0041_assoc_short import V0041AssocShort
     from openapi_client.models.v0041_coord import V0041Coord
+    from openapi_client.models.v0041_openapi_accounts_resp import (
+        V0041OpenapiAccountsResp,
+    )
 
     # make sure account doesn't already exist
     resp = slurmdb.slurmdb_v0041_get_account_with_http_info(account_name)
@@ -425,8 +421,8 @@ def test_db_diag(slurmdb, admin_level):
 
 
 def test_db_wckeys(slurmdb, create_coords, admin_level):
-    from openapi_client.models.v0041_wckey import V0041Wckey
     from openapi_client.models.v0041_openapi_wckey_resp import V0041OpenapiWckeyResp
+    from openapi_client.models.v0041_wckey import V0041Wckey
 
     wckeys = V0041OpenapiWckeyResp(
         wckeys=[
@@ -494,10 +490,10 @@ def test_db_wckeys(slurmdb, create_coords, admin_level):
 
 
 def test_db_clusters(slurmdb, admin_level):
+    from openapi_client.models.v0041_cluster_rec import V0041ClusterRec
     from openapi_client.models.v0041_openapi_clusters_resp import (
         V0041OpenapiClustersResp,
     )
-    from openapi_client.models.v0041_cluster_rec import V0041ClusterRec
 
     clusters = V0041OpenapiClustersResp(
         clusters=[
@@ -553,9 +549,9 @@ def test_db_clusters(slurmdb, admin_level):
 
 
 def test_db_users(slurmdb, admin_level):
-    from openapi_client.models.v0041_openapi_users_resp import V0041OpenapiUsersResp
     from openapi_client.models.v0041_assoc_short import V0041AssocShort
     from openapi_client.models.v0041_coord import V0041Coord
+    from openapi_client.models.v0041_openapi_users_resp import V0041OpenapiUsersResp
     from openapi_client.models.v0041_user import V0041User
     from openapi_client.models.v0041_user_default import V0041UserDefault
     from openapi_client.models.v0041_wckey import V0041Wckey
@@ -679,16 +675,15 @@ def test_db_users(slurmdb, admin_level):
 
 
 def test_db_assoc(slurmdb, create_coords, create_qos, admin_level):
-    from openapi_client.models.v0041_openapi_assocs_resp import V0041OpenapiAssocsResp
     from openapi_client.models.v0041_assoc import V0041Assoc
     from openapi_client.models.v0041_assoc_short import V0041AssocShort
     from openapi_client.models.v0041_coord import V0041Coord
-    from openapi_client.models.v0041_user import V0041User
-    from openapi_client.models.v0041_wckey import V0041Wckey
-
+    from openapi_client.models.v0041_openapi_assocs_resp import V0041OpenapiAssocsResp
     from openapi_client.models.v0041_uint32_no_val_struct import (
         V0041Uint32NoValStruct as V0041Uint32NoVal,
     )
+    from openapi_client.models.v0041_user import V0041User
+    from openapi_client.models.v0041_wckey import V0041Wckey
 
     associations = V0041OpenapiAssocsResp(
         associations=[
@@ -929,15 +924,14 @@ def test_db_assoc(slurmdb, create_coords, create_qos, admin_level):
 
 
 def test_db_qos(slurmdb, create_coords, admin_level):
-    from openapi_client.models.v0041_qos import V0041Qos
-    from openapi_client.models.v0041_tres import V0041Tres
-    from openapi_client.models.v0041_openapi_slurmdbd_qos_resp import (
-        V0041OpenapiSlurmdbdQosResp,
-    )
     from openapi_client.models.v0041_float64_no_val_struct import (
         V0041Float64NoValStruct as V0041Float64NoVal,
     )
-
+    from openapi_client.models.v0041_openapi_slurmdbd_qos_resp import (
+        V0041OpenapiSlurmdbdQosResp,
+    )
+    from openapi_client.models.v0041_qos import V0041Qos
+    from openapi_client.models.v0041_tres import V0041Tres
     from openapi_client.models.v0041_uint32_no_val_struct import (
         V0041Uint32NoValStruct as V0041Uint32NoVal,
     )
@@ -1088,10 +1082,9 @@ def test_db_config(slurmdb, admin_level):
     reason="Ticket 20394 about jobs without associations, fixed for v43+"
 )
 def test_jobs(slurm, slurmdb):
-    from openapi_client.models.v0041_job_submit_req import V0041JobSubmitReq
     from openapi_client.models.v0041_job_desc_msg import V0041JobDescMsg
     from openapi_client.models.v0041_job_info import V0041JobInfo
-
+    from openapi_client.models.v0041_job_submit_req import V0041JobSubmitReq
     from openapi_client.models.v0041_uint32_no_val_struct import (
         V0041Uint32NoValStruct as V0041Uint32NoVal,
     )

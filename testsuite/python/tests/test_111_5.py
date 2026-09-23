@@ -1,10 +1,19 @@
 ############################################################################
 # Copyright (C) SchedMD LLC.
 ############################################################################
-import atf
+import re
+
 import pytest
 
-import re
+import atf
+
+pytestmark = [
+    pytest.mark.xfail_teardown(
+        reason="Issue 50974: Sometimes slurmd was not able to stop normally in 25.11",
+        known_fail_msg="Not all Slurm daemons were successfully stopped",
+        condition=atf.get_version("sbin/slurmd") < (26, 5),
+    ),
+]
 
 
 # Setup
@@ -30,7 +39,7 @@ def update_state(nodes, state):
     )
 
 
-@pytest.fixture(scope="module", autouse=False)
+@pytest.fixture(scope="function", autouse=False)
 def set_states():
     # Has alloc state flag
     node_down = reserve_node()

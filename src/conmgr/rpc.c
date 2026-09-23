@@ -34,13 +34,15 @@
 \*****************************************************************************/
 
 #include <stdint.h>
+#include <sys/socket.h>
 
 #include "slurm/slurm_errno.h"
 
 #include "src/common/forward.h"
-#include "src/common/slurm_protocol_api.h"
 #include "src/common/pack.h"
 #include "src/common/read_config.h"
+#include "src/common/slurm_protocol_api.h"
+#include "src/common/slurm_protocol_defs.h"
 #include "src/common/xmalloc.h"
 
 /*
@@ -132,18 +134,37 @@ static int _try_parse_rpc(conmgr_fd_t *con, slurm_msg_t **msg_ptr)
 		}
 	}
 
-	if (rc) {
+	if (rc && (rc != SLURM_PROTOCOL_AUTHENTICATION_ERROR)) {
 		/*
 		 * Always close input_fd on failure as it is not possible to
 		 * safely parse another incoming rpc on this connection.
-		 * Callback func will decide to close outbound connection as
-		 * error state by the returned rc.
+		 * Avoid sending a msg to callback where the msg is an unknown
+		 * state.
 		 */
-		close_con(false, con);
+		slurm_mutex_lock(&mgr.mutex);
+		con_set_status_code(con, rc);
+		close_con(true, con);
+		slurm_mutex_unlock(&mgr.mutex);
+		FREE_NULL_MSG(msg);
 	} else {
 		log_flag(NET, "%s: [%s] unpacked %u bytes containing %s RPC",
 			 __func__, con->name, need,
 			 rpc_num2string(msg->msg_type));
+
+		if (rc == SLURM_PROTOCOL_AUTHENTICATION_ERROR) {
+			xassert(!msg->auth_ids_set);
+			/*
+			 * Never trust an unauthenticated message but allow
+			 * callback to decide how to proceed
+			 */
+			msg->auth_ids_set = false;
+			msg->auth_uid = SLURM_AUTH_NOBODY;
+			msg->auth_gid = SLURM_AUTH_NOBODY;
+			msg->conn_is_mtls = false;
+			msg->flags |= SLURM_NO_AUTH_CRED;
+		} else if (con->tls) {
+			msg->conn_is_mtls = tls_is_client_authenticated(con);
+		}
 
 		if (con_flag(con, FLAG_RPC_KEEP_BUFFER)) {
 			xassert(!msg->buffer);
@@ -153,9 +174,6 @@ static int _try_parse_rpc(conmgr_fd_t *con, slurm_msg_t **msg_ptr)
 			msg->flags |= SLURM_MSG_KEEP_BUFFER;
 			set_buf_offset(msg->buffer, size_buf(rpc));
 		}
-
-		if (con->tls)
-			msg->conn_is_mtls = tls_is_client_authenticated(con);
 
 		/* notify conmgr we processed some data successfully */
 		set_buf_offset(con->in, need);
@@ -168,11 +186,88 @@ static int _try_parse_rpc(conmgr_fd_t *con, slurm_msg_t **msg_ptr)
 	return rc;
 }
 
+extern int conmgr_con_reply_rc_and_close(conmgr_fd_ref_t *ref, int rc,
+					 uint16_t protocol_version)
+{
+	int send_rc = EINVAL;
+	slurm_msg_t msg = SLURM_MSG_INITIALIZER;
+
+	if (!ref)
+		return EINVAL;
+
+	/* Fake request message to construct a reply */
+	msg.conmgr_con = conmgr_con_link(ref);
+	msg.protocol_version = protocol_version;
+
+	send_rc = slurm_send_rc_msg(&msg, rc);
+	conmgr_con_queue_close(ref);
+
+	slurm_free_msg_members(&msg);
+	return send_rc;
+}
+
+extern uint16_t conmgr_con_peek_rpc_protocol_version(conmgr_fd_ref_t *ref)
+{
+	conmgr_fd_t *con = NULL;
+	uint16_t version = NO_VAL16;
+	buf_t *shadow = NULL;
+
+	if (!ref)
+		return SLURM_MIN_PROTOCOL_VERSION;
+
+	con = ref->con;
+
+	/*
+	 * Wire format: [ msglen (uint32) ][ header, whose first field is the
+	 * protocol version (uint16) ]. Peek that version without consuming the
+	 * pending RPC so a reply can be packed at a version the peer can parse.
+	 */
+	if (!con->in ||
+	    (size_buf(con->in) < (sizeof(uint32_t) + sizeof(uint16_t))))
+		return SLURM_MIN_PROTOCOL_VERSION;
+
+	shadow = create_shadow_buf(get_buf_data(con->in), size_buf(con->in));
+	set_buf_offset(shadow, sizeof(uint32_t));
+	if (unpack16(&version, shadow))
+		version = NO_VAL16;
+	FREE_NULL_BUFFER(shadow);
+
+	/* Only trust a version this binary actually supports. */
+	if ((version != SLURM_PROTOCOL_VERSION) &&
+	    (version != SLURM_ONE_BACK_PROTOCOL_VERSION) &&
+	    (version != SLURM_TWO_BACK_PROTOCOL_VERSION) &&
+	    (version != SLURM_MIN_PROTOCOL_VERSION))
+		return SLURM_MIN_PROTOCOL_VERSION;
+
+	return version;
+}
+
 extern int on_rpc_connection_data(conmgr_callback_args_t conmgr_args, void *arg)
 {
 	int rc;
 	conmgr_fd_t *con = conmgr_args.con;
 	slurm_msg_t *msg = NULL;
+
+	/*
+	 * Secure by default: when TLS is enabled, reject any non-TLS inbound
+	 * inet RPC before parsing or dispatching it. Unix domain sockets are
+	 * exempt (local).
+	 */
+	if (conn_tls_enabled() && !con_flag(con, FLAG_TLS_SERVER) &&
+	    !con_flag(con, FLAG_TLS_CLIENT) &&
+	    (con->address.ss_family != AF_LOCAL)) {
+		debug("%s: [%s] rejecting non-TLS RPC connection",
+		      __func__, con->name);
+		/*
+		 * Reply at the pending request's version (the peer chose it, so
+		 * the peer can parse the reply) rather than a local constant,
+		 * which could be out of the peer's supported range in a
+		 * mixed-version cluster.
+		 */
+		return conmgr_con_reply_rc_and_close(
+			conmgr_args.ref, ESLURM_TLS_REQUIRED,
+			conmgr_con_peek_rpc_protocol_version(conmgr_args.ref));
+	}
 
 	rc = _try_parse_rpc(con, &msg);
 

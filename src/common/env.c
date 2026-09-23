@@ -63,6 +63,7 @@
 #include "src/common/proc_args.h"
 #include "src/common/read_config.h"
 #include "src/interfaces/select.h"
+#include "src/common/sluid.h"
 #include "src/common/slurm_opt.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/slurm_protocol_defs.h"
@@ -182,58 +183,68 @@ envcount (char **env)
 }
 
 /*
- * _setenvfs() (stolen from pdsh)
- *
- * Set a variable in the callers environment.  Args are printf style.
- * XXX Space is allocated on the heap and will never be reclaimed.
- * Example: setenvfs("RMS_RANK=%d", rank);
+ * Return true if setenvf() would reject "name=value" as being too long.
+ * "value" may be NULL if "name" is already a joined "name=value" string.
+ * The byte added with the value accounts for the '=', and the last one for
+ * the terminating NUL.
  */
-int
-setenvfs(const char *fmt, ...)
+static bool _env_check_len(const char *name, const char *value)
+{
+	size_t len = strlen(name);
+
+	if (value)
+		len += strlen(value) + 1;
+
+	return ((len + 1) >= MAX_ENV_STRLEN);
+}
+
+__attribute__((format(printf, 1, 2))) extern int setenvfs(const char *fmt, ...)
 {
 	va_list ap;
-	char *buf, *bufcpy, *loc;
-	int rc, size;
+	char *buf, *loc;
+	int rc;
 
 	buf = xmalloc(ENV_BUFSIZE);
 	va_start(ap, fmt);
 	vsnprintf(buf, ENV_BUFSIZE, fmt, ap);
 	va_end(ap);
 
-	size = strlen(buf);
-	bufcpy = xstrdup(buf);
-	xfree(buf);
-
-	if (size >= MAX_ENV_STRLEN) {
-		if ((loc = strchr(bufcpy, '=')))
-			loc[0] = '\0';
-		error("environment variable %s is too long", bufcpy);
-		xfree(bufcpy);
-		rc = ENOMEM;
-	} else {
-		rc = putenv(bufcpy);
+	if (_env_check_len(buf, NULL)) {
+		if ((loc = strchr(buf, '=')))
+			*loc = '\0';
+		error("environment variable %s is too long", buf);
+		xfree(buf);
+		return ENOMEM;
 	}
 
+	loc = strchr(buf, '=');
+	if (!loc || (loc == buf)) {
+		error("%s: invalid environment entry: %s", __func__, buf);
+		xfree(buf);
+		return EINVAL;
+	}
+	*loc++ = '\0';
+
+	if ((rc = setenv(buf, loc, 1)))
+		rc = errno;
+	xfree(buf);
 	return rc;
 }
 
-int setenvf(char ***envp, const char *name, const char *fmt, ...)
+extern int vsetenvf(char ***envp, const char *name, const char *fmt, va_list ap)
 {
 	char *value;
-	va_list ap;
-	int size, rc;
+	int rc = EINVAL;
 
 	if (!name || name[0] == '\0')
 		return EINVAL;
 
 	value = xmalloc(ENV_BUFSIZE);
-	va_start(ap, fmt);
 	vsnprintf(value, ENV_BUFSIZE, fmt, ap);
-	va_end(ap);
 
-	size = strlen(name) + strlen(value) + 2;
-	if (size >= MAX_ENV_STRLEN) {
+	if (_env_check_len(name, value)) {
 		error("environment variable %s is too long", name);
+		xfree(value);
 		return ENOMEM;
 	}
 
@@ -242,11 +253,23 @@ int setenvf(char ***envp, const char *name, const char *fmt, ...)
 			rc = 0;
 		else
 			rc = 1;
-	} else {
-		rc = setenv(name, value, 1);
+	} else if ((rc = setenv(name, value, 1))) {
+		rc = errno;
 	}
 
 	xfree(value);
+	return rc;
+}
+
+int setenvf(char ***envp, const char *name, const char *fmt, ...)
+{
+	va_list ap;
+	int rc;
+
+	va_start(ap, fmt);
+	rc = vsetenvf(envp, name, fmt, ap);
+	va_end(ap);
+
 	return rc;
 }
 
@@ -273,7 +296,6 @@ void unsetenvp(char **env, const char *name)
 		while (*dp++);
 
 		/*  Continue loop in case `name' appears again. */
-		++ep;
 	}
 	return;
 }
@@ -397,7 +419,7 @@ int setup_env(env_t *env, bool preserve_env)
 		}
 
 	if (env->cpu_bind_type && !env->batch_flag &&
-	    (env->stepid != SLURM_INTERACTIVE_STEP)) {
+	    (env->step_id.step_id != SLURM_INTERACTIVE_STEP)) {
 		char *str_verbose, *str_bind1 = NULL, *str_bind2 = NULL;
 		char *str_bind_list, *str_bind_type = NULL, *str_bind = NULL;
 		bool append_cpu_bind = false;
@@ -467,13 +489,13 @@ int setup_env(env_t *env, bool preserve_env)
 		 * for the user and don't merit an error in the log if they
 		 * can't be set, so avoid calling setenvf().
 		 */
-		if (strlen(str_bind) >= MAX_ENV_STRLEN)
+		if (_env_check_len("SLURM_CPU_BIND", str_bind))
 			debug("Not setting SLURM_CPU_BIND: value too long");
 		else if (setenvf(&env->env, "SLURM_CPU_BIND", "%s", str_bind)) {
 			error("Unable to set SLURM_CPU_BIND");
 			rc = SLURM_ERROR;
 		}
-		if (strlen(str_bind_list) >= MAX_ENV_STRLEN)
+		if (_env_check_len("SLURM_CPU_BIND_LIST", str_bind_list))
 			debug("Not setting SLURM_CPU_BIND_LIST: value too long");
 		else if (setenvf(&env->env, "SLURM_CPU_BIND_LIST", "%s",
 				 str_bind_list)) {
@@ -495,7 +517,8 @@ int setup_env(env_t *env, bool preserve_env)
 		xfree(str_bind_type);
 	}
 
-	if (env->mem_bind_type && (env->stepid != SLURM_INTERACTIVE_STEP)) {
+	if (env->mem_bind_type &&
+	    (env->step_id.step_id != SLURM_INTERACTIVE_STEP)) {
 		char *str_verbose, *str_bind_type = NULL, *str_bind_list;
 		char *str_prefer = NULL, *str_bind = NULL;
 
@@ -641,14 +664,25 @@ int setup_env(env_t *env, bool preserve_env)
 		}
 	}
 
-	if (env->jobid >= 0) {
-		if (setenvf(&env->env, "SLURM_JOB_ID", "%d", env->jobid)) {
+	if (env->step_id.job_id != NO_VAL) {
+		if (setenvf(&env->env, "SLURM_JOB_ID", "%d",
+			    env->step_id.job_id)) {
 			error("Unable to set SLURM_JOB_ID environment");
 			rc = SLURM_ERROR;
 		}
 		/* and for backwards compatibility... */
-		if (setenvf(&env->env, "SLURM_JOBID", "%d", env->jobid)) {
+		if (setenvf(&env->env, "SLURM_JOBID", "%d",
+			    env->step_id.job_id)) {
 			error("Unable to set SLURM_JOBID environment");
+			rc = SLURM_ERROR;
+		}
+	}
+
+	if (env->step_id.sluid) {
+		char sluid[15] = "";
+		print_sluid(env->step_id.sluid, sluid, sizeof(sluid));
+		if (setenvf(&env->env, "SLURM_JOB_SLUID", "%s", sluid)) {
+			error("Unable to set SLURM_JOB_SLUID environment");
 			rc = SLURM_ERROR;
 		}
 	}
@@ -706,13 +740,15 @@ int setup_env(env_t *env, bool preserve_env)
 		rc = SLURM_ERROR;
 	}
 
-	if (env->stepid >= 0) {
-		if (setenvf(&env->env, "SLURM_STEP_ID", "%d", env->stepid)) {
+	if (env->step_id.step_id != NO_VAL) {
+		if (setenvf(&env->env, "SLURM_STEP_ID", "%d",
+			    env->step_id.step_id)) {
 			error("Unable to set SLURM_STEP_ID environment");
 			rc = SLURM_ERROR;
 		}
 		/* and for backwards compatibility... */
-		if (setenvf(&env->env, "SLURM_STEPID", "%d", env->stepid)) {
+		if (setenvf(&env->env, "SLURM_STEPID", "%d",
+			    env->step_id.step_id)) {
 			error("Unable to set SLURM_STEPID environment");
 			rc = SLURM_ERROR;
 		}
@@ -790,7 +826,7 @@ int setup_env(env_t *env, bool preserve_env)
 		rc = SLURM_ERROR;
 	}
 
-	if (env->restart_cnt &&
+	if (env->batch_flag &&
 	    setenvf(&env->env, "SLURM_RESTART_COUNT", "%u", env->restart_cnt)) {
 		error("Can't set SLURM_RESTART_COUNT env variable");
 		rc = SLURM_ERROR;
@@ -1144,6 +1180,12 @@ extern int env_array_for_job(char ***dest,
 		env_array_overwrite_het_fmt(dest, "SLURM_JOB_SEGMENT_SIZE",
 					    het_job_offset, "%u",
 					    alloc->segment_size);
+	}
+
+	if (alloc->stepmgr_host) {
+		env_array_overwrite_het_fmt(dest, "SLURM_STEPMGR",
+					    het_job_offset, "%s",
+					    alloc->stepmgr_host);
 	}
 
 	return rc;
@@ -2084,7 +2126,7 @@ static bool _ns_path_disabled(const char *ns_path)
  * calls are disabled. This is performed by checking the contents of
  * "/proc/sys/max_[mnt|pid]_namespaces" and ensuring they are not 0.
  */
-static bool _ns_disabled()
+static bool _ns_disabled(void)
 {
 	static int disabled = -1;
 	char *pid_ns_path = "/proc/sys/user/max_pid_namespaces";
@@ -2160,7 +2202,7 @@ char **env_array_user_default(const char *username)
 				starttoken, env_loc, stoptoken);
 	xfree(stepd_path);
 
-	if (pipe(fildes) < 0) {
+	if (pipe2(fildes, O_CLOEXEC) < 0) {
 		fatal("pipe: %m");
 		return NULL;
 	}
@@ -2548,49 +2590,53 @@ extern char **env_array_exclude(const char **env, const regex_t *regex)
 
 extern void set_prio_process_env(void)
 {
-        int retval;
+	int retval, rc = EINVAL;
 
-        errno = 0; /* needed to detect a real failure since prio can be -1 */
+	errno = 0; /* needed to detect a real failure since prio can be -1 */
 
-        if ((retval = getpriority(PRIO_PROCESS, 0)) == -1)  {
-                if (errno) {
-                        error("getpriority(PRIO_PROCESS): %m");
-                        return;
-                }
-        }
+	if ((retval = getpriority(PRIO_PROCESS, 0)) == -1) {
+		if (errno) {
+			error("getpriority(PRIO_PROCESS): %m");
+			return;
+		}
+	}
 
-        if (setenvf(NULL, "SLURM_PRIO_PROCESS", "%d", retval) < 0) {
-                error("unable to set SLURM_PRIO_PROCESS in environment");
-                return;
-        }
+	if ((rc = setenvf(NULL, "SLURM_PRIO_PROCESS", "%d", retval))) {
+		error("unable to set SLURM_PRIO_PROCESS in environment: %s",
+		      slurm_strerror(rc));
+		return;
+	}
 
-        debug("propagating SLURM_PRIO_PROCESS=%d", retval);
+	debug("propagating SLURM_PRIO_PROCESS=%d", retval);
 }
 
 extern void set_submit_dir_env(char **wd_ptr, bool set_cluster_name)
 {
 	char *cluster_name;
 	char host[256], work_dir[PATH_MAX];
+	int rc = EINVAL;
 
 	if (working_cluster_rec && working_cluster_rec->name)
 		cluster_name = working_cluster_rec->name;
 	else
 		cluster_name = slurm_conf.cluster_name;
 
-	if (set_cluster_name) {
-		if (setenvf(NULL, "SLURM_CLUSTER_NAME", "%s", cluster_name) < 0)
-			error("unable to set SLURM_CLUSTER_NAME in environment");
-	}
+	if (set_cluster_name &&
+	    (rc = setenvf(NULL, "SLURM_CLUSTER_NAME", "%s", cluster_name)))
+		error("unable to set SLURM_CLUSTER_NAME in environment: %s",
+		      slurm_strerror(rc));
 
 	if ((getcwd(work_dir, PATH_MAX)) == NULL)
 		error("getcwd failed: %m");
-	else if (setenvf(NULL, "SLURM_SUBMIT_DIR", "%s", work_dir) < 0)
-		error("unable to set SLURM_SUBMIT_DIR in environment");
+	else if ((rc = setenvf(NULL, "SLURM_SUBMIT_DIR", "%s", work_dir)))
+		error("unable to set SLURM_SUBMIT_DIR in environment: %s",
+		      slurm_strerror(rc));
 
 	if ((gethostname(host, sizeof(host))))
 		error("gethostname failed: %m");
-	else if (setenvf(NULL, "SLURM_SUBMIT_HOST", "%s", host) < 0)
-		error("unable to set SLURM_SUBMIT_HOST in environment");
+	else if ((rc = setenvf(NULL, "SLURM_SUBMIT_HOST", "%s", host)))
+		error("unable to set SLURM_SUBMIT_HOST in environment: %s",
+		      slurm_strerror(rc));
 
 	if (wd_ptr && work_dir[0])
 		*wd_ptr = xstrdup(work_dir);

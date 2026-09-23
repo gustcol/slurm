@@ -38,10 +38,12 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA.
 \*****************************************************************************/
 
-#include "src/slurmctld/slurmctld.h"
-
 #ifndef _HAVE_POWER_SAVE_H
 #define _HAVE_POWER_SAVE_H
+
+#include "src/slurmctld/slurmctld.h"
+
+#include "src/common/power_action.h"
 
 /* Global Variables */
 extern list_t *resume_job_list;
@@ -55,18 +57,25 @@ extern void config_power_mgr_fini(void);
 extern void power_save_init(void);
 extern void power_save_fini(void);
 
-/* Report if node power saving is enabled */
-extern bool power_save_test(void);
+/*
+ * Check if a power action is valid from name or check default action for type.
+ *
+ * IN type - type of the power action to check
+ * IN action_name - name of the power action to check
+ *
+ * RET true if the power action is valid, false otherwise
+ */
+extern bool power_save_valid_action_default(power_action_type_t type,
+					    char *action_name);
 
 /*
- * Reboot compute nodes for a job from the head node using ResumeProgram.
+ * Reboot compute nodes for a job using the configured
+ * RebootProgram / PowerAction for reboot.
  *
  * IN node_bitmap - bitmap of nodes to reboot
- * IN job_ptr - job requesting reboot
  * IN features - optional features that the nodes need to be rebooted with
  */
-extern int power_job_reboot(bitstr_t *node_bitmap, job_record_t *job_ptr,
-			    char *features);
+extern void power_action_reboot(bitstr_t *bitmap, char *features);
 
 /*
  * Parse settings for excluding nodes, partitions and states from being
@@ -77,11 +86,11 @@ extern int power_job_reboot(bitstr_t *node_bitmap, job_record_t *job_ptr,
 extern void power_save_exc_setup(void);
 
 /*
- * Set node power times based on global and per-partition settings.
+ * Set node power times based on node, partition, and global settings.
  *
- * OUT (optional) partition_suspend_time_set - return True if any partition has
- *                                             suspend_time set.
+ * OUT (optional) suspend_time_set - return True if any node has a finite
+ *                                   suspend_time configured.
  */
-extern void power_save_set_timeouts(bool *partition_suspend_time_set);
+extern void power_save_set_timeouts(bool *suspend_time_set);
 
 #endif /* _HAVE_POWER_SAVE_H */

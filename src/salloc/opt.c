@@ -118,6 +118,9 @@ extern int initialize_and_process_args(int argc, char **argv, int *argc_off,
 	/* initialize option defaults */
 	slurm_reset_all_options(&opt, first_pass);
 
+	/* record which component these options describe */
+	opt.het_job_inx = het_job_inx;
+
 	/* cli_filter plugins can change the defaults */
 	if (first_pass) {
 		if (cli_filter_g_setup_defaults(&opt, false)) {
@@ -193,6 +196,7 @@ env_vars_t env_vars[] = {
   { "SALLOC_CONSOLIDATE_SEGMENTS", LONG_OPT_CONSOLIDATE_SEGMENTS },
   { "SALLOC_CONTAINER", LONG_OPT_CONTAINER },
   { "SALLOC_CONTAINER_ID", LONG_OPT_CONTAINER_ID },
+  { "SALLOC_RUNTIME", LONG_OPT_RUNTIME },
   { "SALLOC_CONSTRAINT", 'C' },
   { "SALLOC_CORE_SPEC", 'S' },
   { "SALLOC_CPU_FREQ_REQ", LONG_OPT_CPU_FREQ },
@@ -431,6 +435,8 @@ static bool _opt_verify(void)
 		setenvf(NULL, "SLURM_CONTAINER", "%s", opt.container);
 	if (opt.container_id && !getenv("SLURM_CONTAINER_ID"))
 		setenvf(NULL, "SLURM_CONTAINER_ID", "%s", opt.container_id);
+	if (opt.runtime && !getenv("SLURM_RUNTIME"))
+		setenvf(NULL, "SLURM_RUNTIME", "%s", opt.runtime);
 
 	if (opt.hint &&
 	    !validate_hint_option(&opt)) {
@@ -607,15 +613,16 @@ static bool _opt_verify(void)
 		}
 	}
 
-	if ((opt.ntasks_per_core > 0) &&
-	    (getenv("SLURM_NTASKS_PER_CORE") == NULL)) {
-		setenvf(NULL, "SLURM_NTASKS_PER_CORE", "%d",
-			opt.ntasks_per_core);
+	if (opt.ntasks_per_core > 0) {
 		if ((opt.threads_per_core !=  NO_VAL) &&
 		    (opt.threads_per_core < opt.ntasks_per_core)) {
 			error("--ntasks-per-core (%d) can not be bigger than --threads-per-core (%d)",
 			opt.ntasks_per_core, opt.threads_per_core);
 			verified = false;
+		}
+		if (verified && !getenv("SLURM_NTASKS_PER_CORE")) {
+			setenvf(NULL, "SLURM_NTASKS_PER_CORE", "%d",
+				opt.ntasks_per_core);
 		}
 	}
 
@@ -653,6 +660,9 @@ static bool _opt_verify(void)
 	if ((saopt.wait_all_nodes == NO_VAL16) &&
 	    (xstrcasestr(slurm_conf.sched_params, "salloc_wait_nodes")))
 			saopt.wait_all_nodes = 1;
+
+	if (opt.x11 && opt.clusters)
+		warning("X11 forwarding may not work reliably in combination with --clusters.");
 
 	if (opt.x11) {
 		x11_get_display(&opt.x11_target_port, &opt.x11_target);
@@ -778,8 +788,9 @@ static void _usage(void)
 "              [-c cpus-per-node] [-r n] [-p partition] [--hold] [-t minutes]\n"
 "              [--immediate[=secs]] [--no-kill] [--overcommit] [-D path]\n"
 "              [--oversubscribe] [-J jobname] [--verbose] [--licenses=names]\n"
-"              [--clusters=cluster_names]\n"
-"              [--contiguous] [--mincpus=n] [--mem=MB] [--tmp=MB] [-C list]\n"
+"              [--clusters=cluster_names] [--contiguous]\n"
+"              [--container=path] [--container-id=id] [--runtime=name]\n"
+"              [--mincpus=n] [--mem=MB] [--tmp=MB] [-C list]\n"
 "              [--account=name] [--dependency=type:jobid[+time]] [--comment=name]\n"
 "              [--mail-type=type] [--mail-user=user] [--nice[=value]]\n"
 "              [--bell] [--no-bell] [--kill-command[=signal]] [--spread-job]\n"
@@ -815,8 +826,6 @@ static void _help(void)
 "      --bbf=<file_name>       burst buffer specification file\n"
 "  -c, --cpus-per-task=ncpus   number of cpus required per task\n"
 "      --comment=name          arbitrary comment\n"
-"      --container             Path to OCI container bundle\n"
-"      --container-id          OCI container ID\n"
 "      --cpu-freq=min[-max[:gov]] requested cpu frequency (and governor)\n"
 "      --delay-boot=mins       delay boot for desired node features\n"
 "  -d, --dependency=type:jobid[:time] defer job until condition on jobid is satisfied\n"
@@ -888,6 +897,11 @@ static void _help(void)
 "  -w, --nodelist=hosts...     request a specific list of hosts\n"
 "  -x, --exclude=hosts...      exclude a specific list of hosts\n"
 "\n"
+"Container options:\n"
+"      --container=path        Container path\n"
+"      --container-id=id       Container identifier\n"
+"      --runtime=name          Runtime plugin type\n"
+"\n"
 "Consumable resources related options:\n"
 "      --exclusive[=user]      allocate nodes in exclusive mode when\n"
 "                              cpu consumable resource is enabled\n"
@@ -908,8 +922,8 @@ static void _help(void)
 "      --threads-per-core=T    number of threads per core to allocate\n"
 "  -B, --extra-node-info=S[:C[:T]]  combine request of sockets per node,\n"
 "                              cores per socket and threads per core.\n"
-"                              Specify an asterisk (*) as a placeholder,\n"
-"                              a minimum value, or a min-max range.\n"
+"                              Specify an asterisk (*) as a placeholder\n"
+"                              or a minimum value.\n"
 "\n"
 "      --ntasks-per-core=n     number of tasks to invoke on each core\n"
 "      --ntasks-per-socket=n   number of tasks to invoke on each socket\n");

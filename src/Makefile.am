@@ -1,12 +1,10 @@
 SUBDIRS =		\
 	api		\
-	bcast		\
 	common		\
 	conmgr		\
 	curl		\
 	database	\
 	interfaces	\
-	lua		\
 	plugins		\
 	sacct		\
 	sacctmgr	\
@@ -32,8 +30,14 @@ SUBDIRS =		\
 	sstat		\
 	stepmgr 	\
 	strigger	\
-	sview
+	sview		\
+	swait
+
+if HAVE_LUA
+SUBDIRS += lua
 
 if LINUX_BUILD
 SUBDIRS += scrun
+endif
+
 endif

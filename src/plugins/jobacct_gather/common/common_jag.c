@@ -306,20 +306,17 @@ again:
  *
  * RETVAL:	==0 - no valid data
  * 		!=0 - data are valid
- *
- * Based upon stat2proc() from the ps command. It can handle arbitrary
- * executable file basenames for `cmd', i.e. those with embedded whitespace or
- * embedded ')'s. Such names confuse %s (see scanf(3)), so the string is split
- * and %39c is used instead. (except for embedded ')' "(%[^)]c)" would work.
  */
 static int _get_process_data_line(int in, jag_prec_t *prec) {
 	char sbuf[512], *tmp;
 	int num_read, nvals;
-	char cmd[40], state[1];
+	char state[1];
 	int ppid, pgrp, session, tty_nr, tpgid;
-	long unsigned flags, minflt, cminflt, majflt, cmajflt;
-	long unsigned utime, stime, starttime, vsize;
-	long int cutime, cstime, priority, nice, timeout, itrealvalue, rss;
+	unsigned int flags;
+	long unsigned minflt, cminflt, majflt, cmajflt;
+	long unsigned utime, stime, vsize;
+	unsigned long long starttime;
+	long int cutime, cstime, priority, nice, num_threads, itrealvalue, rss;
 	long unsigned f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13;
 	int exit_signal, last_cpu;
 
@@ -329,30 +326,31 @@ static int _get_process_data_line(int in, jag_prec_t *prec) {
 	sbuf[num_read] = '\0';
 
 	/*
-	 * split into "PID (cmd" and "<rest>" replace trailing ')' with NULL
+	 * Split on the last ')' to handle cmd names with embedded ')'.
+	 * After the split sbuf holds "PID (cmd" and tmp+2 holds the rest.
 	 */
 	tmp = strrchr(sbuf, ')');
 	if (!tmp)
 		return 0;
 	*tmp = '\0';
 
-	/* parse these two strings separately, skipping the leading "(". */
-	nvals = sscanf(sbuf, "%d (%39c", &prec->pid, cmd);
-	if (nvals < 2)
+	/* parse the PID from the first segment, skipping the leading "(". */
+	nvals = sscanf(sbuf, "%d (", &prec->pid);
+	if (nvals < 1)
 		return 0;
 
 	nvals = sscanf(tmp + 2,	 /* skip space after ')' too */
 		       "%c %d %d %d %d %d "
-		       "%lu %lu %lu %lu %lu "
+		       "%u %lu %lu %lu %lu "
 		       "%lu %lu %ld %ld %ld %ld "
-		       "%ld %ld %lu %lu %ld "
+		       "%ld %ld %llu %lu %ld "
 		       "%lu %lu %lu %lu %lu "
 		       "%lu %lu %lu %lu %lu "
 		       "%lu %lu %lu %d %d ",
 		       state, &ppid, &pgrp, &session, &tty_nr, &tpgid,
 		       &flags, &minflt, &cminflt, &majflt, &cmajflt,
 		       &utime, &stime, &cutime, &cstime, &priority, &nice,
-		       &timeout, &itrealvalue, &starttime, &vsize, &rss,
+		       &num_threads, &itrealvalue, &starttime, &vsize, &rss,
 		       &f1, &f2, &f3, &f4, &f5 ,&f6, &f7, &f8, &f9, &f10, &f11,
 		       &f12, &f13, &exit_signal, &last_cpu);
 	/* There are some additional fields, which we do not scan or use */
@@ -555,8 +553,10 @@ static void _handle_stats(pid_t pid, jag_callbacks_t *callbacks, int tres_count)
 	}
 
 	xstrfmtcat(proc_file, "/proc/%u/stat", pid);
-	if (!(stat_fp = fopen(proc_file, "r")))
+	if (!(stat_fp = fopen(proc_file, "r"))) {
+		xfree(proc_file);
 		return;  /* Assume the process went away */
+	}
 	/*
 	 * Close the file on exec() of user tasks.
 	 *
@@ -635,6 +635,7 @@ static void _handle_stats(pid_t pid, jag_callbacks_t *callbacks, int tres_count)
 bail_out:
 	xfree(prec->tres_data);
 	xfree(prec);
+	xfree(proc_file);
 	return;
 }
 
@@ -982,14 +983,16 @@ static void _aggregate_prec(jag_prec_t *prec, jag_prec_t *ancestor)
  * usage data to the ancestor's <prec> record. Recurse to gather data
  * for *all* subsequent generations.
  *
- * IN:	prec_list       list of prec's
- *      ancestor	The entry in precTable[] to which the data
+ * IN:	ancestor	The entry in precTable[] to which the data
  *			should be added. Even as we recurse, this will
  *			always be the prec for the base of the family
  *			tree.
  *	pid		The process for which we are currently looking
  *			for offspring.
  * IN/OUT:
+ *      prec_list       list of prec's; completed entries other than the
+ *                      traversal root are removed and freed during
+ *                      traversal
  *      permanent_anc Pointer to the original ancestor. Changes to
  *	              it are saved, so we can permanently save
  *		      the values from completed processes.
@@ -1004,6 +1007,7 @@ static void _get_offspring_data(list_t *prec_list, jag_prec_t *ancestor,
 	jag_prec_t *prec = NULL;
 	jag_prec_t *prec_tmp = NULL;
 	list_t *tmp_list = NULL;
+	bool root = true;
 
 	/* reset all precs to be not visited */
 	(void)list_for_each(prec_list, (ListForF)_reset_visited, NULL);
@@ -1036,10 +1040,18 @@ static void _get_offspring_data(list_t *prec_list, jag_prec_t *ancestor,
 			}
 			list_append(tmp_list, prec);
 		}
+		/*
+		 * The root prec stays owned by prec_list; every other
+		 * completed prec was removed from it above and is ours to
+		 * free.
+		 */
+		if (!root && prec_tmp->completed)
+			destroy_jag_prec(prec_tmp);
+		root = false;
 	}
-	FREE_NULL_LIST(tmp_list);
 
-	return;
+	FREE_NULL_LIST(tmp_list);
+	xassert(!root);
 }
 
 extern void jag_common_poll_data(list_t *task_list, uint64_t cont_id,

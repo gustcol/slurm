@@ -199,6 +199,44 @@ typedef struct {
 	time_t start_time;
 } filter_exclusive_args_t;
 
+typedef struct {
+	int count;
+	bool *has_mor;
+	bool *has_xand;
+} feature_count_args_t;
+
+typedef struct {
+	uint32_t cnt;
+	uint32_t prio;
+} hetjob_prio_args_t;
+
+typedef struct {
+	uint32_t exclude_job_id;
+	time_t latest_start;
+} het_job_start_compute_args_t;
+
+typedef struct {
+	het_job_map_t *map;
+	node_space_map_t *node_space;
+	time_t now;
+	int rc;
+	bitstr_t *used_bitmap;
+} het_job_start_now_args_t;
+
+typedef struct {
+	int cred_lifetime;
+	time_t now;
+} het_job_kill_now_args_t;
+
+typedef struct {
+	deadlock_job_struct_t *dl_job_ptr;
+	deadlock_job_struct_t *dl_job_ptr_conflict;
+	deadlock_part_struct_t *dl_part_ptr;
+	deadlock_part_struct_t *dl_part_ptr_conflict;
+	bool have_deadlock;
+	job_record_t *job_ptr;
+} deadlock_check_args_t;
+
 /*********************** local variables *********************/
 static bool stop_backfill = false;
 static pthread_mutex_t term_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -260,6 +298,7 @@ static uint32_t _hetjob_calc_prio_tier(job_record_t *het_leader);
 static void _het_job_deadlock_fini(void);
 static bool _het_job_deadlock_test(job_record_t *job_ptr);
 static bool _job_part_valid(job_record_t *job_ptr, part_record_t *part_ptr);
+static bool _job_qos_valid(job_record_t *job_ptr, slurmdb_qos_rec_t *qos_ptr);
 static void _load_config(void);
 static bool _many_pending_rpcs(void);
 static bool _more_work(time_t last_backfill_time);
@@ -290,8 +329,8 @@ static int  _try_sched(job_record_t *job_ptr, bitstr_t **avail_bitmap,
 		       uint32_t min_nodes, uint32_t max_nodes,
 		       uint32_t req_nodes, resv_exc_t *resv_exc_ptr,
 		       will_run_data_t *will_run);
-static int  _yield_locks(int64_t usec);
-static void _bf_map_key_id(void *item, const char **key, uint32_t *key_len);
+static int _yield_locks(int64_t usec, job_record_t *job_ptr, bool *job_updated);
+static void _bf_map_key_id(void *item, const void **key, uint32_t *key_len);
 static void _bf_map_free(void *item);
 
 /* Log resources to be allocated to a pending job */
@@ -299,6 +338,9 @@ static void _dump_job_sched(job_record_t *job_ptr, time_t end_time,
 			    bitstr_t *avail_bitmap)
 {
 	char begin_buf[256], end_buf[256], *node_list;
+
+	if (get_log_level() < LOG_LEVEL_VERBOSE)
+		return;
 
 	slurm_make_time_str(&job_ptr->start_time, begin_buf, sizeof(begin_buf));
 	slurm_make_time_str(&end_time, end_buf, sizeof(end_buf));
@@ -316,6 +358,9 @@ static void _dump_job_test(job_record_t *job_ptr, bitstr_t *avail_bitmap,
 	char end_buf[256];
 	char later_buf[256];
 
+	if (get_log_level() < LOG_LEVEL_VERBOSE)
+		return;
+
 	if (start_time == 0)
 		strcpy(begin_buf, "NOW");
 	else
@@ -329,7 +374,7 @@ static void _dump_job_test(job_record_t *job_ptr, bitstr_t *avail_bitmap,
 	slurm_make_time_str(&later_start, end_buf, sizeof(end_buf));
 
 	node_list = bitmap2node_name(avail_bitmap);
-	log_flag(BACKFILL, "Test %pJ at %s to %s (later_start: %s) on %s",
+	log_flag(BACKFILL_MAP, "Test %pJ at %s to %s (later_start: %s) on %s",
 		 job_ptr, begin_buf, end_buf, later_buf, node_list);
 	xfree(node_list);
 }
@@ -340,7 +385,10 @@ static void _dump_node_space_table(node_space_map_t *node_space_ptr)
 	int i = 0;
 	char begin_buf[256], end_buf[256], *node_list, *licenses;
 
-	log_flag(BACKFILL, "=========================================");
+	if (get_log_level() < LOG_LEVEL_VERBOSE)
+		return;
+
+	log_flag(BACKFILL_MAP, "=========================================");
 	while (1) {
 		slurm_make_time_str(&node_space_ptr[i].begin_time,
 				    begin_buf, sizeof(begin_buf));
@@ -348,7 +396,7 @@ static void _dump_node_space_table(node_space_map_t *node_space_ptr)
 				    end_buf, sizeof(end_buf));
 		node_list = bitmap2node_name(node_space_ptr[i].avail_bitmap);
 		licenses = bf_licenses_to_string(node_space_ptr[i].licenses);
-		log_flag(BACKFILL, "Begin:%s End:%s Nodes:%s Licenses:%s Fragmentation:%u",
+		log_flag(BACKFILL_MAP, "Begin:%s End:%s Nodes:%s Licenses:%s Fragmentation:%u",
 			 begin_buf, end_buf, node_list, licenses,
 			 node_space_ptr[i].fragmentation);
 		xfree(node_list);
@@ -356,7 +404,7 @@ static void _dump_node_space_table(node_space_map_t *node_space_ptr)
 		if ((i = node_space_ptr[i].next) == 0)
 			break;
 	}
-	log_flag(BACKFILL, "=========================================");
+	log_flag(BACKFILL_MAP, "=========================================");
 }
 
 static void _set_job_time_limit(job_record_t *job_ptr, uint32_t new_limit)
@@ -394,31 +442,39 @@ static bool _many_pending_rpcs(void)
  * OUT has_mor - true if features are MORed together
  * RET Total count for ALL job features, even counts with XAND separator
  */
+static int _foreach_count_feature(void *x, void *arg)
+{
+	job_feature_t *feat_ptr = x;
+	feature_count_args_t *args = arg;
+
+	if (feat_ptr->count)
+		args->count++;
+	if (feat_ptr->op_code == FEATURE_OP_XAND)
+		*args->has_xand = true;
+	if (feat_ptr->op_code == FEATURE_OP_MOR)
+		*args->has_mor = true;
+
+	return 0;
+}
+
 static int _num_feature_count(job_record_t *job_ptr, bool *has_xand,
 			      bool *has_mor)
 {
 	job_details_t *detail_ptr = job_ptr->details;
-	int rc = 0;
-	list_itr_t *feat_iter;
-	job_feature_t *feat_ptr;
+	feature_count_args_t args = {
+		.has_mor = has_mor,
+		.has_xand = has_xand,
+	};
 
 	*has_xand = false;
 	*has_mor = false;
 	if (detail_ptr->feature_list_use == NULL)	/* no constraints */
-		return rc;
+		return 0;
 
-	feat_iter = list_iterator_create(detail_ptr->feature_list_use);
-	while ((feat_ptr = list_next(feat_iter))) {
-		if (feat_ptr->count)
-			rc++;
-		if (feat_ptr->op_code == FEATURE_OP_XAND)
-			*has_xand = true;
-		if (feat_ptr->op_code == FEATURE_OP_MOR)
-			*has_mor = true;
-	}
-	list_iterator_destroy(feat_iter);
+	list_for_each_ro(detail_ptr->feature_list_use, _foreach_count_feature,
+			 &args);
 
-	return rc;
+	return args.count;
 }
 
 static int _clear_qos_blocked_times(void *x, void *arg)
@@ -463,6 +519,12 @@ static int  _try_sched(job_record_t *job_ptr, bitstr_t **avail_bitmap,
 
 		tmp_bitmap = bit_copy(*avail_bitmap);
 		preemptee_candidates = slurm_find_preemptable_jobs(job_ptr);
+		/*
+		 * This needs to be an iterator since the inner loop below
+		 * advances feat_iter to consume all features within a
+		 * parenthesis group, which list_for_each() cannot expose to
+		 * the callback.
+		 */
 		feat_iter = list_iterator_create(feature_cache);
 		while ((feat_ptr = list_next(feat_iter)) &&
 		       (rc == SLURM_SUCCESS)) {
@@ -568,6 +630,12 @@ static int  _try_sched(job_record_t *job_ptr, bitstr_t **avail_bitmap,
 
 		tmp_bitmap = bit_copy(*avail_bitmap);
 		preemptee_candidates = slurm_find_preemptable_jobs(job_ptr);
+		/*
+		 * This needs to be an iterator since the inner loop below
+		 * advances feat_iter to consume all features within a
+		 * parenthesis group, which list_for_each() cannot expose to
+		 * the callback.
+		 */
 		feat_iter = list_iterator_create(feature_cache);
 		while ((feat_ptr = list_next(feat_iter))) {
 			detail_ptr->feature_list_use =
@@ -1234,8 +1302,13 @@ static int _clear_job_estimates(void *x, void *arg)
 /*
  * Return non-zero to break the backfill loop if change in job, node,
  * reservation or partition state or the backfill scheduler needs to be stopped.
+ * IN usec - Number of usec to sleep while yielding
+ * IN job_ptr - If job_updated is set, set BF_CURRENT_JOB_NOT_UPDATED in
+ *		bit_flags while locks are yielded, then unset it
+ * OUT job_updated - If not NULL, set to true if the job's values were updated
+ *		     during the yield, else false.
  */
-static int _yield_locks(int64_t usec)
+static int _yield_locks(int64_t usec, job_record_t *job_ptr, bool *job_updated)
 {
 	slurmctld_lock_t all_locks = {
 		.conf = READ_LOCK,
@@ -1254,6 +1327,10 @@ static int _yield_locks(int64_t usec)
 	config_update = slurm_conf.last_update;
 	resv_update = last_resv_update;
 
+	xassert(!job_updated || job_ptr);
+
+	if (job_updated)
+		job_ptr->bit_flags |= BF_CURRENT_JOB_NOT_UPDATED;
 	unlock_slurmctld(all_locks);
 	while (!stop_backfill) {
 		bf_sleep_usec += _my_sleep(usec);
@@ -1268,6 +1345,14 @@ static int _yield_locks(int64_t usec)
 		slurm_mutex_unlock(&slurmctld_config.thread_count_lock);
 	}
 	lock_slurmctld(all_locks);
+
+	if (job_updated) {
+		/* _update_job() removes BF_CURRENT_JOB_NOT_UPDATED */
+		*job_updated =
+			!(job_ptr->bit_flags & BF_CURRENT_JOB_NOT_UPDATED);
+		job_ptr->bit_flags &= ~BF_CURRENT_JOB_NOT_UPDATED;
+	}
+
 	slurm_mutex_lock(&config_lock);
 	if (config_flag)
 		load_config = true;
@@ -1277,7 +1362,6 @@ static int _yield_locks(int64_t usec)
 	     (last_node_update != node_update))) ||
 	    (last_part_update != part_update) ||
 	    (slurm_conf.last_update != config_update) ||
-	    (validate_resv_cnt != 0) ||
 	    (last_resv_update != resv_update) ||
 	    stop_backfill || load_config)
 		return 1;
@@ -1289,24 +1373,32 @@ static int _yield_locks(int64_t usec)
  * available partitions may have changed when locks were released */
 static bool _job_part_valid(job_record_t *job_ptr, part_record_t *part_ptr)
 {
-	part_record_t *avail_part_ptr;
-	list_itr_t *part_iterator;
-	bool rc = false;
+	if (job_ptr->part_ptr_list)
+		return list_find_first_ro(job_ptr->part_ptr_list,
+					  slurm_find_ptr_in_list, part_ptr);
 
-	if (job_ptr->part_ptr_list) {
-		part_iterator = list_iterator_create(job_ptr->part_ptr_list);
-		while ((avail_part_ptr = list_next(part_iterator))) {
-			if (avail_part_ptr == part_ptr) {
-				rc = true;
-				break;
-			}
-		}
-		list_iterator_destroy(part_iterator);
-	} else if (job_ptr->part_ptr == part_ptr) {
-		rc = true;
-	}
+	return (job_ptr->part_ptr == part_ptr);
+}
 
-	return rc;
+/*
+ * Test if the saved qos_ptr is still one this job recognizes. The job's
+ * qos_list/qos_ptr may have been rebuilt (e.g. by _foreach_cache_update_job)
+ * or cleared (e.g. by job_fail_qos) while locks were released, leaving our
+ * snapshot dangling.
+ * IN  job_ptr - the job whose current qos state to compare against.
+ * IN  qos_ptr - the snapshot pointer to validate; NULL is treated as valid.
+ * RET true if qos_ptr is NULL or still referenced by job_ptr.
+ */
+static bool _job_qos_valid(job_record_t *job_ptr, slurmdb_qos_rec_t *qos_ptr)
+{
+	if (!qos_ptr)
+		return true;
+
+	if (job_ptr->qos_list)
+		return list_find_first_ro(job_ptr->qos_list,
+					  slurm_find_ptr_in_list, qos_ptr);
+
+	return (job_ptr->qos_ptr == qos_ptr);
 }
 
 /* Determine if job in the backfill queue is still runnable.
@@ -1377,53 +1469,92 @@ static void _adjust_hetjob_prio(uint32_t *prio, uint32_t val)
 		*prio += val;
 }
 
+static int _foreach_hetjob_calc_prio(void *x, void *arg)
+{
+	job_record_t *het_comp = x;
+	hetjob_prio_args_t *args = arg;
+	uint32_t tmp, nparts;
+
+	if (het_comp->part_ptr_list &&
+	    het_comp->prio_mult &&
+	    het_comp->prio_mult->priority_array &&
+	    (nparts = list_count(het_comp->part_ptr_list))) {
+		for (uint32_t i = 0; i < nparts; i++) {
+			tmp = het_comp->prio_mult->priority_array[i];
+			if (tmp == 0) { /* job held */
+				args->prio = 0;
+				return -1;
+			}
+			_adjust_hetjob_prio(&args->prio, tmp);
+			args->cnt++;
+		}
+	} else {
+		tmp = het_comp->priority;
+		if (tmp == 0) { /* job held */
+			args->prio = 0;
+			return -1;
+		}
+		_adjust_hetjob_prio(&args->prio, tmp);
+		args->cnt++;
+	}
+	if ((bf_hetjob_prio & HETJOB_PRIO_MIN) && (args->prio == 1))
+		return -1; /* Can not get lower */
+
+	return 0;
+}
+
 /*
  * IN: job_record pointer of a hetjob leader (caller responsible)
  * RET: [min|max|avg] Priority of all components from same hetjob
  */
 static uint32_t _hetjob_calc_prio(job_record_t *het_leader)
 {
-	job_record_t *het_comp = NULL;
-	uint32_t prio = 0, tmp = 0, cnt = 0, i = 0, nparts = 0;
-	list_itr_t *iter = NULL;
+	hetjob_prio_args_t args = { 0 };
 
 	if (bf_hetjob_prio & HETJOB_PRIO_MIN)
-		prio = INFINITE;
+		args.prio = INFINITE;
 
-	iter = list_iterator_create(het_leader->het_job_list);
-	while ((het_comp = list_next(iter))) {
-		if (het_comp->part_ptr_list &&
-		    het_comp->prio_mult &&
-		    het_comp->prio_mult->priority_array &&
-		    (nparts = list_count(het_comp->part_ptr_list))) {
-			for (i = 0; i < nparts; i++) {
-				tmp = het_comp->prio_mult->priority_array[i];
-				if (tmp == 0) { /* job held */
-					prio = 0;
-					break;
-				}
-				_adjust_hetjob_prio(&prio, tmp);
-				cnt++;
-			}
-			if (prio == 0) /* job held */
-				break;
-		} else {
-			tmp = het_comp->priority;
-			if (tmp == 0) { /* job held */
-				prio = 0;
-				break;
-			}
-			_adjust_hetjob_prio(&prio, tmp);
-			cnt++;
-		}
-		if ((bf_hetjob_prio & HETJOB_PRIO_MIN) && (prio == 1))
-			break; /* Can not get lower */
+	list_for_each_ro(het_leader->het_job_list, _foreach_hetjob_calc_prio,
+			 &args);
+
+	if (args.prio && args.cnt && (bf_hetjob_prio & HETJOB_PRIO_AVG))
+		args.prio /= args.cnt;
+
+	return args.prio;
+}
+
+static int _foreach_calc_prio_tier_part(void *x, void *arg)
+{
+	part_record_t *part_ptr = x;
+	hetjob_prio_args_t *args = arg;
+
+	_adjust_hetjob_prio(&args->prio, part_ptr->priority_tier);
+	args->cnt++;
+
+	return 0;
+}
+
+static int _foreach_hetjob_calc_prio_tier(void *x, void *arg)
+{
+	job_record_t *het_comp = x;
+	hetjob_prio_args_t *args = arg;
+
+	if (het_comp->part_ptr_list &&
+	    list_count(het_comp->part_ptr_list)) {
+		list_for_each_ro(het_comp->part_ptr_list,
+				 _foreach_calc_prio_tier_part, args);
+	} else {
+		_adjust_hetjob_prio(&args->prio,
+				    het_comp->part_ptr->priority_tier);
+		args->cnt++;
 	}
-	list_iterator_destroy(iter);
-	if (prio && cnt && (bf_hetjob_prio & HETJOB_PRIO_AVG))
-		prio /= cnt;
+	if ((bf_hetjob_prio & HETJOB_PRIO_MIN) && (args->prio == 0))
+		return -1; /* Minimum found. */
+	if ((bf_hetjob_prio & HETJOB_PRIO_MAX) &&
+	    (args->prio == (NO_VAL16 - 1)))
+		return -1; /* Maximum found. */
 
-	return prio;
+	return 0;
 }
 
 /*
@@ -1432,41 +1563,25 @@ static uint32_t _hetjob_calc_prio(job_record_t *het_leader)
  */
 static uint32_t _hetjob_calc_prio_tier(job_record_t *het_leader)
 {
-	job_record_t *het_comp = NULL;
-	part_record_t *part_ptr = NULL;
-	uint32_t prio_tier = 0, tmp = 0, cnt = 0;
-	list_itr_t *iter = NULL, *iter2 = NULL;
+	hetjob_prio_args_t args = { 0 };
 
 	if (bf_hetjob_prio & HETJOB_PRIO_MIN)
-		prio_tier = NO_VAL16 - 1;
+		args.prio = NO_VAL16 - 1;
 
-	iter = list_iterator_create(het_leader->het_job_list);
-	while ((het_comp = list_next(iter))) {
-		if (het_comp->part_ptr_list &&
-		    list_count(het_comp->part_ptr_list)) {
-			iter2 = list_iterator_create(het_comp->part_ptr_list);
-			while ((part_ptr = list_next(iter2))) {
-				tmp = part_ptr->priority_tier;
-				_adjust_hetjob_prio(&prio_tier, tmp);
-				cnt++;
-			}
-			list_iterator_destroy(iter2);
-		} else {
-			tmp = het_comp->part_ptr->priority_tier;
-			_adjust_hetjob_prio(&prio_tier, tmp);
-			cnt++;
-		}
-		if ((bf_hetjob_prio & HETJOB_PRIO_MIN) && (prio_tier == 0))
-			break; /* Minimum found. */
-		if ((bf_hetjob_prio & HETJOB_PRIO_MAX) &&
-		    (prio_tier == (NO_VAL16 - 1)))
-			break; /* Maximum found. */
-	}
-	list_iterator_destroy(iter);
-	if (prio_tier && cnt && (bf_hetjob_prio & HETJOB_PRIO_AVG))
-		prio_tier /= cnt;
+	list_for_each_ro(het_leader->het_job_list,
+			 _foreach_hetjob_calc_prio_tier, &args);
 
-	return prio_tier;
+	if (args.prio && args.cnt && (bf_hetjob_prio & HETJOB_PRIO_AVG))
+		args.prio /= args.cnt;
+
+	return args.prio;
+}
+
+static int _find_hetcomp_with_resv(void *x, void *key)
+{
+	job_record_t *het_comp = x;
+
+	return (het_comp->resv_id != 0);
 }
 
 /*
@@ -1475,18 +1590,8 @@ static uint32_t _hetjob_calc_prio_tier(job_record_t *het_leader)
  */
 static bool _hetjob_any_resv(job_record_t *het_leader)
 {
-	job_record_t *het_comp = NULL;
-	list_itr_t *iter = NULL;
-	bool any_resv = false;
-
-	iter = list_iterator_create(het_leader->het_job_list);
-	while (!any_resv && (het_comp = list_next(iter))) {
-		if (het_comp->resv_id != 0)
-			any_resv = true;
-	}
-	list_iterator_destroy(iter);
-
-	return any_resv;
+	return list_find_first_ro(het_leader->het_job_list,
+				  _find_hetcomp_with_resv, NULL);
 }
 
 static int _foreach_het_job_details(void *x, void *arg)
@@ -1628,13 +1733,13 @@ static int _set_hetjob_details(void *x, void *arg)
 }
 
 /* Fetch key from xhash_t item. Called from function ptr */
-static void _bf_map_key_id(void *item, const char **key, uint32_t *key_len)
+static void _bf_map_key_id(void *item, const void **key, uint32_t *key_len)
 {
 	bf_user_usage_t *user = (bf_user_usage_t *)item;
 
 	xassert(user);
 
-	*key = (char *)&user->uid;
+	*key = &user->uid;
 	*key_len = sizeof(uid_t);
 }
 
@@ -1665,7 +1770,7 @@ static slurmdb_bf_usage_t *_bf_map_find_add(xhash_t* map, uid_t uid)
 	bf_user_usage_t *user;
 	xassert(map != NULL);
 
-	if (!(user = xhash_get(map, (char *)&uid, sizeof(uid_t))))
+	if (!(user = xhash_get(map, &uid, sizeof(uid))))
 		user = _bf_map_add_user(map, uid);
 	return &user->bf_usage;
 }
@@ -2089,6 +2194,71 @@ static int _hres_pre_select(job_record_t *job_ptr, node_space_map_t *node_space,
 	return SLURM_SUCCESS;
 }
 
+/*
+ * Validate that the job's deadline can be met.
+ * IN job_ptr - The job record to evaluate the deadline of
+ * IN now - time_t representing now
+ * OUT deadline_time_limit - # of minutes remaining before job deadline
+ * RETURN - true if job deadline can be met, else false
+ */
+static bool _validate_deadline(job_record_t *job_ptr, time_t now,
+			       uint32_t *deadline_time_limit)
+{
+	/* test of deadline */
+	*deadline_time_limit = 0;
+	if ((job_ptr->deadline) && (job_ptr->deadline != NO_VAL)) {
+		if (!deadline_ok(job_ptr, __func__))
+			return false;
+
+		*deadline_time_limit = (job_ptr->deadline - now) / 60;
+	}
+	return true;
+}
+
+/*
+ * Set backfill time limit variables.
+ * IN deadline_time_limit - # of minutes remaining before job deadline
+ * IN part_max_time - Partition's configured max time limit
+ * IN qos_flags - QOS flags to check if QOS_FLAG_NO_RESERVE is set
+ * IN/OUT job_ptr - Uses time_min and time_limit, can set time_limit
+ * OUT time_limit - time limit to use when evaluating the job
+ * OUT comp_time_limit - completion time limit
+ */
+static void _set_backfill_timelimits(uint32_t deadline_time_limit,
+				     uint32_t part_max_time, uint32_t qos_flags,
+				     job_record_t *job_ptr,
+				     uint32_t *comp_time_limit,
+				     uint32_t *time_limit)
+{
+	uint32_t part_time_limit;
+
+	if (part_max_time == INFINITE)
+		part_time_limit = YEAR_MINUTES;
+	else
+		part_time_limit = part_max_time;
+
+	/* Determine job's expected completion time */
+	if ((job_ptr->time_limit == NO_VAL) ||
+	    (job_ptr->time_limit == INFINITE)) {
+		*time_limit = part_time_limit;
+		job_ptr->limit_set.time = 1;
+	} else {
+		if (part_max_time == INFINITE)
+			*time_limit = job_ptr->time_limit;
+		else
+			*time_limit = MIN(job_ptr->time_limit, part_time_limit);
+	}
+	if (deadline_time_limit)
+		*comp_time_limit = MIN(*time_limit, deadline_time_limit);
+	else if (job_ptr->time_min && (job_ptr->time_min < *time_limit)) {
+		*comp_time_limit = *time_limit;
+		*time_limit = job_ptr->time_limit = job_ptr->time_min;
+	} else
+		*comp_time_limit = *time_limit;
+	if ((qos_flags & QOS_FLAG_NO_RESERVE) && slurm_conf.preempt_mode)
+		*time_limit = job_ptr->time_limit = 1;
+}
+
 /* This is for use in _attempt_backfill() only */
 #define SKIP_SCHED_OR_TRY_LATER(job_ptr, job_no_reserve, later_start,	\
 				orig_time_limit, orig_start_time)	\
@@ -2122,7 +2292,7 @@ static void _attempt_backfill(void)
 	part_record_t *part_ptr;
 	uint32_t end_time, end_reserve, deadline_time_limit, boot_time;
 	uint32_t orig_end_time;
-	uint32_t time_limit, comp_time_limit, orig_time_limit = 0, part_time_limit;
+	uint32_t time_limit, comp_time_limit, orig_time_limit = 0;
 	uint32_t min_nodes, max_nodes, req_nodes;
 	bitstr_t *active_bitmap = NULL, *avail_bitmap = NULL;
 	bitstr_t *resv_bitmap = NULL, *excluded_topo_bitmap = NULL;
@@ -2347,6 +2517,12 @@ static void _attempt_backfill(void)
 		qos_ptr = job_queue_rec->qos_ptr;
 		use_prefer = job_queue_rec->use_prefer;
 
+		if (!_job_qos_valid(job_ptr, qos_ptr)) {
+			log_flag(BACKFILL, "%pJ saved qos_ptr no longer valid, skipping",
+				 job_ptr);
+			continue;
+		}
+
 		if (job_ptr->array_recs &&
 		    (job_queue_rec->array_task_id == NO_VAL))
 			is_job_array_head = true;
@@ -2376,7 +2552,7 @@ static void _attempt_backfill(void)
 			/* Sync planned nodes before yielding locks */
 			nodes_planned = true;
 			_handle_planned(nodes_planned);
-			if (_yield_locks(yield_sleep)) {
+			if (_yield_locks(yield_sleep, NULL, NULL)) {
 				log_flag(BACKFILL, "system state changed, breaking out after testing %u(%d) jobs",
 					 slurmctld_diag_stats.bf_last_depth,
 					 job_test_count);
@@ -2423,6 +2599,11 @@ static void _attempt_backfill(void)
 			continue;
 		if (!_job_part_valid(job_ptr, part_ptr))
 			continue;	/* Partition change during lock yield */
+		if (!_job_qos_valid(job_ptr, qos_ptr)) {
+			log_flag(BACKFILL, "%pJ saved qos_ptr no longer valid after yield, skipping",
+				 job_ptr);
+			continue;
+		}
 
 		if (job_ptr->resv_list)
 			job_queue_rec_resv_list(job_queue_rec);
@@ -2434,8 +2615,16 @@ static void _attempt_backfill(void)
 		job_ptr->bit_flags |= BACKFILL_SCHED;
 		job_ptr->last_sched_eval = now;
 		job_ptr->part_ptr = part_ptr;
-		job_ptr->priority = bf_job_priority;
+		/*
+		 * Don't reset priority changed during yield - job entry may be
+		 * out of priority order now, but continuing because bf_continue
+		 * is set in that case.
+		 */
+		if (!job_ptr->direct_set_prio)
+			job_ptr->priority = bf_job_priority;
 		job_ptr->qos_ptr = qos_ptr;
+		if (qos_ptr)
+			job_ptr->qos_id = qos_ptr->id;
 
 		mcs_select = slurm_mcs_get_select(job_ptr);
 		het_job_time = _het_job_start_find(job_ptr);
@@ -2621,6 +2810,8 @@ next_task:
 		 */
 		job_ptr->part_ptr = part_ptr;
 		job_ptr->qos_ptr = qos_ptr;
+		if (qos_ptr)
+			job_ptr->qos_id = qos_ptr->id;
 		job_ptr->resv_ptr = resv_ptr;
 		if (resv_ptr)
 			job_ptr->resv_id = resv_ptr->resv_id;
@@ -2677,43 +2868,15 @@ next_task:
 			continue;
 		}
 
-		/* test of deadline */
+		/* Prepare to test of deadline */
 		now = time(NULL);
-		deadline_time_limit = 0;
-		if ((job_ptr->deadline) && (job_ptr->deadline != NO_VAL)) {
-			if (!deadline_ok(job_ptr, __func__))
-				continue;
-
-			deadline_time_limit = (job_ptr->deadline - now) / 60;
-		}
+		if (!_validate_deadline(job_ptr, now, &deadline_time_limit))
+			continue;
 
 		/* Determine job's expected completion time */
-		if (part_ptr->max_time == INFINITE)
-			part_time_limit = YEAR_MINUTES;
-		else
-			part_time_limit = part_ptr->max_time;
-		if ((job_ptr->time_limit == NO_VAL) ||
-		    (job_ptr->time_limit == INFINITE)) {
-			time_limit = part_time_limit;
-			job_ptr->limit_set.time = 1;
-		} else {
-			if (part_ptr->max_time == INFINITE)
-				time_limit = job_ptr->time_limit;
-			else
-				time_limit = MIN(job_ptr->time_limit,
-						 part_time_limit);
-		}
-		if (deadline_time_limit)
-			comp_time_limit = MIN(time_limit, deadline_time_limit);
-		else if (job_ptr->time_min &&
-			 (job_ptr->time_min < time_limit)) {
-			comp_time_limit = time_limit;
-			time_limit = job_ptr->time_limit = job_ptr->time_min;
-		} else
-			comp_time_limit = time_limit;
-		if ((qos_flags & QOS_FLAG_NO_RESERVE) &&
-		    slurm_conf.preempt_mode)
-			time_limit = job_ptr->time_limit = 1;
+		_set_backfill_timelimits(deadline_time_limit,
+					 part_ptr->max_time, qos_flags, job_ptr,
+					 &comp_time_limit, &time_limit);
 
 		later_start = now;
 		used_slots = 0;
@@ -2750,6 +2913,7 @@ TRY_LATER:
 
 		if (many_rpcs || (slurm_delta_tv(&start_tv) >= yield_interval)) {
 			uint32_t save_time_limit = job_ptr->time_limit;
+			bool job_updated = false;
 			_set_job_time_limit(job_ptr, orig_time_limit);
 			if (slurm_conf.debug_flags & DEBUG_FLAG_BACKFILL) {
 				END_TIMER;
@@ -2761,7 +2925,7 @@ TRY_LATER:
 			/* Sync planned nodes before yielding locks */
 			nodes_planned = true;
 			_handle_planned(nodes_planned);
-			if (_yield_locks(yield_sleep)) {
+			if (_yield_locks(yield_sleep, job_ptr, &job_updated)) {
 				log_flag(BACKFILL, "system state changed, breaking out after testing %u(%d) jobs",
 					 slurmctld_diag_stats.bf_last_depth,
 					 job_test_count);
@@ -2810,6 +2974,11 @@ TRY_LATER:
 				job_ptr->resv_id = resv_ptr->resv_id;
 			if (!_job_part_valid(job_ptr, part_ptr))
 				continue;	/* Partition change during lock yield */
+			if (!_job_qos_valid(job_ptr, qos_ptr)) {
+				log_flag(BACKFILL, "%pJ saved qos_ptr no longer valid after yield, skipping",
+					 job_ptr);
+				continue;
+			}
 			if (!job_independent(job_ptr)) {
 				log_flag(BACKFILL, "%pJ no longer independent after bf yield",
 					 job_ptr);
@@ -2818,9 +2987,38 @@ TRY_LATER:
 				continue;
 			}
 
-			job_ptr->time_limit = save_time_limit;
+			/*
+			 * Reset the backfill timelimit vars if job updated
+			 * since the job_ptr's timelimit, time_min, and deadline
+			 * could have been changed.
+			 */
+			if (job_updated) {
+				/*
+				 * Reset orig_time_limit if job_ptr->time_limit
+				 * was updated by user during yield.
+				 */
+				if ((job_ptr->time_limit != orig_time_limit) &&
+				    (job_ptr->limit_set.time != 1))
+					orig_time_limit = job_ptr->time_limit;
+				else
+					job_ptr->time_limit = orig_time_limit;
+
+				if (!_validate_deadline(job_ptr, now,
+							&deadline_time_limit))
+					continue;
+
+				_set_backfill_timelimits(deadline_time_limit,
+							 part_ptr->max_time,
+							 qos_flags, job_ptr,
+							 &comp_time_limit,
+							 &time_limit);
+			} else {
+				job_ptr->time_limit = save_time_limit;
+			}
 			job_ptr->part_ptr = part_ptr;
 			job_ptr->qos_ptr = qos_ptr;
+			if (qos_ptr)
+				job_ptr->qos_id = qos_ptr->id;
 		}
 
 		/*
@@ -3044,6 +3242,12 @@ later_start_set:
 		job_ptr->bit_flags |= BACKFILL_TEST;
 		job_ptr->bit_flags |= job_no_reserve;	/* 0 or TEST_NOW_ONLY */
 
+		save_whole_node = job_ptr->details->whole_node;
+
+		if (part_ptr->max_share == 0) {
+			job_ptr->details->whole_node |= WHOLE_NODE_REQUIRED;
+		}
+
 		if (active_bitmap) {
 			will_run_data.start = start_res;
 			will_run_data.end = later_start;
@@ -3060,13 +3264,13 @@ later_start_set:
 				if (node_features_g_overlap(active_bitmap))
 					get_boot_time = true;
 				FREE_NULL_BITMAP(active_bitmap);
-				save_share_res  = job_ptr->details->share_res;
-				save_whole_node = job_ptr->details->whole_node;
+				save_share_res = job_ptr->details->share_res;
 				job_ptr->details->share_res = 0;
+				if (!job_ptr->details->whole_node)
+					job_ptr->bit_flags |=
+						BF_WHOLE_NODE_TEST;
 				job_ptr->details->whole_node |=
 					WHOLE_NODE_REQUIRED;
-				if (!save_whole_node)
-					job_ptr->bit_flags |= BF_WHOLE_NODE_TEST;
 				test_fini = 0;
 			}
 		}
@@ -3139,9 +3343,9 @@ later_start_set:
 				       &will_run_data);
 			if (test_fini == 0) {
 				job_ptr->details->share_res = save_share_res;
-				job_ptr->details->whole_node = save_whole_node;
 			}
 		}
+		job_ptr->details->whole_node = save_whole_node;
 		job_ptr->bit_flags &= ~BACKFILL_TEST;
 		job_ptr->bit_flags &= ~BF_WHOLE_NODE_TEST;
 		job_ptr->bit_flags &= ~TEST_NOW_ONLY;
@@ -3794,11 +3998,13 @@ static int _start_job(job_record_t *job_ptr, bitstr_t *resv_bitmap)
 	if (rc == SLURM_SUCCESS) {
 		/* job initiated */
 		last_job_update = time(NULL);
-		info("Started %pJ in %s on %s",
+		log_flag(HETJOB, "Started %pJ in %s on %s",
 		     job_ptr, job_ptr->part_ptr->name, job_ptr->nodes);
-		if (job_ptr->batch_flag == 0)
+		if (job_ptr->batch_flag == 0) {
 			srun_allocate(job_ptr);
-		else if (!IS_JOB_CONFIGURING(job_ptr))
+			if (job_ptr->het_job_id)
+				launch_het_job_leader(job_ptr);
+		} else if (!IS_JOB_CONFIGURING(job_ptr))
 			launch_job(job_ptr);
 		slurmctld_diag_stats.backfilled_jobs++;
 		slurmctld_diag_stats.last_backfilled_jobs++;
@@ -3808,15 +4014,16 @@ static int _start_job(job_record_t *job_ptr, bitstr_t *resv_bitmap)
 			 slurmctld_diag_stats.backfilled_jobs);
 	} else if ((job_ptr->job_id != fail_jobid) &&
 		   (rc != ESLURM_ACCOUNTING_POLICY)) {
-		char *node_list;
 		bit_not(resv_bitmap);
-		node_list = bitmap2node_name(resv_bitmap);
 		/* This happens when a job has sharing disabled and
 		 * a selected node is still completing some job,
 		 * which should be a temporary situation. */
-		verbose("Failed to start %pJ with %s avail: %s",
-			job_ptr, node_list, slurm_strerror(rc));
-		xfree(node_list);
+		if (get_log_level() >= LOG_LEVEL_VERBOSE) {
+			char *node_list = bitmap2node_name(resv_bitmap);
+			verbose("Failed to start %pJ with %s avail: %s",
+				job_ptr, node_list, slurm_strerror(rc));
+			xfree(node_list);
+		}
 		fail_jobid = job_ptr->job_id;
 	} else {
 		debug3("Failed to start %pJ: %s",
@@ -4176,21 +4383,33 @@ static int _het_job_find_rec(void *x, void *key)
  * history so that heterogeneous jobs do not keep getting deferred based
  * upon old system state
  */
+static int _delete_or_reset_het_job_map(void *x, void *key)
+{
+	het_job_map_t *map = x;
+
+	if (map->prev_start == 0)
+		return 1;
+
+	map->prev_start = 0;
+	list_flush(map->het_job_rec_list);
+	return 0;
+}
+
 static void _het_job_start_clear(void)
 {
-	het_job_map_t *map;
-	list_itr_t *iter;
+	list_delete_all(het_job_list, _delete_or_reset_het_job_map, NULL);
+}
 
-	iter = list_iterator_create(het_job_list);
-	while ((map = list_next(iter))) {
-		if (map->prev_start == 0) {
-			list_delete_item(iter);
-		} else {
-			map->prev_start = 0;
-			list_flush(map->het_job_rec_list);
-		}
-	}
-	list_iterator_destroy(iter);
+static int _foreach_max_latest_start(void *x, void *arg)
+{
+	het_job_rec_t *rec = x;
+	het_job_start_compute_args_t *args = arg;
+
+	if (rec->job_id == args->exclude_job_id)
+		return 0;
+	args->latest_start = MAX(args->latest_start, rec->latest_start);
+
+	return 0;
 }
 
 /*
@@ -4202,19 +4421,14 @@ static void _het_job_start_clear(void)
 static time_t _het_job_start_compute(het_job_map_t *map,
 				     uint32_t exclude_job_id)
 {
-	list_itr_t *iter;
-	het_job_rec_t *rec;
-	time_t latest_start = map->prev_start;
+	het_job_start_compute_args_t args = {
+		.exclude_job_id = exclude_job_id,
+		.latest_start = map->prev_start,
+	};
 
-	iter = list_iterator_create(map->het_job_rec_list);
-	while ((rec = list_next(iter))) {
-		if (rec->job_id == exclude_job_id)
-			continue;
-		latest_start = MAX(latest_start, rec->latest_start);
-	}
-	list_iterator_destroy(iter);
+	list_for_each(map->het_job_rec_list, _foreach_max_latest_start, &args);
 
-	return latest_start;
+	return args.latest_start;
 }
 
 /*
@@ -4311,6 +4525,24 @@ static void _het_job_start_set(job_record_t *job_ptr, time_t latest_start,
 	}
 }
 
+static int _foreach_het_job_full(void *x, void *arg)
+{
+	job_record_t *job_ptr = x;
+	het_job_map_t *map = arg;
+
+	if ((job_ptr->magic != JOB_MAGIC) ||
+	    (job_ptr->het_job_id != map->het_job_id))
+		return -1; /* bad job pointer */
+	if (IS_JOB_RUNNING(job_ptr))
+		return 0;
+	if (!list_find_first_ro(map->het_job_rec_list, _het_job_find_rec,
+				&job_ptr->job_id) ||
+	    !_job_runnable_now(job_ptr))
+		return -1;
+
+	return 0;
+}
+
 /*
  * Return TRUE if we have expected start times for all components of a hetjob
  * and all components are valid and runable.
@@ -4320,36 +4552,16 @@ static void _het_job_start_set(job_record_t *job_ptr, time_t latest_start,
  */
 static bool _het_job_full(het_job_map_t *map)
 {
-	job_record_t *het_job_ptr, *job_ptr;
-	list_itr_t *iter;
-	bool rc = true;
+	job_record_t *het_job_ptr;
 
 	het_job_ptr = find_job_record(map->het_job_id);
 	if (!het_job_ptr || !het_job_ptr->het_job_list ||
 	    (!IS_JOB_RUNNING(het_job_ptr) &&
-	     !_job_runnable_now(het_job_ptr))) {
+	     !_job_runnable_now(het_job_ptr)))
 		return false;
-	}
 
-	iter = list_iterator_create(het_job_ptr->het_job_list);
-	while ((job_ptr = list_next(iter))) {
-		if ((job_ptr->magic != JOB_MAGIC) ||
-		    (job_ptr->het_job_id != map->het_job_id)) {
-			rc = false;	/* bad job pointer */
-			break;
-		}
-		if (IS_JOB_RUNNING(job_ptr))
-			continue;
-		if (!list_find_first(map->het_job_rec_list, _het_job_find_rec,
-				     &job_ptr->job_id) ||
-		    !_job_runnable_now(job_ptr)) {
-			rc = false;
-			break;
-		}
-	}
-	list_iterator_destroy(iter);
-
-	return rc;
+	return (list_for_each_ro(het_job_ptr->het_job_list,
+				 _foreach_het_job_full, map) >= 0);
 }
 
 /*
@@ -4408,6 +4620,19 @@ static bool _het_job_limit_check(het_job_map_t *map, time_t now)
 					       (job_ptr->bit_flags &
 						JOB_MEM_SET), sockets_per_node,
 					       job_ptr->details->num_tasks);
+
+		/*
+		 * The Node TRES is only set here to set up
+		 * tres_req_cnt[TRES_ARRAY_BILLING]. We can't test against it in
+		 * acct_policy_job_runnable_[pre|pos]t_select() fully as
+		 * acct_policy_job_begin() -> _add_usage_node_bitmap() skips
+		 * setting up usage on this on purpose because we don't know if
+		 * we will overlap nodes or not with other jobs we are also
+		 * running with the same assoc/qos. This limit will be checked
+		 * later on though and fail. If it does fail the begin_time will
+		 * be moved forward in time 1200 seconds (see
+		 * _het_job_kill_now()).
+		 */
 		tres_req_cnt[TRES_ARRAY_NODE] = (uint64_t)selected_node_cnt;
 
 		assoc_mgr_lock(&locks);
@@ -4463,109 +4688,143 @@ static bool _het_job_limit_check(het_job_map_t *map, time_t now)
 	return runnable;
 }
 
+static int _foreach_het_job_start_now(void *x, void *arg)
+{
+	het_job_rec_t *rec = x;
+	het_job_start_now_args_t *args = arg;
+	job_record_t *job_ptr = rec->job_ptr;
+	bitstr_t *avail_bitmap = NULL;
+	bool reset_time = false;
+	bool resv_overlap = false;
+	time_t start_res = args->now;
+	uint32_t hard_limit;
+	resv_exc_t resv_exc = { 0 };
+
+	job_ptr->part_ptr = rec->part_ptr;
+	if (rec->resv_ptr) {
+		job_ptr->resv_ptr = rec->resv_ptr;
+		job_ptr->resv_id = job_ptr->resv_ptr->resv_id;
+	}
+
+	/*
+	 * Identify the nodes which this job can use
+	 */
+	args->rc = job_test_resv(job_ptr, &start_res, true, &avail_bitmap,
+				 &resv_exc, &resv_overlap, false);
+	reservation_delete_resv_exc_parts(&resv_exc);
+	if (args->rc != SLURM_SUCCESS) {
+		error("%pJ failed to start due to reservation", job_ptr);
+		FREE_NULL_BITMAP(avail_bitmap);
+		return -1;
+	}
+	bit_and(avail_bitmap, job_ptr->part_ptr->node_bitmap);
+	bit_and(avail_bitmap, up_node_bitmap);
+	if (args->used_bitmap)
+		bit_and_not(avail_bitmap, args->used_bitmap);
+	if (job_ptr->details->exc_node_bitmap)
+		bit_and_not(avail_bitmap, job_ptr->details->exc_node_bitmap);
+
+	if (fed_mgr_job_lock(job_ptr)) {
+		error("%pJ failed to start due to fed job lock", job_ptr);
+		FREE_NULL_BITMAP(avail_bitmap);
+		return 0;
+	}
+
+	bit_not(avail_bitmap);
+	args->rc = _start_job(job_ptr, avail_bitmap);
+	FREE_NULL_BITMAP(avail_bitmap);
+	if (args->rc == SLURM_SUCCESS) {
+		/*
+		 * If the following fails because of network connectivity, the
+		 * origin cluster should ask when it comes back up if the
+		 * cluster_lock cluster actually started the job
+		 */
+		fed_mgr_job_start(job_ptr, job_ptr->start_time);
+		log_flag(HETJOB, "%pJ started", job_ptr);
+		if (!args->used_bitmap && job_ptr->node_bitmap)
+			args->used_bitmap = bit_copy(job_ptr->node_bitmap);
+		else if (job_ptr->node_bitmap)
+			bit_or(args->used_bitmap, job_ptr->node_bitmap);
+	} else {
+		fed_mgr_job_unlock(job_ptr);
+		return -1;
+	}
+	if (job_ptr->time_min) {
+		/* Set time limit as high as possible */
+		acct_policy_alter_job(job_ptr, args->map->comp_time_limit);
+		job_ptr->time_limit = args->map->comp_time_limit;
+		reset_time = true;
+	}
+	if (job_ptr->start_time) {
+		if (job_ptr->time_limit == INFINITE)
+			hard_limit = YEAR_SECONDS;
+		else
+			hard_limit = job_ptr->time_limit * 60;
+		job_ptr->end_time = job_ptr->start_time + hard_limit;
+		/*
+		 * Only set if start_time. end_time must be set beforehand for
+		 * _reset_job_time_limit.
+		 */
+		if (reset_time)
+			_reset_job_time_limit(job_ptr, args->now,
+					      args->node_space);
+	}
+	if (reset_time)
+		jobacct_storage_g_job_start(acct_db_conn, job_ptr);
+
+	return 0;
+}
+
 /*
  * Start all components of a hetjob now
  */
 static int _het_job_start_now(het_job_map_t *map, node_space_map_t *node_space)
 {
-	job_record_t *job_ptr;
-	bitstr_t *avail_bitmap = NULL;
-	bitstr_t *resv_bitmap = NULL, *used_bitmap = NULL;
-	het_job_rec_t *rec;
-	list_itr_t *iter;
-	int rc = SLURM_SUCCESS;
-	bool resv_overlap = false;
-	time_t now = time(NULL), start_res;
-	uint32_t hard_limit;
-	resv_exc_t resv_exc = { 0 };
+	het_job_start_now_args_t args = {
+		.map = map,
+		.node_space = node_space,
+		.now = time(NULL),
+		.rc = SLURM_SUCCESS,
+	};
 
-	iter = list_iterator_create(map->het_job_rec_list);
-	while ((rec = list_next(iter))) {
-		bool reset_time = false;
-		job_ptr = rec->job_ptr;
-		job_ptr->part_ptr = rec->part_ptr;
-		if (rec->resv_ptr) {
-			job_ptr->resv_ptr = rec->resv_ptr;
-			job_ptr->resv_id = job_ptr->resv_ptr->resv_id;
-		}
+	list_for_each_ro(map->het_job_rec_list, _foreach_het_job_start_now,
+			 &args);
+	FREE_NULL_BITMAP(args.used_bitmap);
 
-		/*
-		 * Identify the nodes which this job can use
-		 */
-		start_res = now;
-		rc = job_test_resv(job_ptr, &start_res, true, &avail_bitmap,
-				   &resv_exc, &resv_overlap, false);
-		reservation_delete_resv_exc_parts(&resv_exc);
-		if (rc != SLURM_SUCCESS) {
-			error("%pJ failed to start due to reservation",
-			      job_ptr);
-			FREE_NULL_BITMAP(avail_bitmap);
-			break;
-		}
-		bit_and(avail_bitmap, job_ptr->part_ptr->node_bitmap);
-		bit_and(avail_bitmap, up_node_bitmap);
-		if (used_bitmap)
-			bit_and_not(avail_bitmap, used_bitmap);
-		if (job_ptr->details->exc_node_bitmap) {
-			bit_and_not(avail_bitmap,
-				job_ptr->details->exc_node_bitmap);
-		}
+	return args.rc;
+}
 
-		if (fed_mgr_job_lock(job_ptr)) {
-			error("%pJ failed to start due to fed job lock",
-			      job_ptr);
-			FREE_NULL_BITMAP(avail_bitmap);
-			continue;
-		}
+static int _foreach_het_job_kill_now(void *x, void *arg)
+{
+	het_job_rec_t *rec = x;
+	het_job_kill_now_args_t *args = arg;
+	job_record_t *job_ptr = rec->job_ptr;
+	uint32_t save_bitflags;
 
-		resv_bitmap = avail_bitmap;
-		avail_bitmap = NULL;
-		bit_not(resv_bitmap);
-		rc = _start_job(job_ptr, resv_bitmap);
-		FREE_NULL_BITMAP(resv_bitmap);
-		if (rc == SLURM_SUCCESS) {
-			/*
-			 * If the following fails because of network
-			 * connectivity, the origin cluster should ask
-			 * when it comes back up if the cluster_lock
-			 * cluster actually started the job
-			 */
-			fed_mgr_job_start(job_ptr, job_ptr->start_time);
-			log_flag(HETJOB, "%pJ started", job_ptr);
-			if (!used_bitmap && job_ptr->node_bitmap)
-				used_bitmap = bit_copy(job_ptr->node_bitmap);
-			else if (job_ptr->node_bitmap)
-				bit_or(used_bitmap, job_ptr->node_bitmap);
-		} else {
-			fed_mgr_job_unlock(job_ptr);
-			break;
-		}
-		if (job_ptr->time_min) {
-			/* Set time limit as high as possible */
-			acct_policy_alter_job(job_ptr, map->comp_time_limit);
-			job_ptr->time_limit = map->comp_time_limit;
-			reset_time = true;
-		}
-		if (job_ptr->start_time) {
-			if (job_ptr->time_limit == INFINITE)
-				hard_limit = YEAR_SECONDS;
-			else
-				hard_limit = job_ptr->time_limit * 60;
-			job_ptr->end_time = job_ptr->start_time + hard_limit;
-			/*
-			 * Only set if start_time. end_time must be set
-			 * beforehand for _reset_job_time_limit.
-			 */
-			if (reset_time)
-				_reset_job_time_limit(job_ptr, now, node_space);
-		}
-		if (reset_time)
-			jobacct_storage_g_job_start(acct_db_conn, job_ptr);
-	}
-	list_iterator_destroy(iter);
-	FREE_NULL_BITMAP(used_bitmap);
+	if (IS_JOB_PENDING(job_ptr))
+		return 0;
 
-	return rc;
+	log_flag(HETJOB, "Deallocate %pJ due to hetjob start failure", job_ptr);
+	job_ptr->details->begin_time = args->now + args->cred_lifetime + 1;
+	job_ptr->end_time = args->now;
+	job_state_set(job_ptr, (JOB_PENDING | JOB_COMPLETING));
+	last_job_update = args->now;
+	build_cg_bitmap(job_ptr);
+	job_completion_logger(job_ptr, false);
+	deallocate_nodes(job_ptr, false, false, false);
+	/*
+	 * Since the job_completion_logger() removes the submit, we need to add
+	 * it again, but don't stage-out burst buffer
+	 */
+	save_bitflags = job_ptr->bit_flags;
+	job_ptr->bit_flags |= JOB_KILL_HURRY;
+	acct_policy_add_job_submit(job_ptr, false);
+	job_ptr->bit_flags = save_bitflags;
+	if (!job_ptr->node_bitmap_cg ||
+	    (bit_set_count(job_ptr->node_bitmap_cg) == 0))
+		batch_requeue_fini(job_ptr);
+
+	return 0;
 }
 
 /*
@@ -4573,41 +4832,13 @@ static int _het_job_start_now(het_job_map_t *map, node_space_map_t *node_space)
  */
 static void _het_job_kill_now(het_job_map_t *map)
 {
-	job_record_t *job_ptr;
-	het_job_rec_t *rec;
-	list_itr_t *iter;
-	time_t now = time(NULL);
-	int cred_lifetime = 1200;
-	uint32_t save_bitflags;
+	het_job_kill_now_args_t args = {
+		.cred_lifetime = cred_expiration(),
+		.now = time(NULL),
+	};
 
-	cred_lifetime = cred_expiration();
-	iter = list_iterator_create(map->het_job_rec_list);
-	while ((rec = list_next(iter))) {
-		job_ptr = rec->job_ptr;
-		if (IS_JOB_PENDING(job_ptr))
-			continue;
-		info("Deallocate %pJ due to hetjob start failure",
-		     job_ptr);
-		job_ptr->details->begin_time = now + cred_lifetime + 1;
-		job_ptr->end_time   = now;
-		job_state_set(job_ptr, (JOB_PENDING | JOB_COMPLETING));
-		last_job_update     = now;
-		build_cg_bitmap(job_ptr);
-		job_completion_logger(job_ptr, false);
-		deallocate_nodes(job_ptr, false, false, false);
-		/*
-		 * Since the job_completion_logger() removes the submit,
-		 * we need to add it again, but don't stage-out burst buffer
-		 */
-		save_bitflags = job_ptr->bit_flags;
-		job_ptr->bit_flags |= JOB_KILL_HURRY;
-		acct_policy_add_job_submit(job_ptr, false);
-		job_ptr->bit_flags = save_bitflags;
-		if (!job_ptr->node_bitmap_cg ||
-		    (bit_set_count(job_ptr->node_bitmap_cg) == 0))
-			batch_requeue_fini(job_ptr);
-	}
-	list_iterator_destroy(iter);
+	list_for_each_ro(map->het_job_rec_list, _foreach_het_job_kill_now,
+			 &args);
 }
 
 /*
@@ -4777,9 +5008,78 @@ static void _het_job_deadlock_fini(void)
 	FREE_NULL_LIST(deadlock_global_list);
 }
 
+static int _foreach_log_deadlock_job(void *x, void *arg)
+{
+	deadlock_job_struct_t *dl_job = x;
+
+	log_flag(HETJOB, "   Hetjob %u to start at %"PRIu64,
+		 dl_job->het_job_id, (uint64_t) dl_job->start_time);
+
+	return 0;
+}
+
+static int _foreach_log_deadlock_part(void *x, void *arg)
+{
+	deadlock_part_struct_t *dl_part = x;
+
+	log_flag(HETJOB, "Partition %s Hetjobs:", dl_part->part_ptr->name);
+	list_for_each_ro(dl_part->deadlock_job_list, _foreach_log_deadlock_job,
+			 NULL);
+
+	return 0;
+}
+
+static int _foreach_check_inner_deadlock(void *x, void *arg)
+{
+	deadlock_job_struct_t *dl_job = x;
+	deadlock_check_args_t *args = arg;
+	deadlock_job_struct_t *match;
+
+	if (dl_job->het_job_id == args->dl_job_ptr->het_job_id)
+		return -1; /* Self */
+
+	match = list_find_first_ro(args->dl_part_ptr_conflict->deadlock_job_list,
+				   _deadlock_part_list_srch2, dl_job);
+	if (match && (match->start_time < args->dl_job_ptr->start_time)) {
+		args->have_deadlock = true;
+		args->dl_job_ptr_conflict = match;
+		return -1;
+	}
+
+	return 0;
+}
+
+static int _foreach_check_outer_deadlock(void *x, void *arg)
+{
+	deadlock_part_struct_t *dl_part = x;
+	deadlock_check_args_t *args = arg;
+
+	if (dl_part == args->dl_part_ptr) /* Current partition, skip it */
+		return 0;
+	if (!list_find_first_ro(dl_part->deadlock_job_list,
+				_deadlock_part_list_srch, args->job_ptr))
+		return 0; /* Hetjob not in this partition, no check */
+
+	args->dl_part_ptr_conflict = dl_part;
+	list_for_each_ro(args->dl_part_ptr->deadlock_job_list,
+			 _foreach_check_inner_deadlock, args);
+
+	if (args->have_deadlock) {
+		log_flag(HETJOB, "Hetjob %u in partition %s would deadlock with hetjob %u in partition %s, skipping it",
+			 args->dl_job_ptr->het_job_id,
+			 args->dl_part_ptr->part_ptr->name,
+			 args->dl_job_ptr_conflict->het_job_id,
+			 args->dl_part_ptr_conflict->part_ptr->name);
+		return -1;
+	}
+
+	return 0;
+}
+
 /*
  * Determine if job can run at it's "start_time" or later.
- * job_ptr IN - job to test, set reason to "HET_JOB_DEADLOCK" if it will deadlock
+ * job_ptr IN - job to test, set reason to "HET_JOB_DEADLOCK" if it will
+ *              deadlock
  * RET true if the job can not run due to possible deadlock with other hetjob
  *
  * NOTE: If there are a large number of hetjobs this will be painfully slow
@@ -4787,11 +5087,9 @@ static void _het_job_deadlock_fini(void)
  */
 static bool _het_job_deadlock_test(job_record_t *job_ptr)
 {
-	deadlock_job_struct_t  *dl_job_ptr  = NULL, *dl_job_ptr2 = NULL;
-	deadlock_job_struct_t  *dl_job_ptr3 = NULL;
-	deadlock_part_struct_t *dl_part_ptr = NULL, *dl_part_ptr2 = NULL;
-	list_itr_t *job_iter, *part_iter;
-	bool have_deadlock = false;
+	deadlock_job_struct_t *dl_job_ptr = NULL;
+	deadlock_part_struct_t *dl_part_ptr = NULL;
+	deadlock_check_args_t check_args = { 0 };
 
 	if (!job_ptr->het_job_id || !job_ptr->part_ptr)
 		return false;
@@ -4830,65 +5128,24 @@ static bool _het_job_deadlock_test(job_record_t *job_ptr)
 	/*
 	 * Log current table of hetjob start times by partition
 	 */
-	if (slurm_conf.debug_flags & DEBUG_FLAG_BACKFILL) {
-		part_iter = list_iterator_create(deadlock_global_list);
-		while ((dl_part_ptr2 = list_next(part_iter))){
-			info("Partition %s Hetjobs:",
-			     dl_part_ptr2->part_ptr->name);
-			job_iter = list_iterator_create(dl_part_ptr2->
-							deadlock_job_list);
-			while ((dl_job_ptr2 = list_next(job_iter))) {
-				info("   Hetjob %u to start at %"PRIu64,
-				     dl_job_ptr2->het_job_id,
-				     (uint64_t) dl_job_ptr2->start_time);
-			}
-			list_iterator_destroy(job_iter);
-		}
-		list_iterator_destroy(part_iter);
-	}
+	if ((slurm_conf.debug_flags & DEBUG_FLAG_BACKFILL) &&
+	    (slurm_conf.debug_flags & DEBUG_FLAG_HETJOB))
+		list_for_each_ro(deadlock_global_list,
+				 _foreach_log_deadlock_part, NULL);
 
 	/*
 	 * Determine if any hetjobs scheduled to start earlier than this job
 	 * in this partition are scheduled to start after it in some other
 	 * partition
 	 */
-	part_iter = list_iterator_create(deadlock_global_list);
-	while ((dl_part_ptr2 = list_next(part_iter))){
-		if (dl_part_ptr2 == dl_part_ptr) /* Current partition, skip it */
-			continue;
-		dl_job_ptr2 = list_find_first(dl_part_ptr2->deadlock_job_list,
-					      _deadlock_part_list_srch,
-					      job_ptr);
-		if (!dl_job_ptr2) /* Hetjob not in this partition, no check */
-			continue;
-		job_iter = list_iterator_create(dl_part_ptr->deadlock_job_list);
-		while ((dl_job_ptr2 = list_next(job_iter))) {
-			if (dl_job_ptr2->het_job_id == dl_job_ptr->het_job_id)
-				break;	/* Self */
-			dl_job_ptr3 = list_find_first(
-						dl_part_ptr2->deadlock_job_list,
-						_deadlock_part_list_srch2,
-						dl_job_ptr2);
-			if (dl_job_ptr3 &&
-			    (dl_job_ptr3->start_time < dl_job_ptr->start_time)){
-				have_deadlock = true;
-				break;
-			}
-		}
-		list_iterator_destroy(job_iter);
+	check_args.dl_job_ptr = dl_job_ptr;
+	check_args.dl_part_ptr = dl_part_ptr;
+	check_args.job_ptr = job_ptr;
 
-		if (have_deadlock)
-			log_flag(HETJOB, "Hetjob %u in partition %s would deadlock with hetjob %u in partition %s, skipping it",
-				 dl_job_ptr->het_job_id,
-				 dl_part_ptr->part_ptr->name,
-				 dl_job_ptr3->het_job_id,
-				 dl_part_ptr2->part_ptr->name);
-		if (have_deadlock)
-			break;
-	}
-	list_iterator_destroy(part_iter);
+	list_for_each_ro(deadlock_global_list, _foreach_check_outer_deadlock,
+			 &check_args);
 
-	return have_deadlock;
+	return check_args.have_deadlock;
 }
 
 static void _set_bf_exit(bf_exit_t code)

@@ -36,6 +36,7 @@
 #include <sys/un.h>
 
 #include "src/common/fd.h"
+#include "src/common/net.h"
 #include "src/common/pack.h"
 #include "src/common/read_config.h"
 #include "src/common/slurm_protocol_api.h"
@@ -60,10 +61,8 @@ static int _slurmd_pack_msg_to_stepd(slurm_msg_t *resp, buf_t *out)
 	pack32(0, out);
 
 	pack16(resp->msg_type, out);
-	if (pack_msg(resp, out) != SLURM_SUCCESS) {
-		FREE_NULL_BUFFER(out);
+	if (pack_msg(resp, out))
 		return SLURM_ERROR;
-	}
 
 	/* write length then reset out to end of message */
 	end_position = get_buf_offset(out);
@@ -278,16 +277,13 @@ extern void stepd_proxy_slurmd_init(char *spooldir)
 		.on_data = _on_data_local_socket,
 	};
 	static char *path = NULL;
-	static const conmgr_con_flags_t flags =
-		(CON_FLAG_WATCH_WRITE_TIMEOUT | CON_FLAG_WATCH_READ_TIMEOUT |
-		 CON_FLAG_WATCH_CONNECT_TIMEOUT);
 	int rc;
 
 	if (!path)
 		xstrfmtcat(path, "unix:%s/slurmd.socket", spooldir);
 
-	if ((rc = conmgr_create_listen_socket(CON_TYPE_RAW, flags, path,
-					      &events, NULL)))
+	if ((rc = conmgr_create_listen_socket(NULL, CON_TYPE_RAW, CON_FLAG_NONE,
+					      path, &events, NULL)))
 		fatal("%s: [%s] unable to create socket: %s",
 		      __func__, path, slurm_strerror(rc));
 }
@@ -300,13 +296,14 @@ extern void stepd_proxy_stepd_init(char *spooldir)
 static int _stepd_connect_to_slurmd(void)
 {
 	struct sockaddr_un slurmd_addr = { .sun_family = AF_UNIX };
-	size_t len;
+	socklen_t len;
 	int fd;
 
 	(void) snprintf(slurmd_addr.sun_path, sizeof(slurmd_addr.sun_path),
 			"%s/slurmd.socket", slurmd_spooldir);
 
-	len = strlen(slurmd_addr.sun_path) + 1 + sizeof(slurmd_addr.sun_family);
+	len = sockaddr_fixlen((struct sockaddr *) &slurmd_addr,
+			      (socklen_t) sizeof(slurmd_addr));
 
 	if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
 		error("%s: socket() failed: %m", __func__);

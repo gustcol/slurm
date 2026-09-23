@@ -1,6 +1,6 @@
 Name:		slurm
-Version:	25.05.0
-%define rel	1
+Version:	26.11.0
+%define rel	0rc1
 %if %{defined patch} && %{undefined extraver}
 %define extraver .patched
 %endif
@@ -48,6 +48,7 @@ Source:		%{slurm_source_dir}.tar.bz2
 # --with jwt		%_with_jwt 1		require jwt support
 # --with freeipmi	%_with_freeipmi 1	require freeipmi support
 # --with selinux	%_with_selinux 1	build with selinux support
+# --with hpe_slingshot	%_with_hpe_slingshot 1	build with switch/hpe_slingshot plugin
 #
 
 #  Options that are off by default (enable with --with <opt>)
@@ -57,6 +58,7 @@ Source:		%{slurm_source_dir}.tar.bz2
 %bcond_with multiple_slurmd
 %bcond_with pmix
 %bcond_with ucx
+%bcond_with selinux
 
 # These options are only here to force there to be these on the build.
 # If they are not set they will still be compiled if the packages exist.
@@ -69,6 +71,7 @@ Source:		%{slurm_source_dir}.tar.bz2
 %bcond_with jwt
 %bcond_with yaml
 %bcond_with freeipmi
+%bcond_with hpe_slingshot
 
 # Use debug by default on all systems
 %bcond_without debug
@@ -103,17 +106,11 @@ BuildRequires:  pkgconfig
 %if %{with cgroupv2}
 Requires: libbpf
 BuildRequires: kernel-headers
-%if %{defined suse_version}
-Requires: dbus-1
-BuildRequires: dbus-1-devel
-%else
-Requires: dbus
-BuildRequires: dbus-devel
-%endif
+BuildRequires: pkgconfig(dbus-1)
 %endif
 
 %if %{with munge}
-Requires: munge
+Recommends: munge
 BuildRequires: munge-devel munge-libs
 %endif
 
@@ -128,7 +125,7 @@ Obsoletes: slurm-munge <= %{version}
 Obsoletes: slurm-plugins <= %{version}
 
 # fake systemd support when building rpms on other platforms
-%{!?_unitdir: %global _unitdir /lib/systemd/systemd}
+%{!?_unitdir: %global _unitdir /lib/systemd/system}
 
 %define use_mysql_devel %(perl -e '`rpm -q mysql-devel`; print !$?;')
 # Default for OpenSUSE/SLES builds
@@ -175,39 +172,32 @@ BuildRequires: pkgconfig(lua) >= 5.1.0
 %endif
 
 %if %{with hwloc} && "%{_with_hwloc}" == "--with-hwloc"
-BuildRequires: hwloc-devel
+BuildRequires: pkgconfig(hwloc)
 %endif
 
 %if %{with numa}
-%if %{defined suse_version}
-BuildRequires: libnuma-devel
-%else
-BuildRequires: numactl-devel
-%endif
+BuildRequires: pkgconfig(numa)
 %endif
 
 %if %{with pmix} && "%{_with_pmix}" == "--with-pmix"
-BuildRequires: pmix
+BuildRequires: pkgconfig(pmix)
 %global pmix_version %(rpm -q pmix --qf "%{RPMTAG_VERSION}")
 %endif
 
 %if %{with ucx} && "%{_with_ucx}" == "--with-ucx"
-BuildRequires: ucx-devel
+BuildRequires: pkgconfig(ucx)
 %global ucx_version %(rpm -q ucx-devel --qf "%{RPMTAG_VERSION}")
 %endif
 
 %if %{with libcurl}
-%if %{defined suse_version}
-Requires: libcurl4
-%else
-Requires: libcurl
-%endif
-BuildRequires: libcurl-devel
+BuildRequires: pkgconfig(libcurl)
 %endif
 
 %if %{with jwt}
 BuildRequires: libjwt-devel >= 1.10.0
+BuildRequires: libjwt-devel < 3
 Requires: libjwt >= 1.10.0
+Requires: libjwt < 3
 %endif
 
 %if %{with yaml}
@@ -221,8 +211,7 @@ BuildRequires: freeipmi-devel
 %endif
 
 %if %{with selinux}
-Requires: libselinux
-BuildRequires: libselinux-devel
+BuildRequires: pkgconfig(libselinux)
 %endif
 
 #  Allow override of sysconfdir via _slurm_sysconfdir.
@@ -261,17 +250,14 @@ BuildRequires: libselinux-devel
 # cause errors with rpm 4.13 and on. Turn that check off.
 %define _empty_manifest_terminate_build 0
 
-# First we remove $prefix/local and then just prefix to make
-# sure we get the correct installdir
-%define _perlarch %(perl -e 'use Config; $T=$Config{installsitearch}; $P=$Config{installprefix}; $P1="$P/local"; $T =~ s/$P1//; $T =~ s/$P//; print $T;')
-
-%define _perlman3 %(perl -e 'use Config; $T=$Config{installsiteman3dir}; $P=$Config{siteprefix}; $P1="$P/local"; $T =~ s/$P1//; $T =~ s/$P//; print $T;')
-
-%define _perlarchlib %(perl -e 'use Config; $T=$Config{installarchlib}; $P=$Config{installprefix}; $P1="$P/local"; $T =~ s/$P1//; $T =~ s/$P//; print $T;')
-
-%define _perldir %{_prefix}%{_perlarch}
-%define _perlman3dir %{_prefix}%{_perlman3}
-%define _perlarchlibdir %{_prefix}%{_perlarchlib}
+# Install Perl modules in Perl's vendor directory ($Config{installvendorarch}),
+# always in @INC for the system Perl.
+%define _perldir %(perl -MConfig -e 'print $Config{installvendorarch}')
+%define _perlman3dir %(perl -MConfig -e 'print $Config{installvendorman3dir}')
+# _perlarchlibdir is used only to clean up the perllocal.pod that
+# Makefile.PL drops alongside core Perl's archlib regardless of which
+# INSTALLDIRS tier is active, so it must point at $Config{installarchlib}.
+%define _perlarchlibdir %(perl -MConfig -e 'print $Config{installarchlib}')
 
 %description
 Slurm is an open source, fault-tolerant, and highly scalable
@@ -407,12 +393,12 @@ according to the Slurm
 Summary: Slurm REST API translator
 Group: System Environment/Base
 Requires: %{name}%{?_isa} = %{version}-%{release}
+%if 0%{?rhel} == 7
 BuildRequires: http-parser-devel
-%if %{defined suse_version}
-BuildRequires: libjson-c-devel
 %else
-BuildRequires: json-c-devel
+BuildRequires: (llhttp-devel or http-parser-devel)
 %endif
+BuildRequires: pkgconfig(json-c)
 %description slurmrestd
 Provides a REST interface to Slurm.
 %endif
@@ -448,9 +434,10 @@ Provides a REST interface to Slurm.
 	%{?_with_yaml} \
 	%{?_with_nvml} \
 	%{!?with_munge:--without-munge} \
+	%{?_with_hpe_slingshot} \
 	%{?_with_cflags}
 
-make %{?_smp_mflags}
+SLURM_PERL_INSTALLDIRS=vendor make %{?_smp_mflags}
 
 %install
 
@@ -460,16 +447,11 @@ export QA_RPATHS=0x5
 
 # Strip out some dependencies
 
-cat > find-requires.sh <<'EOF'
-exec %{__find_requires} "$@" | grep -E -v '^libpmix.so|libevent|libnvidia-ml'
-EOF
-chmod +x find-requires.sh
-%global _use_internal_dependency_generator 0
-%global __find_requires %{_builddir}/%{buildsubdir}/find-requires.sh
+%global __requires_exclude ^libpmix.so|libevent|libnvidia-ml
 
 rm -rf %{buildroot}
-make install DESTDIR=%{buildroot}
-make install-contrib DESTDIR=%{buildroot}
+SLURM_PERL_INSTALLDIRS=vendor make install DESTDIR=%{buildroot}
+SLURM_PERL_INSTALLDIRS=vendor make install-contrib DESTDIR=%{buildroot}
 
 # Do not package Slurm's version of libpmi on Cray systems in the usual location.
 # Cray's version of libpmi should be used. Move it elsewhere if the site still
@@ -525,6 +507,7 @@ rm -f %{buildroot}/%{_datadir}/bash-completion/completions/srun
 rm -f %{buildroot}/%{_datadir}/bash-completion/completions/sshare
 rm -f %{buildroot}/%{_datadir}/bash-completion/completions/sstat
 rm -f %{buildroot}/%{_datadir}/bash-completion/completions/strigger
+rm -f %{buildroot}/%{_datadir}/bash-completion/completions/swait
 
 # Build man pages that are generated directly by the tools
 rm -f %{buildroot}/%{_mandir}/man1/sjobexitmod.1
@@ -719,6 +702,7 @@ ln -sf %{_bashcompdir}/bash-completion/completions/{slurm_completion.sh,srun}
 ln -sf %{_bashcompdir}/bash-completion/completions/{slurm_completion.sh,sshare}
 ln -sf %{_bashcompdir}/bash-completion/completions/{slurm_completion.sh,sstat}
 ln -sf %{_bashcompdir}/bash-completion/completions/{slurm_completion.sh,strigger}
+ln -sf %{_bashcompdir}/bash-completion/completions/{slurm_completion.sh,swait}
 
 %preun
 
@@ -744,6 +728,7 @@ if [ $1 -eq 0 ]; then
 	rm -f %{_bashcompdir}/bash-completion/completions/sshare
 	rm -f %{_bashcompdir}/bash-completion/completions/sstat
 	rm -f %{_bashcompdir}/bash-completion/completions/strigger
+	rm -f %{_bashcompdir}/bash-completion/completions/swait
 fi
 
 %post sackd

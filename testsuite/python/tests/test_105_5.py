@@ -2,11 +2,14 @@
 # Copyright (C) SchedMD LLC.
 ############################################################################
 
-import atf
+import re
 
 # import os
 import pytest
-import re
+
+import atf
+
+pytestmark = pytest.mark.slow
 
 user_name = atf.properties["test-user"]
 

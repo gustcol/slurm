@@ -15,6 +15,12 @@ repos:
   - id: black
     language_version: python3
 
+- repo: https://github.com/pycqa/isort
+  rev: 5.13.2
+  hooks:
+  - id: isort
+    args: [--profile, black, --project, atf, --skip-gitignore]
+
 - repo: https://github.com/pycqa/flake8
   rev: 7.1.1
   hooks:
@@ -39,7 +45,7 @@ repos:
   rev: v0.19.1
   hooks:
   - id: gitlint
-    args: [--config, tools/gitlint, --msg-filename]
+    args: [--config, tools/gitlint, --staged, --msg-filename]
   - id: gitlint-ci
     alias: gitlint-ci-draft
     args: [--config, tools/gitlint]
@@ -47,10 +53,6 @@ repos:
   - id: gitlint-ci
     alias: gitlint-ci-nodraft
     args: [--config, tools/gitlint, --contrib, CC2]
-  # Enforce internal email addresses
-  - id: gitlint-ci
-    alias: gitlint-ci-email
-    args: [--config, tools/gitlint]
 
 - repo: https://github.com/pecigonzalo/pre-commit-shfmt
   rev: v2.2.0
@@ -83,3 +85,9 @@ repos:
         )
       args:
         - --severity=warning
+    - id: check-gitignore
+      name: check for tracked files matched by .gitignore
+      entry: tools/check-gitignore
+      language: script
+      always_run: true
+      pass_filenames: false

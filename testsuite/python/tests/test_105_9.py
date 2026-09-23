@@ -34,13 +34,27 @@ Untested (not covered by this file):
 - Node down or timeout while waiting for epilog complete.
 - Requeue delay removed (no cred_expire wait before relaunch).
 """
-import atf
 import pytest
+
+import atf
+
+pytestmark = [
+    pytest.mark.xfail_teardown(
+        reason="Issue 50974: Sometimes slurmd was not able to stop normally in 25.11",
+        known_fail_msg="Not all Slurm daemons were successfully stopped",
+        condition=atf.get_version("sbin/slurmd") < (26, 5),
+    ),
+]
 
 
 # Setup
 @pytest.fixture(scope="module", autouse=True)
 def setup():
+    atf.require_version(
+        (25, 11),
+        component="bin/sbatch",
+        reason="The --requeue=expedite option was added in 25.11",
+    )
     atf.require_auto_config("wants to set and unset Epilog")
     atf.require_config_parameter_includes(
         "SlurmctldParameters", "enable_expedited_requeue"
@@ -54,13 +68,7 @@ def node(setup):
 
 
 @pytest.fixture(scope="function", autouse=True)
-def cancel_jobs(setup):
-    yield
-    atf.cancel_jobs(atf.properties["submitted-jobs"])
-
-
-@pytest.fixture(scope="function", autouse=True)
-def resume_node(setup, cancel_jobs, node):
+def resume_node(setup, node):
     yield
     atf.run_command(
         f"scontrol update nodename={node} state=RESUME",
@@ -70,6 +78,10 @@ def resume_node(setup, cancel_jobs, node):
     atf.wait_for_node_state(node, "IDLE", fatal=True)
 
 
+@pytest.mark.xfail(
+    atf.get_version() < (25, 11, 3),
+    reason="Ticket 24564: Expedite requeue was transitioning jobs to REQUEUE_HOLD on success",
+)
 def test_expedited_requeue_success():
     """Test that --requeue=expedite does NOT requeue on successful completion."""
 
@@ -147,6 +159,10 @@ exit 1
     atf.run_command(f"rm -f {epilog}", fatal=True)
 
 
+@pytest.mark.xfail(
+    atf.get_version() < (25, 11, 3),
+    reason="Ticket 24564: Expedite requeue was transitioning jobs to REQUEUE_HOLD on success",
+)
 def test_expedited_requeue_epilog_failure(epilog_failure, node):
     """When epilog fails with job exit 0, node is drained; job completes (no requeue criteria, so no requeue)."""
 
@@ -181,11 +197,13 @@ def test_expedited_requeue_job_and_epilog_failure(epilog_failure, node):
         job_id, "EXPEDITING"
     ), "Job should not be REQUEUE_HOLD when epilog failed (expedited requeue expected)"
 
-    # Verify the node is unavailable (epilog failure drains the node)
-    reason = (atf.get_job_parameter(job_id, "Reason") or "").upper()
-    assert (
-        "DRAINED" in reason
-    ), f"Job reason should indicate node is drained, got {reason}"
+    # Verify the node is unavailable (epilog failure drains the node).
+    # Assert on node state rather than job Reason: Reason only shows "DRAINED"
+    # after the scheduler runs; with SchedulerParameters=defer_batch or
+    # SlurmctldParameters=enable_rpc_queue the scheduler may not have run yet.
+    assert atf.wait_for_node_state(
+        node, "DRAIN"
+    ), f"Node {node} should be drained when epilog failed"
 
     # Verify ExpeditedRequeue flag is set
     expedited_requeue = atf.get_job_parameter(job_id, "ExpeditedRequeue")

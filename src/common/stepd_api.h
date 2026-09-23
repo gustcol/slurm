@@ -81,6 +81,8 @@ typedef enum {
 	REQUEST_GETHOST,
 	REQUEST_GET_NS_FDS,
 	REQUEST_GET_BPF_TOKEN,
+	REQUEST_STEP_UPDATE_MEM_LIMITS,
+	REQUEST_JOB_USAGE,
 } step_msg_t;
 
 typedef enum {
@@ -90,6 +92,8 @@ typedef enum {
 	SLURMSTEPD_STEP_CANCELLED,
 	SLURMSTEPD_STEP_ENDING
 } slurmstepd_state_t;
+
+extern const char *stepd_state_2str(slurmstepd_state_t state);
 
 typedef enum {
 	GETPW_MATCH_USER_AND_PID = 0,	/* user must match, pid must belong */
@@ -130,6 +134,7 @@ typedef struct step_location {
 	char *directory;
 	char *nodename;
 	uint16_t protocol_version;
+	time_t start_time;
 	slurm_step_id_t step_id;
 } step_loc_t;
 
@@ -179,6 +184,14 @@ int stepd_signal_container(int fd, uint16_t protocol_version, int signal,
 			   int flags, char *details, uid_t uid);
 
 /*
+ * Update the memory limit for a running job step.
+ *
+ * Returns SLURM_SUCCESS on success, or -1 on failure.
+ */
+extern int stepd_update_mem_limit(int fd, uint16_t protocol_version,
+				  uint64_t job_mem_per_node);
+
+/*
  * Attach a client to a running job step.
  *
  * On success returns SLURM_SUCCESS and fills in resp->local_pids,
@@ -188,7 +201,8 @@ int stepd_signal_container(int fd, uint16_t protocol_version, int signal,
  *         probably be moved into a more generic stepd_api call so that
  *         this header does not need to include slurm_protocol_defs.h.
  */
-extern int stepd_attach(int fd, uint16_t protocol_version, slurm_addr_t *ioaddr,
+extern int stepd_attach(int fd, uint16_t stepd_protocol_version,
+			uint16_t srun_protocol_version, slurm_addr_t *ioaddr,
 			slurm_addr_t *respaddr, char *cert, char *io_key,
 			uid_t uid, reattach_tasks_response_msg_t *resp);
 
@@ -306,6 +320,14 @@ int stepd_completion(int fd, uint16_t protocol_version,
 int stepd_stat_jobacct(int fd, uint16_t protocol_version,
 		       slurm_step_id_t *sent, job_step_stat_t *resp);
 
+/*
+ * Get job-level accounting data.
+ *
+ * Returns SLURM_SUCCESS on success or SLURM_ERROR on error.
+ * resp receives a jobacctinfo_t which must be freed if SUCCESS.
+ */
+extern int stepd_job_usage(int fd, uint16_t protocol_version,
+			   jobacctinfo_t **jobacct);
 
 int stepd_task_info(int fd, uint16_t protocol_version,
 		    slurmstepd_task_info_t **task_info,
@@ -336,7 +358,7 @@ extern uint32_t stepd_get_nodeid(int fd, uint16_t protocol_version);
 
 /*
  * Get the namespace fd of a running job via slurmstepd by entering
- * its job container
+ * its namespace
  * On error returns -1.
  */
 extern int stepd_get_namespace_fd(int fd, uint16_t protocol_version);
@@ -350,6 +372,13 @@ extern int stepd_get_namespace_fd(int fd, uint16_t protocol_version);
  */
 extern int stepd_get_namespace_fds(int fd, list_t *fd_map,
 				   uint16_t protocol_version);
+
+/*
+ * ListDelF for an ns_fd_map_t * entry: closes the fd it owns and frees
+ * the wrapper. Pass to list_create() when building a list whose entries
+ * own their fds.
+ */
+extern void stepd_destroy_ns_fd_map(void *x);
 
 /*
  * Request to get the BPF token for a step in a user namespace.

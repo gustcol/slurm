@@ -67,6 +67,7 @@ generated_html = \
 	priority_multifactor3.html \
 	programmer_guide.html \
 	prolog_epilog.html \
+	publications.html \
 	qos.html \
 	quickstart_admin.html \
 	quickstart.html \
@@ -94,12 +95,17 @@ generated_html = \
 	user_permissions.html \
 	wckey.html
 
+# The configurator pages are self-contained HTML and are always installed.
 html_DATA = \
-	${generated_html} \
+	configurator.html \
+	configurator.easy.html
+
+# Static assets referenced by the generated HTML (via header.txt). These are
+# only useful alongside the full doc set, so they install with `make
+# install-html` rather than with the default `make install`.
+html_assets = \
 	allocation_pies.gif \
 	arch.gif \
-	configurator.html \
-	configurator.easy.html \
 	cg_hierarchy.jpg \
 	entities.gif \
 	example_usage.gif \
@@ -107,8 +113,6 @@ html_DATA = \
 	fonts.ttf \
 	hdf5_task_attr.png \
 	hdf5_job_outline.png \
-	ibm_pe_fig1.png \
-	ibm_pe_fig2.png \
 	jobcomp_kafka_fig1.png \
 	jquery.min.js \
 	k_function.gif \
@@ -136,6 +140,27 @@ html_DATA = \
 	topo_ex1.gif \
 	topo_ex2.gif \
 	usage_pies.gif
+
+# Generated HTML is kept out of html_DATA so that `make` (and `make install`)
+# do not rebuild it. Use `make html` to build and `make install-html` to
+# install the generated pages along with their static assets.
+html-local: ${generated_html}
+
+install-html-local: ${generated_html}
+	@$(NORMAL_INSTALL)
+	test -z "$(htmldir)" || $(MKDIR_P) "$(DESTDIR)$(htmldir)"
+	@list='$(generated_html) $(html_assets)'; for f in $$list; do \
+	  if test -f "$$f"; then d=; else d="$(srcdir)/"; fi; \
+	  echo " $(INSTALL_DATA) $$d$$f '$(DESTDIR)$(htmldir)'"; \
+	  $(INSTALL_DATA) "$$d$$f" "$(DESTDIR)$(htmldir)" || exit $$?; \
+	done
+
+uninstall-local:
+	@$(NORMAL_UNINSTALL)
+	@list='$(generated_html) $(html_assets)'; for f in $$list; do \
+	  echo " rm -f '$(DESTDIR)$(htmldir)/$$f'"; \
+	  rm -f "$(DESTDIR)$(htmldir)/$$f"; \
+	done
 
 MOSTLYCLEANFILES = ${generated_html}
 

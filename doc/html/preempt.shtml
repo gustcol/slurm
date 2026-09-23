@@ -74,6 +74,11 @@ reaching its new end time.
 is configured or when suspending jobs with <i>scontrol suspend</i>. For
 setting the preemption grace time in these cases, see
 <a href="slurm.conf.html#OPT_suspend_grace_time">suspend_grace_time</a>.
+<br><b>NOTE</b>: A job selected for preemption that exits before
+<i>GraceTime</i> expires will be handled according to <i>PreemptMode</i>
+regardless of why it exited (most visible if <i>PreemptMode=REQUEUE</i>).
+Slurm cannot distinguish between an exit caused by the preemption signal
+and an unrelated exit that occurs within <i>GraceTime</i>.
 </LI>
 
 <LI>
@@ -118,8 +123,8 @@ partition, and allows the resuming of suspended jobs. In order to use gang
 scheduling, the <b>GANG</b> option must be specified at the cluster level.
 <BR><B>NOTE</B>: If <b>GANG</b> scheduling is enabled with
 <I>PreemptType=preempt/partition_prio</I>, the controller will ignore
-<I>PreemptExemptTime</I> and the following <I>PreemptParameters</I>:
-<I>reorder_count</I>, <I>strict_order</I>, and <I>youngest_first</I>.
+the following <I>PreemptParameters</I>: <I>reorder_count</I>,
+<I>strict_order</I>, and <I>youngest_first</I>.
 <BR>
 <B>NOTE</B>: Gang scheduling is performed independently for each partition, so
 if you only want time-slicing by <I>OverSubscribe</I>, without any preemption,
@@ -130,6 +135,11 @@ PriorityTier partitions, then you will need overlapping partitions, and
 <I>PreemptMode=SUSPEND,GANG</I> to use Gang scheduler to resume the suspended
 job(s).
 In either case, time-slicing won't happen between jobs on different partitions.
+<BR>
+<B>NOTE</B>: A heterogeneous job is excluded from GANG scheduling operations,
+including <I>PreemptMode=SUSPEND</I>, and from oversubscription while
+<I>GANG</I> is enabled. See
+<A HREF="#hetjob">heterogeneous job preemption</A> below.
 </LI>
 <LI>
 <I>REQUEUE</I>: Preempts jobs by requeuing them (if possible) or canceling
@@ -153,6 +163,16 @@ the preemptor job from are on the same partition, then they will share
 resources with the Gang scheduler (time-slicing). If not (i.e. if the
 preemptees and preemptor are on different partitions) then the preempted jobs
 will remain suspended until the preemptor ends.
+</LI>
+<LI>
+<I>PRIORITY</I>: Allow preemption only if the preemptor's job priority is higher
+than the preemptee's job priority.
+</LI>
+<LI>
+<I>WITHIN</I>: For <I>PreemptType=preempt/qos</I>, allow jobs within the same
+qos to preempt one another. While this can be set globally, it is recommend
+that this only be set directly on a relevant subset of the system qos values
+instead.
 </LI>
 </UL>
 </LI>
@@ -178,12 +198,11 @@ of <I>preempt/qos</I>.</LI>
 </LI>
 <LI>
 <B>PreemptExemptTime</B>: Specifies minimum run time of jobs before they are
-considered for preemption. This is only honored when the <i>PreemptMode</i>
-is set to <i>REQUEUE</i> or <i>CANCEL</i>. It is specified as a time string:
-A time of -1 disables the option, equivalent to 0. Acceptable time formats
-include "minutes", "minutes:seconds", "hours:minutes:seconds", "days\-hours",
-"days\-hours:minutes", and "days\-hours:minutes:seconds".
-PreemptEligibleTime is shown in the output of "scontrol show job &lt;job id&gt;"
+considered for preemption. It is specified as a time string: A time of -1
+disables the option, equivalent to 0. Acceptable time formats include
+"minutes", "minutes:seconds", "hours:minutes:seconds", "days\-hours",
+"days\-hours:minutes", and "days\-hours:minutes:seconds". PreemptEligibleTime
+is shown in the output of "scontrol show job &lt;job id&gt;"
 </LI>
 <LI>
 <B>PriorityTier</B>: Configure the partition's <I>PriorityTier</I> setting
@@ -220,9 +239,9 @@ resource normally, but a second job can be started if done so through
 preemption based upon QOS.
 </LI>
 <LI>
-<B>ExclusiveUser</B>: In partitions with <I>ExclusiveUser=YES</I>, jobs will be
+<B>Exclusive</B>: In partitions with <I>Exclusive=USER</I>, jobs will be
 prevented from preempting or being preempted by any job from any other user.
-The one exception is that these ExclusiveUser jobs will be able to preempt
+The one exception is that these jobs will be able to preempt
 (but not be preempted by) fully "--exclusive" jobs from other users.
 This is for the same reason that "--exclusive=user" blocks preemption, but this
 partition-level setting can only be overridden by making a job fully exclusive.
@@ -255,20 +274,41 @@ job options by using a job_submit plugin (set the value of "job_desc.shared"
 to "NO_VAL16").
 </P>
 
+<P id="hetjob">
+For a heterogeneous job to be considered for preemption, all components
+must be eligible for preemption; <I>PreemptType</I> determines which jobs are
+eligible. Heterogeneous jobs are excluded from GANG scheduling operations,
+including <I>PreemptMode=SUSPEND</I>: a component whose <I>PreemptMode</I>
+resolves to <I>SUSPEND</I> is treated as <I>PreemptMode=OFF</I>.
+When a heterogeneous job is to be preempted, the first component found with
+<I>PreemptMode=REQUEUE</I> sets the mode for all components; if there is none,
+the first component found with <I>PreemptMode=CANCEL</I> does. The selected
+mode is applied to every component. If no component resolves to <I>REQUEUE</I>
+or <I>CANCEL</I>, the job is not preempted.
+The <I>GraceTime</I> and user warning signal for each component of the
+heterogeneous job remain unique. A heterogeneous job is never suspended as a
+preemptee, and it will never preempt a job whose resolved <I>PreemptMode</I> is
+<I>SUSPEND</I>.
+Note that preemption of heterogeneous jobs is only supported with
+<I>SelectType=select/cons_tres</I>, not with <I>select/linear</I>.
+</P>
+
 <P>
-For heterogeneous job to be considered for preemption all components
-must be eligible for preemption. When a heterogeneous job is to be preempted
-the first identified component of the job with the highest order PreemptMode
-(<I>SUSPEND</I> (highest), <I>REQUEUE</I>, <I>CANCEL</I> (lowest)) will be
-used to set the PreemptMode for all components. The <I>GraceTime</I> and user
-warning signal for each component of the heterogeneous job remain unique.
+A heterogeneous job is also excluded from oversubscription while <I>GANG</I> is
+enabled, because GANG scheduling cannot time-slice it out of a shared row. It is
+never placed on cores already allocated to another job, not even in its own
+partition's oversubscription rows. No other job is placed on its cores while it
+runs. Such a job may therefore remain pending where a non-heterogeneous job
+would start.
 </P>
 
 <p>
 Because licenses are not freed when jobs are suspended, jobs using licenses
-requested by higher priority jobs will only be prempted when PreemptMode is
+requested by higher priority jobs will only be preempted when PreemptMode is
 either <i>REQUEUE</i> or <i>CANCEL</i> and
-<i>PreemptParameters=reclaim_licenses</i> is set.
+<i>PreemptParameters=reclaim_licenses</i> is set. Note that this applies only
+to regular <a href="licenses.html">licenses</a>,
+not <a href="hres.html">Hierarchical Resources (HRES)</a>.
 </p>
 
 <h2 id="operation">Preemption Design and Operation

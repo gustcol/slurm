@@ -64,6 +64,8 @@ typedef struct http_con_s {
 	conmgr_fd_ref_t *con;
 	/* True to xfree() this pointer */
 	bool free_on_close;
+	/* True once a rejection response has been sent */
+	bool rejected;
 	const http_con_server_events_t *events;
 	void *arg; /* arbitrary pointer from caller */
 	http_parser_state_t *parser; /* http parser plugin state */
@@ -382,7 +384,7 @@ static int _on_content(const http_parser_content_t *content, void *arg)
 						 (length + 1))))
 			return _send_reject(hcon, rc);
 
-		xassert(remaining_buf(request->content) >= nlength);
+		xassert(remaining_buf(request->content) >= (length + 1));
 		memmove((get_buf_data(request->content) +
 			 get_buf_offset(request->content)),
 			at, length);
@@ -393,7 +395,7 @@ static int _on_content(const http_parser_content_t *content, void *arg)
 		/* final byte must in body must always be NULL terminated */
 		{
 			char *term = (get_buf_data(request->content) +
-				      get_buf_offset(request->content) + 1);
+				      get_buf_offset(request->content));
 			*term = '\0';
 		}
 	}
@@ -578,7 +580,27 @@ extern int http_con_send_response(http_con_t *hcon,
 			return args.rc;
 	}
 
-	if (close_header && (rc = _send_http_connection_close(hcon)))
+	/*
+	 * RFC7230-6.6: a server closing the connection should say so in the
+	 * final response. The client asking to close is reason enough, so
+	 * honor it here where the headers are still being written.
+	 *
+	 * RFC7231-6.2 / RFC9112-9.3: a 1xx (informational) response is not
+	 * the final response to the request, and RFC9112-9.3 excuses every
+	 * 1xx status from the "send close in every response" requirement
+	 * that otherwise applies to all of them. A client that gets "100
+	 * Continue" is expected to keep sending the rest of the request
+	 * afterward -- that is the entire point of "Expect: 100-continue"
+	 * (RFC9110-10.1.1). Closing here on request->connection_close alone
+	 * would tear down the read side before that body arrives, so only an
+	 * explicit close_header (never requested for an interim response
+	 * today) can close on a 1xx.
+	 */
+	if ((close_header ||
+	     (request->connection_close &&
+	      ((status_code < HTTP_STATUS_INFO_BEGIN) ||
+	       (status_code > HTTP_STATUS_INFO_END)))) &&
+	    (rc = _send_http_connection_close(hcon)))
 		return rc;
 
 	if (body && (get_buf_offset(body) > 0)) {
@@ -624,31 +646,40 @@ extern int http_con_send_response(http_con_t *hcon,
 static int _send_reject(http_con_t *hcon, slurm_err_t error_number)
 {
 	http_con_request_t *request = &hcon->request;
-	bool close_header = false;
 	const char *error = slurm_strerror(error_number);
 	const size_t error_len = strlen(error);
 	const buf_t body = SHADOW_BUF_INITIALIZER(error, error_len);
 
 	xassert(hcon->magic == MAGIC);
 
-	if (!_valid_http_version(request->http_version.major,
-				 request->http_version.minor)) {
+	if (hcon->rejected) {
 		/*
-		 * Default to HTTP/1.1 when version is invalid or failed to
-		 * parse for rejecting a request:
+		 * Callbacks reject and return the error, which the parser
+		 * hands back to _on_data(). Only respond once.
+		 */
+		log_flag(NET, "%s: [%s] Ignoring duplicate rejection: %s",
+			 __func__, conmgr_con_get_name(hcon->con),
+			 slurm_strerror(error_number));
+		return error_number;
+	}
+
+	hcon->rejected = true;
+
+	if ((!request->http_version.major && !request->http_version.minor) ||
+	    _valid_http_version(request->http_version.major,
+				request->http_version.minor)) {
+		/*
+		 * Default to HTTP/1.1 when version is missing, invalid or
+		 * failed to parse for rejecting a request:
 		 */
 		request->http_version.major = 1;
 		request->http_version.minor = 1;
 	}
 
-	close_header = (request->connection_close ||
-			_valid_http_version(request->http_version.major,
-					    request->http_version.minor));
-
+	/* The connection is always closed after a rejection */
 	(void) http_con_send_response(hcon,
 				      http_status_from_error(error_number),
-				      NULL, close_header, &body,
-				      MIME_TYPE_TEXT);
+				      NULL, true, &body, MIME_TYPE_TEXT);
 
 	/* ensure connection gets closed */
 	conmgr_con_queue_close(hcon->con);
@@ -678,11 +709,13 @@ static int _on_content_complete(void *arg)
 	rc = hcon->events->on_request(hcon, conmgr_con_get_name(hcon->con),
 				      &hcon->request, hcon->arg);
 
-	if (request->connection_close) {
-		/* Notify client that this connection will be closed now */
-		_send_http_connection_close(hcon);
+	/*
+	 * The response has already been written, so the client was told the
+	 * connection is closing by http_con_send_response(). Writing a header
+	 * here would land after the body.
+	 */
+	if (request->connection_close)
 		conmgr_con_queue_close(hcon->con);
-	}
 
 	_request_reset(hcon);
 
@@ -784,7 +817,8 @@ static void _on_finish(conmgr_callback_args_t conmgr_args, void *arg)
 	 */
 
 	if (hcon_events->on_close)
-		hcon_events->on_close(conmgr_con_get_name(hcon_con), hcon_arg);
+		hcon_events->on_close(conmgr_con_get_name(hcon_con),
+				      conmgr_args.status_code, hcon_arg);
 
 	CONMGR_CON_UNLINK(hcon_con);
 }
@@ -865,4 +899,10 @@ extern int http_con_get_auth_creds(http_con_t *hcon, uid_t *cred_uid,
 	xassert(hcon->magic == MAGIC);
 	return conmgr_con_get_auth_creds(hcon->con, cred_uid, cred_gid,
 					 cred_pid);
+}
+
+extern bool http_con_is_tls(http_con_t *hcon)
+{
+	xassert(hcon->magic == MAGIC);
+	return conmgr_fd_is_tls(hcon->con);
 }

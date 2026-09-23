@@ -1,11 +1,12 @@
 ############################################################################
 # Copyright (C) SchedMD LLC.
 ############################################################################
-import atf
-import pytest
-
 import logging
 import re
+
+import pytest
+
+import atf
 
 resources_yaml = """
 - resource: power
@@ -16,35 +17,42 @@ resources_yaml = """
     - name: full_gpu_node
       value: 5000
   layers:
-    - nodes:
+    - layer_name: "leaf1"
+      parent_name: "mid1"
+      nodes:
         - "node[1-8]"
       count: 40000
       base:
         - name: storage
           value: 5000
-    - nodes:
+    - layer_name: "leaf2"
+      parent_name: "mid1"
+      nodes:
         - "node[9-16]"
       count: 40000
-    - nodes:
+    - layer_name: "leaf3"
+      parent_name: "mid2"
+      nodes:
         - "node[17-24]"
       count: 40000
-    - nodes:
+    - layer_name: "leaf4"
+      parent_name: "mid2"
+      nodes:
         - "node[25-32]"
       count: 60000
-    - nodes:
-        - "node[1-16]"
+    - layer_name: "mid1"
+      parent_name: "root"
       count: 60000
       base:
         - name: network1
           value: 3000
-    - nodes:
-        - "node[17-32]"
+    - layer_name: "mid2"
+      parent_name: "root"
       count: 80000
       base:
         - name: network2
           value: 2000
-    - nodes:
-        - "node[1-32]"
+    - layer_name: "root"
       count: 130000
       base:
         - name: acUnit1
@@ -57,14 +65,14 @@ resources_yaml = """
 # Setup
 @pytest.fixture(scope="module", autouse=True)
 def setup():
-    atf.require_version((25, 11), component="bin/sacctmgr")
+    atf.require_version((26, 11), component="bin/sacctmgr")
     atf.require_nodes(32)
     atf.require_config_parameter("SelectType", "select/cons_tres")
     atf.require_config_parameter("SelectTypeParameters", "CR_CPU")
+    atf.require_config_parameter("MinJobAge", 2)
 
-    atf.add_config_parameter_value(
-        "SchedulerParameters", "bf_interval=1,sched_interval=1"
-    )
+    atf.require_config_parameter_includes("SchedulerParameters", ("bf_interval", 1))
+    atf.require_config_parameter_includes("SchedulerParameters", ("sched_interval", 1))
 
     atf.require_config_file("resources.yaml", resources_yaml)
 
@@ -155,3 +163,21 @@ def test_sched1():
             assert (
                 job_usage_on_layer <= layer_total
             ), f"Job usage ({job_usage_on_layer}) on layer {layer_nodes} should not be bigger than total on layer ({layer_total})"
+
+
+def test_job_array():
+    """Test that a job array runs and is purged without slurmctld crashing"""
+
+    if atf.get_version() < (25, 11):
+        pytest.xfail(
+            "Issue 50445: double-free with job arrays and mode 3 HRES fixed in 25.11"
+        )
+
+    job_id = atf.submit_job_sbatch(
+        '--resources=power:10 --array=1-2 --mem=1 --wrap="hostname"', fatal=True
+    )
+    atf.wait_for_job_state(job_id, "DONE", fatal=True)
+    # Poll until the jobs are purged.
+    for time in atf.timer(fatal=True):
+        if not atf.get_jobs(quiet=True, fatal=False):
+            break

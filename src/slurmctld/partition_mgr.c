@@ -534,9 +534,7 @@ extern int load_all_part_state(uint16_t reconfig_flags)
 		part_ptr->max_cpus_per_socket =
 			part_rec_state->max_cpus_per_socket;
 		part_ptr->max_nodes = part_rec_state->max_nodes;
-		part_ptr->max_nodes_orig = part_rec_state->max_nodes;
 		part_ptr->min_nodes = part_rec_state->min_nodes;
-		part_ptr->min_nodes_orig = part_rec_state->min_nodes;
 		part_ptr->max_share = part_rec_state->max_share;
 		part_ptr->grace_time = part_rec_state->grace_time;
 		part_ptr->over_time_limit = part_rec_state->over_time_limit;
@@ -650,6 +648,48 @@ part_record_t *find_part_record(char *name)
 }
 
 /*
+ * find_alloc_part_record - find a non-pending job's allocated partition from
+ *	its state saved alloc_partition, falling back to the first token of
+ *	the partition string when alloc_partition is NULL.
+ * IN job_ptr - the job to look up
+ * OUT part_name - if not NULL, set to a copy of the partition name only when
+ *	the return is NULL, letting the caller name the removed partition
+ * RET the allocated partition, or NULL if it no longer exists
+ */
+extern part_record_t *find_alloc_part_record(job_record_t *job_ptr,
+					     char **part_name)
+{
+	char *name, *tmp_name = NULL, *last = NULL;
+	part_record_t *part_ptr;
+
+	xassert(job_ptr);
+
+	/*
+	 * When alloc_partition is NULL, fall back to the first token of the
+	 * partition string: pre-26.11 state (the prepended allocated partition)
+	 * or a completing job whose alloc_partition was cleared by a runtime
+	 * change (rebuild_job_part_list() re-sets it only for running or
+	 * suspended jobs).
+	 *
+	 * The lookup returns NULL when that partition no longer exists; the job
+	 * then reports a surviving partition instead. This is display only --
+	 * accounting already recorded the partition it ran in.
+	 */
+	name = job_ptr->alloc_partition;
+	if (!name && job_ptr->partition) {
+		tmp_name = xstrdup(job_ptr->partition);
+		name = strtok_r(tmp_name, ",", &last);
+	}
+
+	part_ptr = name ? find_part_record(name) : NULL;
+	if (part_name && !part_ptr)
+		*part_name = xstrdup(name);
+	xfree(tmp_name);
+
+	return part_ptr;
+}
+
+/*
  * Create a copy of a job's part_list *partition list
  * IN part_list_src - a job's part_list
  * RET copy of part_list_src, must be freed by caller
@@ -676,29 +716,24 @@ extern list_t *part_list_copy(list_t *part_list_src)
 /*
  * get_part_list - find record for named partition(s)
  * IN name - partition name(s) in a comma separated list
- * OUT part_ptr_list - sorted list of pointers to the partitions or NULL
- * OUT prim_part_ptr - pointer to the primary partition
+ * OUT part_ptr_list - list of pointers to the partitions sorted by
+ *		       PriorityTier, or NULL
+ * OUT prim_part_ptr - pointer to the highest PriorityTier partition
  * OUT err_part - All the invalid partition names.
- * OUT first_valid - bool ptr indicating if the first partition in name is valid
  * NOTE: Caller must free the returned list
  * NOTE: Caller must free err_part
  */
 extern void get_part_list(char *name, list_t **part_ptr_list,
-			  part_record_t **prim_part_ptr, char **err_part,
-			  bool *first_valid)
+			  part_record_t **prim_part_ptr, char **err_part)
 {
 	part_record_t *part_ptr;
 	char *token, *last = NULL, *tmp_name;
-	bool first_iteration = true;
 
 	*part_ptr_list = NULL;
 	*prim_part_ptr = NULL;
 
 	if (err_part)
 		xfree(*err_part);
-
-	if (first_valid)
-		*first_valid = true;
 
 	if (name == NULL)
 		return;
@@ -713,30 +748,21 @@ extern void get_part_list(char *name, list_t **part_ptr_list,
 			if (!list_find_first(*part_ptr_list, &_match_part_ptr,
 					     part_ptr))
 				list_append(*part_ptr_list, part_ptr);
-		} else {
-			if (err_part)
-				xstrfmtcat(*err_part, "%s%s",
-					   *err_part ? "," : "",
-					   token);
-			if (first_iteration && first_valid)
-				*first_valid = false;
+		} else if (err_part) {
+			xstrfmtcat(*err_part, "%s%s", *err_part ? "," : "",
+				   token);
 		}
 		token = strtok_r(NULL, ",", &last);
-		first_iteration = false;
 	}
 
 	if (*part_ptr_list) {
 		/*
-		 * Return the first part_ptr in the list before sorting. On
-		 * state load, the first partition in the list is the running
-		 * partition -- for multi-partition jobs. Other times it doesn't
-		 * matter what the returned part_ptr is because it will be
-		 * modified when scheduling the different job_queue_rec_t's.
-		 *
-		 * The part_ptr_list always needs to be sorted by priority_tier.
+		 * Always sort part_ptr_list by PriorityTier (highest at the
+		 * head). A non-pending job's allocated partition is recovered
+		 * from alloc_partition, so the list order need not preserve it.
 		 */
-		*prim_part_ptr = list_peek(*part_ptr_list);
 		list_sort(*part_ptr_list, priority_sort_part_tier);
+		*prim_part_ptr = list_peek(*part_ptr_list);
 		if (list_count(*part_ptr_list) == 1)
 			FREE_NULL_LIST(*part_ptr_list);
 	}
@@ -987,7 +1013,7 @@ extern buf_t *pack_all_part(uint16_t show_flags, uid_t uid,
  */
 void pack_part(part_record_t *part_ptr, buf_t *buffer, uint16_t protocol_version)
 {
-	if (protocol_version >= SLURM_25_05_PROTOCOL_VERSION) {
+	if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
 		if (default_part_loc == part_ptr)
 			part_ptr->flags |= PART_FLAG_DEFAULT;
 		else
@@ -998,8 +1024,8 @@ void pack_part(part_record_t *part_ptr, buf_t *buffer, uint16_t protocol_version
 		pack32(part_ptr->grace_time, buffer);
 		pack32(part_ptr->max_time, buffer);
 		pack32(part_ptr->default_time, buffer);
-		pack32(part_ptr->max_nodes_orig, buffer);
-		pack32(part_ptr->min_nodes_orig, buffer);
+		pack32(part_ptr->max_nodes, buffer);
+		pack32(part_ptr->min_nodes, buffer);
 		pack32(part_ptr->total_nodes, buffer);
 		pack32(part_ptr->total_cpus, buffer);
 		pack64(part_ptr->def_mem_per_cpu, buffer);
@@ -1036,54 +1062,6 @@ void pack_part(part_record_t *part_ptr, buf_t *buffer, uint16_t protocol_version
 		(void) slurm_pack_list(part_ptr->job_defaults_list,
 				       job_defaults_pack, buffer,
 				       protocol_version);
-	} else if (protocol_version >= SLURM_MIN_PROTOCOL_VERSION) {
-		if (default_part_loc == part_ptr)
-			part_ptr->flags |= PART_FLAG_DEFAULT;
-		else
-			part_ptr->flags &= (~PART_FLAG_DEFAULT);
-
-		packstr(part_ptr->name, buffer);
-		pack32(part_ptr->cpu_bind, buffer);
-		pack32(part_ptr->grace_time, buffer);
-		pack32(part_ptr->max_time, buffer);
-		pack32(part_ptr->default_time, buffer);
-		pack32(part_ptr->max_nodes_orig, buffer);
-		pack32(part_ptr->min_nodes_orig, buffer);
-		pack32(part_ptr->total_nodes, buffer);
-		pack32(part_ptr->total_cpus, buffer);
-		pack64(part_ptr->def_mem_per_cpu, buffer);
-		pack32(part_ptr->max_cpus_per_node, buffer);
-		pack32(part_ptr->max_cpus_per_socket, buffer);
-		pack64(part_ptr->max_mem_per_cpu, buffer);
-
-		pack32(part_ptr->flags, buffer);
-		pack16(part_ptr->max_share, buffer);
-		pack16(part_ptr->over_time_limit, buffer);
-		pack16(part_ptr->preempt_mode, buffer);
-		pack16(part_ptr->priority_job_factor, buffer);
-		pack16(part_ptr->priority_tier, buffer);
-		pack16(part_ptr->state_up, buffer);
-		pack16(part_ptr->cr_type, buffer);
-		pack16(part_ptr->resume_timeout, buffer);
-		pack16(part_ptr->suspend_timeout, buffer);
-		pack32(part_ptr->suspend_time, buffer);
-
-		packstr(part_ptr->allow_accounts, buffer);
-		packstr(part_ptr->allow_groups, buffer);
-		packstr(part_ptr->allow_alloc_nodes, buffer);
-		packstr(part_ptr->allow_qos, buffer);
-		packstr(part_ptr->qos_char, buffer);
-		packstr(part_ptr->alternate, buffer);
-		packstr(part_ptr->deny_accounts, buffer);
-		packstr(part_ptr->deny_qos, buffer);
-		packstr(part_ptr->nodes, buffer);
-		packstr(part_ptr->nodesets, buffer);
-		pack_bit_str_hex(part_ptr->node_bitmap, buffer);
-		packstr(part_ptr->billing_weights_str, buffer);
-		packstr(part_ptr->tres_fmt_str, buffer);
-		(void)slurm_pack_list(part_ptr->job_defaults_list,
-				      job_defaults_pack, buffer,
-				      protocol_version);
 	} else {
 		error("%s: protocol_version %hu not supported",
 		      __func__, protocol_version);
@@ -1131,7 +1109,7 @@ extern int set_partition_billing_weights(char *billing_weights_str,
  * global: part_list - list of partition entries
  *	last_part_update - update time of partition records
  */
-extern int update_part(update_part_msg_t * part_desc, bool create_flag)
+extern int update_part(partition_info_t *part_desc, bool create_flag)
 {
 	int error_code;
 	part_record_t *part_ptr;
@@ -1212,15 +1190,13 @@ extern int update_part(update_part_msg_t * part_desc, bool create_flag)
 	if (part_desc->max_nodes != NO_VAL) {
 		info("%s: setting max_nodes to %u for partition %s", __func__,
 		     part_desc->max_nodes, part_desc->name);
-		part_ptr->max_nodes      = part_desc->max_nodes;
-		part_ptr->max_nodes_orig = part_desc->max_nodes;
+		part_ptr->max_nodes = part_desc->max_nodes;
 	}
 
 	if (part_desc->min_nodes != NO_VAL) {
 		info("%s: setting min_nodes to %u for partition %s", __func__,
 		     part_desc->min_nodes, part_desc->name);
-		part_ptr->min_nodes      = part_desc->min_nodes;
-		part_ptr->min_nodes_orig = part_desc->min_nodes;
+		part_ptr->min_nodes = part_desc->min_nodes;
 	}
 
 	if (part_desc->grace_time != NO_VAL) {
@@ -1293,11 +1269,47 @@ extern int update_part(update_part_msg_t * part_desc, bool create_flag)
 		info("%s: setting exclusive_topo for partition %s", __func__,
 		     part_desc->name);
 		part_ptr->flags |= PART_FLAG_EXCLUSIVE_TOPO;
+
+		/* Make sure Exclusive=TOPO sets Exclusive=NODE */
+		if ((part_desc->max_share != NO_VAL16) && part_desc->max_share)
+			warning("%s: Oversubscribe ignored, Exclusive=TOPO and Exclusive=NODE imply OverSubscribe=NO",
+				__func__);
+		if (part_desc->max_share)
+			part_desc->max_share = 0;
+
 	} else if (part_desc->flags & PART_FLAG_EXC_TOPO_CLR) {
 		info("%s: clearing exclusive_topo for partition %s", __func__,
 		     part_desc->name);
 		part_ptr->flags &= (~PART_FLAG_EXCLUSIVE_TOPO);
 	}
+
+	/*
+	 * Exclusive=[USER|TOPO] are mutually exclusive. If both will end up
+	 * being set only set Exclusive=TOPO since it is the more restrictive
+	 * option since it implies Exclusive=NODE.
+	 */
+	if ((part_ptr->flags & PART_FLAG_EXCLUSIVE_TOPO) &&
+	    (part_ptr->flags & PART_FLAG_EXCLUSIVE_USER)) {
+		part_ptr->flags |= ~PART_FLAG_EXCLUSIVE_USER;
+		warning("%s: Exclusive=USER and Exclusive=TOPO are mutually exclusive, ignoring Exclusive=USER (partition %s)",
+			__func__, part_desc->name);
+	}
+
+	/*
+	 * Exclusive=NO/NONE and Exclusive=USER adjust max_share only when the
+	 * update does not include OverSubscribe (max_share still NO_VAL16)
+	 * and the partition was Exclusive=NODE.
+	 */
+	if ((part_desc->flags & PART_FLAG_EXC_USER_CLR) &&
+	    (part_desc->flags & PART_FLAG_EXC_TOPO_CLR) &&
+	    !(part_desc->flags & PART_FLAG_EXCLUSIVE_USER) &&
+	    !(part_desc->flags & PART_FLAG_EXCLUSIVE_TOPO) &&
+	    (part_desc->max_share == NO_VAL16) && !part_ptr->max_share)
+		part_ptr->max_share = 1;
+
+	if ((part_desc->flags & PART_FLAG_EXCLUSIVE_USER) &&
+	    (part_desc->max_share == NO_VAL16) && !part_ptr->max_share)
+		part_ptr->max_share = 1;
 
 	if (part_desc->flags & PART_FLAG_LLN) {
 		info("%s: setting LLN for partition %s", __func__,
@@ -1340,12 +1352,10 @@ extern int update_part(update_part_msg_t * part_desc, bool create_flag)
 
 	if (part_desc->preempt_mode != NO_VAL16) {
 		if (!(part_desc->preempt_mode & PREEMPT_MODE_GANG)) {
-			uint16_t new_mode;
+			uint16_t new_mode = part_desc->preempt_mode;
 
-			new_mode =
-				part_desc->preempt_mode & (~PREEMPT_MODE_GANG);
-
-			if (new_mode <= PREEMPT_MODE_CANCEL) {
+			if ((new_mode & ~PREEMPT_MODE_PRIORITY) <=
+			    PREEMPT_MODE_CANCEL) {
 				/*
 				 * This is a valid mode, but if GANG was enabled
 				 * at cluster level, always leave it set.
@@ -2250,15 +2260,37 @@ extern void part_list_update_assoc_lists(void)
 extern int part_update_assoc_lists(void *x, void *arg)
 {
 	part_record_t *part_ptr = x;
+	int old_allow_cnt = 0, old_deny_cnt = 0;
 
 	xassert(verify_assoc_lock(ASSOC_LOCK, READ_LOCK));
 
+	if (part_ptr->allow_accts_list)
+		old_allow_cnt = list_count(part_ptr->allow_accts_list);
 	FREE_NULL_LIST(part_ptr->allow_accts_list);
 	part_ptr->allow_accts_list =
 		accounts_list_build(part_ptr->allow_accounts, true);
+
+	if (old_allow_cnt && !part_ptr->allow_accts_list)
+		info("Partition %s's last AllowAccounts association was removed; partition now allows all accounts",
+		     part_ptr->name);
+	else if (part_ptr->allow_accts_list &&
+		 (list_count(part_ptr->allow_accts_list) < old_allow_cnt))
+		info("Partition %s had an AllowAccounts association removed",
+		     part_ptr->name);
+
+	if (part_ptr->deny_accts_list)
+		old_deny_cnt = list_count(part_ptr->deny_accts_list);
 	FREE_NULL_LIST(part_ptr->deny_accts_list);
 	part_ptr->deny_accts_list =
 		accounts_list_build(part_ptr->deny_accounts, true);
+
+	if (old_deny_cnt && !part_ptr->deny_accts_list)
+		info("Partition %s's last DenyAccounts association was removed; no accounts are now denied",
+		     part_ptr->name);
+	else if (part_ptr->deny_accts_list &&
+		 (list_count(part_ptr->deny_accts_list) < old_deny_cnt))
+		info("Partition %s had a DenyAccounts association removed",
+		     part_ptr->name);
 
 	return 0;
 }

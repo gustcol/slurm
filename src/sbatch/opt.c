@@ -97,6 +97,7 @@ slurm_opt_t opt = {
 sbatch_env_t het_job_env;
 int   error_exit = 1;
 bool  is_het_job = false;
+bool het_leader_external = false;
 
 /*---- forward declarations of static functions  ----*/
 
@@ -191,6 +192,7 @@ env_vars_t env_vars[] = {
   { "SBATCH_CONSOLIDATE_SEGMENTS", LONG_OPT_CONSOLIDATE_SEGMENTS },
   { "SBATCH_CONTAINER", LONG_OPT_CONTAINER },
   { "SBATCH_CONTAINER_ID", LONG_OPT_CONTAINER_ID },
+  { "SBATCH_RUNTIME", LONG_OPT_RUNTIME },
   { "SBATCH_CONSTRAINT", 'C' },
   { "SBATCH_CORE_SPEC", 'S' },
   { "SBATCH_CPU_FREQ_REQ", LONG_OPT_CPU_FREQ },
@@ -289,7 +291,7 @@ static void _opt_env(void)
  */
 extern char *process_options_first_pass(int argc, char **argv)
 {
-	int i, local_argc = 0;
+	int i, local_argc = 0, leader_argc = 0;
 	char **local_argv, *script_file = NULL;
 	int opt_char, option_index = 0;
 	char *opt_string = NULL;
@@ -308,17 +310,32 @@ extern char *process_options_first_pass(int argc, char **argv)
 
 	_opt_early_env();
 
+	/*
+	 * if a cli_filter plugin sets --external prior to this it applies
+	 * to all components, which includes the leader
+	 */
+	het_leader_external = (opt.job_flags & EXTERNAL_JOB);
+
 	/* Remove hetjob separator and capture all options of interest from
 	 * all job components (e.g. "sbatch -N1 -v : -N2 -v tmp" -> "-vv") */
 	local_argv = xcalloc(argc, sizeof(char *));
 	for (i = 0; i < argc; i++) {
-		if (xstrcmp(argv[i], ":"))
+		if (xstrcmp(argv[i], ":")) {
 			local_argv[local_argc++] = argv[i];
+		} else if (!is_het_job) {
+			is_het_job = true;
+			leader_argc = local_argc;
+		}
 	}
+	if (!is_het_job)
+		leader_argc = local_argc;
 
 	optind = 0;
 	while ((opt_char = getopt_long(local_argc, local_argv, opt_string,
 				       optz, &option_index)) != -1) {
+		/* optind has moved past the option, so the leader ends on it */
+		if ((opt_char == LONG_OPT_EXTERNAL) && (optind <= leader_argc))
+			het_leader_external = true;
 		slurm_process_option_or_exit(&opt, opt_char, optarg, true,
 					     true);
 	}
@@ -329,9 +346,25 @@ extern char *process_options_first_pass(int argc, char **argv)
 		error("Script arguments not permitted with --wrap option");
 		exit(error_exit);
 	}
-	if ((local_argc > optind) && (opt.job_flags & EXTERNAL_JOB)) {
-		error("Script arguments not permitted with --external option");
-		exit(error_exit);
+
+	if (is_het_job) {
+		if ((local_argc > optind) && het_leader_external) {
+			error("Script arguments not permitted with --external option on the first component");
+			exit(error_exit);
+		}
+		if (sbopt.wrap && het_leader_external) {
+			error("--wrap option not permitted with --external option on the first component");
+			exit(error_exit);
+		}
+	} else {
+		if ((local_argc > optind) && (opt.job_flags & EXTERNAL_JOB)) {
+			error("Script arguments not permitted with --external option");
+			exit(error_exit);
+		}
+		if (sbopt.wrap && (opt.job_flags & EXTERNAL_JOB)) {
+			error("--wrap option not permitted with --external option");
+			exit(error_exit);
+		}
 	}
 	if (local_argc > optind) {
 		int i;
@@ -383,6 +416,9 @@ extern void process_options_second_pass(int argc, char **argv, int *argc_off,
 
 	/* initialize option defaults */
 	slurm_reset_all_options(&opt, false);
+
+	/* record which component these options describe */
+	opt.het_job_inx = het_job_inx;
 
 	/* cli_filter plugins can change the defaults */
 	if (cli_filter_g_setup_defaults(&opt, false)) {
@@ -712,6 +748,8 @@ static bool _opt_verify(void)
 		setenvf(NULL, "SLURM_CONTAINER", "%s", opt.container);
 	if (opt.container_id && !getenv("SLURM_CONTAINER_ID"))
 		setenvf(NULL, "SLURM_CONTAINER_ID", "%s", opt.container_id);
+	if (opt.runtime && !getenv("SLURM_RUNTIME"))
+		setenvf(NULL, "SLURM_RUNTIME", "%s", opt.runtime);
 
 	/*
 	 * NOTE: this burst_buffer_file processing is intentionally different
@@ -1078,11 +1116,12 @@ static void _usage(void)
 "              [--input file] [--output file] [--error file]\n"
 "              [--time-min=minutes] [--licenses=names] [--clusters=cluster_names]\n"
 "              [--chdir=directory] [--oversubscribe] [-m dist] [-J jobname]\n"
-"              [--verbose] [--gid=group] [--uid=user]\n"
-"              [--contiguous] [--mincpus=n] [--mem=MB] [--tmp=MB] [-C list]\n"
+"              [--verbose] [--gid=group] [--uid=user] [--contiguous]\n"
+"              [--container=path] [--container-id=id] [--runtime=name]\n"
+"              [--mincpus=n] [--mem=MB] [--tmp=MB] [-C list]\n"
 "              [--account=name] [--dependency=type:jobid[+time]] [--comment=name]\n"
 "              [--mail-type=type] [--mail-user=user] [--nice[=value]] [--wait]\n"
-"              [--requeue[=expedited]] [--no-requeue] [--ntasks-per-node=n]\n"
+"              [--requeue[=expedite]] [--no-requeue] [--ntasks-per-node=n]\n"
 "              [--propagate] [--nodefile=file] [--nodelist=hosts] [--exclude=hosts]\n"
 "              [--network=type] [--mem-per-cpu=MB] [--qos=qos] [--gres=list]\n"
 "              [--mem-bind=...] [--reservation=name] [--mcs-label=mcs]\n"
@@ -1141,8 +1180,6 @@ static void _help(void)
 "                              commands to.  Default is current cluster.\n"
 "                              Name of 'all' will submit to run on all clusters.\n"
 "                              NOTE: SlurmDBD must up.\n"
-"      --container             Path to OCI container bundle\n"
-"      --container-id          OCI container ID\n"
 "  -m, --distribution=type     distribution method for processes to nodes\n"
 "                              (type = block|cyclic|arbitrary)\n"
 "      --mail-type=type        notify on state change: BEGIN, END, FAIL or ALL\n"
@@ -1169,7 +1206,7 @@ static void _help(void)
 "  -q, --qos=qos               quality of service\n"
 "  -Q, --quiet                 quiet mode (suppress informational messages)\n"
 "      --reboot                reboot compute nodes before starting job\n"
-"      --requeue[=expedited]   if set, permit the job to be requeued\n"
+"      --requeue[=expedite]   if set, permit the job to be requeued\n"
 "  -s, --oversubscribe         over subscribe resources with other jobs\n"
 "  -S, --core-spec=cores       count of reserved cores\n"
 "      --signal=[[R][B]:]num[@time] send signal when time limit within time seconds\n"
@@ -1204,6 +1241,11 @@ static void _help(void)
 "  -w, --nodelist=hosts...     request a specific list of hosts\n"
 "  -x, --exclude=hosts...      exclude a specific list of hosts\n"
 "\n"
+"Container options:\n"
+"      --container=path        Container path\n"
+"      --container-id=id       Container identifier\n"
+"      --runtime=name          Runtime plugin type\n"
+"\n"
 "Consumable resources related options:\n"
 "      --exclusive[=user]      allocate nodes in exclusive mode when\n"
 "                              cpu consumable resource is enabled\n"
@@ -1224,8 +1266,8 @@ static void _help(void)
 "      --threads-per-core=T    number of threads per core to allocate\n"
 "  -B, --extra-node-info=S[:C[:T]]  combine request of sockets per node,\n"
 "                              cores per socket and threads per core.\n"
-"                              Specify an asterisk (*) as a placeholder,\n"
-"                              a minimum value, or a min-max range.\n"
+"                              Specify an asterisk (*) as a placeholder\n"
+"                              or a minimum value.\n"
 "\n"
 "      --ntasks-per-core=n     number of tasks to invoke on each core\n"
 "      --ntasks-per-socket=n   number of tasks to invoke on each socket\n");

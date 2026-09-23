@@ -98,55 +98,6 @@ static int _sort_update_object_dec(void *a, void *b)
 	return 0;
 }
 
-static void _dump_slurmdb_assoc_records(list_t *assoc_list)
-{
-	slurmdb_assoc_rec_t *assoc = NULL;
-	list_itr_t *itr = NULL;
-
-	itr = list_iterator_create(assoc_list);
-	while((assoc = list_next(itr))) {
-		debug("\t\tid=%d", assoc->id);
-	}
-	list_iterator_destroy(itr);
-}
-
-static void _dump_slurmdb_clus_res_record(slurmdb_clus_res_rec_t *clus_res)
-{
-	debug("\t\t\tname=%s", clus_res->cluster);
-	debug("\t\t\tallowed=%u", clus_res->allowed);
-}
-
-static void _dump_slurmdb_clus_res_records(list_t *clus_res_list)
-{
-	slurmdb_clus_res_rec_t *clus_res = NULL;
-	list_itr_t *itr = NULL;
-	itr = list_iterator_create(clus_res_list);
-	while ((clus_res = list_next(itr))) {
-		_dump_slurmdb_clus_res_record(clus_res);
-	}
-	list_iterator_destroy(itr);
-}
-
-static void _dump_slurmdb_res_records(list_t *res_list)
-{
-	slurmdb_res_rec_t *res = NULL;
-	list_itr_t *itr = NULL;
-	itr = list_iterator_create(res_list);
-	while ((res = list_next(itr))) {
-		debug("\t\tname=%s", res->name);
-		debug("\t\tcount=%u", res->count);
-		debug("\t\ttype=%u", res->type);
-		debug("\t\tmanager=%s", res->manager);
-		debug("\t\tserver=%s", res->server);
-		debug("\t\tdescription=%s", res->description);
-		if (res->clus_res_rec && res->clus_res_rec->cluster)
-			_dump_slurmdb_clus_res_record(res->clus_res_rec);
-		else if (res->clus_res_list)
-			_dump_slurmdb_clus_res_records(res->clus_res_list);
-	}
-	list_iterator_destroy(itr);
-}
-
 static bool _is_user_min_admin_level(void *db_conn, uid_t uid,
 				     slurmdb_admin_level_t min_level,
 				     bool locked)
@@ -343,71 +294,6 @@ extern int addto_update_list(list_t *update_list, slurmdb_update_type_t type,
 }
 
 /*
- * dump_update_list - dump contents of updates
- * IN update_list: updates to perform
- */
-extern void dump_update_list(list_t *update_list)
-{
-	list_itr_t *itr = NULL;
-	slurmdb_update_object_t *object = NULL;
-
-	debug3("========== DUMP UPDATE LIST ==========");
-	itr = list_iterator_create(update_list);
-	while((object = list_next(itr))) {
-		if (!object->objects || !list_count(object->objects)) {
-			debug3("\tUPDATE OBJECT WITH NO RECORDS, type: %d",
-			       object->type);
-			continue;
-		}
-		switch(object->type) {
-		case SLURMDB_MODIFY_USER:
-		case SLURMDB_ADD_USER:
-		case SLURMDB_REMOVE_USER:
-		case SLURMDB_ADD_COORD:
-		case SLURMDB_REMOVE_COORD:
-			debug3("\tUSER RECORDS");
-			break;
-		case SLURMDB_ADD_TRES:
-			debug3("\tTRES RECORDS");
-			break;
-		case SLURMDB_ADD_ASSOC:
-		case SLURMDB_MODIFY_ASSOC:
-		case SLURMDB_REMOVE_ASSOC:
-			debug3("\tASSOC RECORDS");
-			_dump_slurmdb_assoc_records(object->objects);
-			break;
-		case SLURMDB_UPDATE_FEDS:
-			debug3("\tFEDERATION RECORDS");
-			break;
-		case SLURMDB_ADD_QOS:
-		case SLURMDB_MODIFY_QOS:
-		case SLURMDB_REMOVE_QOS:
-			debug3("\tQOS RECORDS");
-			break;
-		case SLURMDB_ADD_RES:
-		case SLURMDB_MODIFY_RES:
-		case SLURMDB_REMOVE_RES:
-			debug3("\tRES RECORDS");
-			_dump_slurmdb_res_records(object->objects);
-			break;
-		case SLURMDB_ADD_WCKEY:
-		case SLURMDB_MODIFY_WCKEY:
-		case SLURMDB_REMOVE_WCKEY:
-			debug3("\tWCKEY RECORDS");
-			break;
-		case SLURMDB_UPDATE_NOTSET:
-		default:
-			error("unknown type set in "
-			      "update_object: %d",
-			      object->type);
-			break;
-		}
-	}
-	list_iterator_destroy(itr);
-}
-
-
-/*
  * cluster_first_reg - ask for controller to send nodes in a down state
  *    and jobs pending or running on first registration.
  *
@@ -573,44 +459,6 @@ extern int set_usage_information(char **usage_table,
 	(*usage_table) = my_usage_table;
 
 	return SLURM_SUCCESS;
-}
-
-
-/*
- * merge_delta_qos_list - apply delta_qos_list to qos_list
- *
- * IN/OUT qos_list: list of QOS'es
- * IN delta_qos_list: list of delta QOS'es
- */
-extern void merge_delta_qos_list(list_t *qos_list, list_t *delta_qos_list)
-{
-	list_itr_t *curr_itr = list_iterator_create(qos_list);
-	list_itr_t *new_itr = list_iterator_create(delta_qos_list);
-	char *new_qos = NULL, *curr_qos = NULL;
-
-	while((new_qos = list_next(new_itr))) {
-		if (new_qos[0] == '-') {
-			while((curr_qos = list_next(curr_itr))) {
-				if (!xstrcmp(curr_qos, new_qos+1)) {
-					list_delete_item(curr_itr);
-					break;
-				}
-			}
-			list_iterator_reset(curr_itr);
-		} else if (new_qos[0] == '+') {
-			while((curr_qos = list_next(curr_itr))) {
-				if (!xstrcmp(curr_qos, new_qos+1)) {
-					break;
-				}
-			}
-			if (!curr_qos) {
-				list_append(qos_list, xstrdup(new_qos+1));
-			}
-			list_iterator_reset(curr_itr);
-		}
-	}
-	list_iterator_destroy(new_itr);
-	list_iterator_destroy(curr_itr);
 }
 
 extern bool is_user_min_admin_level(void *db_conn, uid_t uid,
@@ -841,6 +689,34 @@ extern int archive_run_script(slurmdb_archive_cond_t *arch_cond,
 				     (long)curr_end);
 	}
 
+	if (arch_cond->purge_jobenv != NO_VAL) {
+		if (!(curr_end =
+			      archive_setup_end_time(last_submit,
+						     arch_cond
+							     ->purge_jobenv))) {
+			error("Parsing purge job_env failed");
+			return SLURM_ERROR;
+		}
+
+		env_array_append_fmt(
+			&env, "SLURM_ARCHIVE_JOB_ENV", "%u",
+			SLURMDB_PURGE_ARCHIVE_SET(arch_cond->purge_jobenv));
+		env_array_append_fmt(&env, "SLURM_ARCHIVE_LAST_JOB_ENV", "%ld",
+				     (long) curr_end);
+	}
+	if (arch_cond->purge_jobscript != NO_VAL) {
+		if (!(curr_end = archive_setup_end_time(
+			      last_submit, arch_cond->purge_jobscript))) {
+			error("Parsing purge job_script failed");
+			return SLURM_ERROR;
+		}
+
+		env_array_append_fmt(
+			&env, "SLURM_ARCHIVE_JOB_SCRIPT", "%u",
+			SLURMDB_PURGE_ARCHIVE_SET(arch_cond->purge_jobscript));
+		env_array_append_fmt(&env, "SLURM_ARCHIVE_LAST_JOB_SCRIPT",
+				     "%ld", (long) curr_end);
+	}
 #ifdef _PATH_STDPATH
 	env_array_append (&env, "PATH", _PATH_STDPATH);
 #else
@@ -979,7 +855,13 @@ extern int as_build_step_start_msg(dbd_step_start_msg_t *req,
 
 	req->assoc_id    = step_ptr->job_ptr->assoc_id;
 	req->container   = step_ptr->container;
-	req->db_index    = step_ptr->job_ptr->db_index;
+	/*
+	 * In Slurm <= 25.05 step_id.sluid=0, so use db_index.
+	 * Once 25.05 is no longer supported only use
+	 * step_ptr->step_id.sluid.
+	 */
+	req->db_index = step_ptr->step_id.sluid ?
+		step_ptr->step_id.sluid : step_ptr->job_ptr->db_index;
 	req->name        = step_ptr->name;
 	req->nodes       = node_list;
 	/* create req->node_inx outside of locks when packing */
@@ -1012,6 +894,7 @@ extern int as_build_step_start_msg(dbd_step_start_msg_t *req,
 		req->std_out = step_ptr->std_out;
 	}
 
+	req->state = step_ptr->state;
 	req->submit_line = step_ptr->submit_line;
 	req->tres_alloc_str = step_ptr->tres_alloc_str;
 
@@ -1051,7 +934,13 @@ extern int as_build_step_comp_msg(dbd_step_comp_msg_t *req,
 	memset(req, 0, sizeof(dbd_step_comp_msg_t));
 
 	req->assoc_id    = step_ptr->job_ptr->assoc_id;
-	req->db_index    = step_ptr->job_ptr->db_index;
+	/*
+	 * In Slurm <= 25.05 step_id.sluid=0, so use db_index.
+	 * Once 25.05 is no longer supported only use
+	 * step_ptr->step_id.sluid.
+	 */
+	req->db_index = step_ptr->step_id.sluid ?
+		step_ptr->step_id.sluid : step_ptr->job_ptr->db_index;
 	req->end_time    = time(NULL);	/* called at step completion */
 	req->exit_code   = step_ptr->exit_code;
 	req->jobacct     = step_ptr->jobacct;

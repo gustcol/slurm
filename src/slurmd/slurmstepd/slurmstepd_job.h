@@ -64,6 +64,7 @@
 
 typedef struct {
 	char *key;                 /* srun key for IO verification         */
+	char *key_hash; /* compact key for IO verification */
 	char *tls_cert;            /* srun public certificate if tls in use */
 	slurm_addr_t resp_addr;	   /* response addr for task exit msg      */
 	slurm_addr_t ioaddr;       /* Address to connect on for normal I/O.
@@ -71,6 +72,9 @@ typedef struct {
 				      resp_addr. */
 	uid_t uid;		   /* user id for job */
 	uint16_t protocol_version; /* protocol_version of the srun */
+	bool attached;		   /* true if added by an attach (sattach) so
+				      its resp_addr may be cleared once the
+				      client disconnects or becomes unreachable */
 } srun_info_t;
 
 typedef enum {
@@ -83,7 +87,7 @@ typedef enum {
 typedef struct {
 	pthread_mutex_t mutex;	    /* mutex to protect task state          */
 	stepd_step_task_state_t state;  /* task state                       */
-	cpu_set_t *cpu_set;
+	xcpuset_t *cpu_set;
 
 	int             id;	    /* local task id                        */
 	uint32_t        gtid;	    /* global task id                       */
@@ -121,11 +125,13 @@ typedef struct {
 	char *rootfs; /* path to container rootfs */
 	char *spool_dir; /* path to slurmd's spool dir for container */
 	char *task_spool_dir; /* path to slurmd's spool dir for container task */
+	char *work_dir; /* step's original working directory */
 } step_container_t;
 
 typedef struct {
 	char *alias_list; /* node name to address aliases */
 	step_container_t *container; /* populated if step is a container */
+	int runtime_idx; /* index of the runtime plugin for this step */
 	slurmstepd_state_t state;	/* Job state			*/
 	pthread_cond_t state_cond;	/* Job state conditional	*/
 	pthread_mutex_t state_mutex;	/* Job state mutex		*/
@@ -268,12 +274,6 @@ extern int stepd_step_rec_create(launch_tasks_request_msg_t *msg,
 extern int batch_stepd_step_rec_create(batch_job_launch_msg_t *msg);
 
 extern void stepd_step_rec_destroy(void);
-
-srun_info_t *srun_info_create(slurm_cred_t *cred, char *alloc_tls_cert,
-			      slurm_addr_t *respaddr, slurm_addr_t *ioaddr,
-			      uid_t uid, uint16_t protocol_version);
-
-void  srun_info_destroy(srun_info_t *srun);
 
 stepd_step_task_info_t * task_info_create(int taskid, int gtaskid,
 					  char *ifname, char *ofname,

@@ -1,9 +1,13 @@
 ############################################################################
 # Copyright (C) SchedMD LLC.
 ############################################################################
-import pytest
-import atf
 import os
+
+import pytest
+
+import atf
+
+pytestmark = pytest.mark.slow
 
 # Ensure that job ids are not truncated
 os.environ["SLURM_BITSTR_LEN"] = "0"
@@ -23,12 +27,6 @@ def setup():
     # We need 9 nodes to be able to run with select_linear
     atf.require_nodes(9)
     atf.require_slurm_running()
-
-
-@pytest.fixture(scope="function", autouse=True)
-def cancel_jobs():
-    yield
-    atf.cancel_all_jobs()
 
 
 def test_single_job():

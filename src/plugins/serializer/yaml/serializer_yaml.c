@@ -188,8 +188,11 @@ static serializer_flags_t _merge_flags(serializer_flags_t flags)
 
 extern int serialize_p_init(serializer_flags_t flags)
 {
-	if (flags != SER_FLAGS_NONE)
+	/* See the matching comment in the json serializer. */
+	if (flags & (SER_FLAGS_COMPACT | SER_FLAGS_PRETTY))
 		global_flags = flags;
+	else
+		global_flags = (SERIALIZER_YAML_DEFAULT_FLAGS | flags);
 
 	log_flag(DATA, "loaded");
 
@@ -374,7 +377,8 @@ static parse_state_t _yaml_to_data(int depth, yaml_parser_t *parser,
 	return PARSE_CONTINUE;
 }
 
-static int _parse_yaml(const char *buffer, yaml_parser_t *parser, data_t *data)
+static int _parse_yaml(const char *buffer, size_t buf_len,
+		       yaml_parser_t *parser, data_t *data)
 {
 	const unsigned char *buf = (const unsigned char *) buffer;
 	int rc = SLURM_SUCCESS;
@@ -389,7 +393,7 @@ static int _parse_yaml(const char *buffer, yaml_parser_t *parser, data_t *data)
 		return SLURM_ERROR;
 	}
 
-	yaml_parser_set_input_string(parser, buf, strlen(buffer));
+	yaml_parser_set_input_string(parser, buf, buf_len);
 
 	(void) _yaml_to_data(0, parser, data, &rc);
 
@@ -663,7 +667,7 @@ static int _dump_yaml(const data_t *data, yaml_emitter_t *emitter, buf_t *buf,
 	if (!yaml_emitter_initialize(emitter))
 		_yaml_emitter_error;
 
-	if (flags == SER_FLAGS_COMPACT) {
+	if (flags & SER_FLAGS_COMPACT) {
 		yaml_emitter_set_indent(emitter, 0);
 		yaml_emitter_set_width(emitter, -1);
 		yaml_emitter_set_break(emitter, YAML_ANY_BREAK);
@@ -706,8 +710,7 @@ yaml_fail:
 
 #undef _yaml_emitter_error
 
-extern int serialize_p_data_to_string(char **dest, size_t *length,
-				      const data_t *src,
+extern int serialize_p_data_to_string(char **dest, size_t *length, data_t *src,
 				      serializer_flags_t flags)
 {
 	yaml_emitter_t emitter;
@@ -733,7 +736,6 @@ extern int serialize_p_data_to_string(char **dest, size_t *length,
 		char *end = (ptr + get_buf_offset(buf));
 
 		*end = '\0';
-		set_buf_offset(buf, (get_buf_offset(buf) + 1));
 	}
 
 	if (length)
@@ -753,13 +755,16 @@ extern int serialize_p_string_to_data(data_t **dest, const char *src,
 	data_t *data;
 	yaml_parser_t parser;
 
-	/* string must be NULL terminated */
-	if (!length || (src[length] && (strnlen(src, length) >= length)))
+	/*
+	 * String must contain at least one non-NULL character.
+	 * The yaml lib doesn't allow NULL terminator be part of the length.
+	 */
+	if (!length || !(length = strnlen(src, length)))
 		return EINVAL;
 
 	data = data_new();
 
-	if (_parse_yaml(src, &parser, data)) {
+	if (_parse_yaml(src, length, &parser, data)) {
 		FREE_NULL_DATA(data);
 		return ESLURM_DATA_CONV_FAILED;
 	}
@@ -768,4 +773,19 @@ extern int serialize_p_string_to_data(data_t **dest, const char *src,
 
 	*dest = data;
 	return SLURM_SUCCESS;
+}
+
+extern int serialize_p_dump(serialize_dump_state_t **state_ptr,
+			    data_parser_t *parser, data_parser_type_t type,
+			    void *src, ssize_t src_bytes, buf_t *dst,
+			    serializer_flags_t flags)
+{
+	return ESLURM_NOT_SUPPORTED;
+}
+
+extern int serialize_p_parse(serialize_parse_state_t **state_ptr,
+			     data_parser_t *parser, data_parser_type_t type,
+			     void *dst, ssize_t dst_bytes, buf_t *src)
+{
+	return ESLURM_NOT_SUPPORTED;
 }

@@ -36,6 +36,7 @@
 \*****************************************************************************/
 
 #include <dirent.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -44,8 +45,10 @@
 #include <poll.h>
 #include <stdint.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -102,6 +105,89 @@ strong_alias(rmdir_recursive, slurm_rmdir_recursive);
 static int fd_get_lock(int fd, int cmd, int type);
 static pid_t fd_test_lock(int fd, int type);
 
+static bool closeall_initialized = false;
+static int (*close_range_f)(unsigned int first, unsigned int last,
+			    int flags) = NULL;
+static int rlimit_nofile = INT_MAX;
+
+#define T(x) { x, #x }
+
+static const struct {
+	int flag;
+	const char *str;
+} fcntl_acc_modes[] = {
+	T(O_RDONLY),
+	T(O_WRONLY),
+	T(O_RDWR),
+};
+
+static const struct {
+	int flag;
+	const char *str;
+} fcntl_modes[] = {
+	T(O_APPEND),    T(O_ASYNC), T(O_NONBLOCK), T(O_DSYNC), T(O_SYNC),
+#ifdef O_DIRECT
+	T(O_DIRECT),
+#endif
+#ifdef O_NOATIME
+	T(O_NOATIME),
+#endif
+#ifdef O_PATH
+	T(O_PATH),
+#endif
+#ifdef O_LARGEFILE
+	T(O_LARGEFILE),
+#endif
+};
+
+#undef T
+
+extern const char *fcntl_modes_to_string(const int modes, char *str,
+					 size_t bytes)
+{
+	int matched = 0;
+	char *dst = str;
+
+	/* Treat O_ACCMODE masked bits as special as a 0x00 is a valid flag */
+
+	for (int i = 0; i < ARRAY_SIZE(fcntl_acc_modes); i++) {
+		if ((modes & O_ACCMODE) == fcntl_acc_modes[i].flag) {
+			int wrote = snprintf(dst, bytes, "%s",
+					     fcntl_acc_modes[i].str);
+
+			if ((wrote < 0) || (wrote > bytes))
+				return "INVALID";
+
+			dst += wrote;
+			bytes -= wrote;
+			matched = fcntl_acc_modes[i].flag;
+			break;
+		}
+	}
+
+	for (int i = 0; i < ARRAY_SIZE(fcntl_modes); i++) {
+		if (((modes & ~O_ACCMODE) & fcntl_modes[i].flag) ==
+		    fcntl_modes[i].flag) {
+			int wrote =
+				snprintf(dst, bytes, "|%s", fcntl_modes[i].str);
+
+			if ((wrote < 0) || (wrote > bytes))
+				return "INVALID";
+
+			dst += wrote;
+			bytes -= wrote;
+			matched |= fcntl_modes[i].flag;
+		}
+	}
+
+	if (((matched & ~O_ACCMODE) != (modes & ~O_ACCMODE)) &&
+	    (snprintf(dst, bytes, "|0x%X", (modes & ~matched & ~O_ACCMODE)) <
+	     0))
+		return "INVALID";
+
+	return str;
+}
+
 static bool _is_fd_skipped(int fd, int *skipped, log_closeall_skip_t log_skip)
 {
 	if (fd == log_skip.log_fd)
@@ -120,68 +206,104 @@ static bool _is_fd_skipped(int fd, int *skipped, log_closeall_skip_t log_skip)
 	return false;
 }
 
-static void _slow_closeall(int fd, int *skipped, log_closeall_skip_t log_skip)
-{
-	struct rlimit rlim;
-
-	if (getrlimit(RLIMIT_NOFILE, &rlim) < 0) {
-		error("getrlimit(RLIMIT_NOFILE): %m");
-		rlim.rlim_cur = 4096;
-	}
-
-	for (; fd < rlim.rlim_cur; fd++)
-		if (!_is_fd_skipped(fd, skipped, log_skip))
-			close(fd);
-}
-
 extern void closeall_except(int fd, int *skipped)
 {
-	char *name = "/proc/self/fd";
-	DIR *d;
-	int fd_of_d = -1;
-	struct dirent *dir;
+	int highest_skipped = fd;
 	log_closeall_skip_t log_skip = log_closeall_pre();
 
-	/*
-	 * Blindly closing all file descriptors is slow.
-	 *
-	 * Instead get all open file descriptors from /proc/self/fd, then
-	 * close each one of those that are greater than or equal to fd.
-	 */
-	if (!(d = opendir(name))) {
-		debug("Could not read open files from %s: %m, closing all potential file descriptors",
-		      name);
-		_slow_closeall(fd, skipped, log_skip);
-		log_closeall_post();
-		return;
+	xassert(closeall_initialized);
+
+	for (int i = 0; skipped && (skipped[i] >= 0); i++) {
+		if (skipped[i] > highest_skipped)
+			highest_skipped = skipped[i];
 	}
 
-	/*
-	 * Do not close fd_of_d during the loop, or successive readdir() calls
-	 * will fail, and the loop will terminate prematurely leaking fds to
-	 * the child process.
-	 */
-	fd_of_d = dirfd(d);
+	if (log_skip.log_fd > highest_skipped)
+		highest_skipped = log_skip.log_fd;
+	if (log_skip.sched_log_fd > highest_skipped)
+		highest_skipped = log_skip.sched_log_fd;
 
-	while ((dir = readdir(d))) {
-		/* Ignore "." and ".." entries */
-		if (dir->d_type != DT_DIR) {
-			int open_fd = atoi(dir->d_name);
-
-			if ((open_fd >= fd) && (open_fd != fd_of_d) &&
-			    !_is_fd_skipped(open_fd, skipped, log_skip))
-				close(open_fd);
-		}
+	for (int i = fd; i < highest_skipped; i++) {
+		if (!_is_fd_skipped(i, skipped, log_skip))
+			close(i);
 	}
-	closedir(d);
-	/* dirfd(3) says fd_of_d is closed automatically by closedir() */
+
+	if (close_range_f) {
+		close_range_f(highest_skipped + 1, ~0U, 0);
+	} else {
+		for (int i = highest_skipped + 1; i < rlimit_nofile; i++)
+			close(i);
+	}
 
 	log_closeall_post();
 }
 
+#ifdef SYS_close_range
+/*
+ * Used as a fallback if the kernel supports close_range() but libc does not.
+ */
+extern int close_range_internal(unsigned int first, unsigned int last,
+				int flags)
+{
+	return syscall(SYS_close_range, first, last, flags);
+}
+#endif
+
+/*
+ * close_range() is not necessarily available on all systems so we detect it at
+ * runtime. However, this detection is not async-signal-safe, so cannot happen
+ * when closeall() is called post-fork(). Detect early in the process start
+ * so the symbol is available when needed.
+ */
+extern void closeall_init(void)
+{
+	struct rlimit rlim;
+	void *self = dlopen(0, RTLD_GLOBAL | RTLD_NOW);
+	closeall_initialized = true;
+
+	if (self) {
+		close_range_f = dlsym(self, "close_range");
+
+		if (!close_range_f)
+			close_range_f = dlsym(self, "close_range_internal");
+
+		/*
+		 * Attempt calling close range with invalid arguments,
+		 * to make sure it's implemented by underlying kernel.
+		 * This can happen when newer libc runs on old kernel,
+		 * e.g. new container image running on old OS.
+		 */
+		if (close_range_f) {
+			close_range_f(1, 0, 0);
+			if (errno == ENOSYS) /* errno should be EINVAL */
+				close_range_f = NULL;
+		}
+
+		dlclose(self);
+	}
+
+	if (!close_range_f) {
+		if ((getrlimit(RLIMIT_NOFILE, &rlim) == 0) &&
+		    (rlim.rlim_cur != RLIM_INFINITY)) {
+			rlimit_nofile = rlim.rlim_cur;
+		} else {
+			rlimit_nofile = (int) sysconf(_SC_OPEN_MAX);
+			if (rlimit_nofile == -1)
+				rlimit_nofile = INT_MAX;
+		}
+	}
+
+	debug2("%s: close_range %sfound", __func__, close_range_f ? "" : "not ");
+}
+
 extern void closeall(int fd)
 {
-	return closeall_except(fd, NULL);
+	xassert(closeall_initialized);
+
+	if (close_range_f)
+		close_range_f(fd, ~0U, 0);
+	else
+		closeall_except(fd, NULL);
 }
 
 extern void fd_close(int *fd)
@@ -439,26 +561,43 @@ extern char *fd_resolve_path(int fd)
 	return resolved;
 }
 
-extern char *fd_resolve_peer(int fd)
+/*
+ * Return peer-address string for a socket fd.
+ * IN  fd      - open socket file descriptor
+ * IN  resolve - true to issue a reverse DNS lookup; false for IP literal
+ * IN  caller  - caller's __func__ for log messages
+ * RET allocated string (must xfree()) or NULL on failure; preserves errno
+ */
+static char *_get_peer(int fd, bool resolve, const char *caller)
 {
 	slurm_addr_t addr = {0};
 	socklen_t size = sizeof(addr);
 	int err = errno;
-	char *peer;
+	char *peer = NULL;
 
 	if (fd < 0)
 		return NULL;
 
 	if (slurm_get_peer_addr(fd, &addr)) {
-		log_flag(NET, "%s: unable to resolve peername for fd:%d: %m",
-			 __func__, fd);
+		log_flag(NET, "%s: unable to get peername for fd:%d: %m",
+			 caller, fd);
 		return NULL;
 	}
 
-	peer = sockaddr_to_string(&addr, size);
+	peer = sockaddr_to_string(&addr, size, resolve);
 
 	errno = err;
 	return peer;
+}
+
+extern char *fd_resolve_peer(int fd)
+{
+	return _get_peer(fd, true, __func__);
+}
+
+extern char *fd_get_peer(int fd)
+{
+	return _get_peer(fd, false, __func__);
 }
 
 extern void fd_set_oob(int fd, int value)

@@ -81,9 +81,9 @@ static const char *tags[] = {
 	NULL
 };
 
-#define OP_FLAGS                                          \
-	(OP_BIND_DATA_PARSER | OP_BIND_OPENAPI_RESP_FMT | \
-	 OP_BIND_REQUIRE_SLURMDBD)
+#define OP_FLAGS \
+	(OPENAPI_BIND_DATA_PARSER | OPENAPI_BIND_OPENAPI_RESP_FMT | \
+	 OPENAPI_BIND_REQUIRE_SLURMDBD)
 
 const openapi_path_binding_t openapi_paths[] = {
 	{
@@ -143,6 +143,23 @@ const openapi_path_binding_t openapi_paths[] = {
 				.body = {
 					.type = DATA_PARSER_OPENAPI_SLURMDBD_CONFIG_RESP,
 					.description = "Add or update config",
+				},
+			},
+			{0}
+		},
+		.flags = OP_FLAGS,
+	},
+	{
+		.path = "/slurmdb/{data_parser}/conf",
+		.callback = op_handler_conf,
+		.methods = (openapi_path_binding_method_t[]){
+			{
+				.method = HTTP_REQUEST_GET,
+				.tags = tags,
+				.summary = "Dump slurmdbd configuration",
+				.response = {
+					.type = DATA_PARSER_OPENAPI_SLURMDBD_CONF_RESP,
+					.description = "slurmdbd configuration",
 				},
 			},
 			{0}

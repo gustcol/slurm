@@ -554,9 +554,13 @@ individual host names.</li>
 Number of nodes assigned to a job.</li>
 
 <li><b>SLURM_JOB_OVERSUBSCRIBE</b>
-Job OverSubscribe status.
-See the <a href="squeue.html#OPT_OverSubscribe">squeue man page</a> for
-possible values.
+Set to NO, YES, or OK (oversubscribe disposition for the job; see
+<a href="squeue.html#OPT_%h">squeue --format</a> <code>%h</code>).
+Available in Prolog, PrologSlurmctld, Epilog and EpilogSlurmctld.</li>
+
+<li><b>SLURM_JOB_EXCLUSIVE</b>
+Set to NO, NODE, USER, MCS, or TOPO (exclusive disposition for the job; see
+<a href="squeue.html#OPT_Exclusive">squeue --Format Exclusive</a>.
 Available in Prolog, PrologSlurmctld, Epilog and EpilogSlurmctld.</li>
 
 <li><b>SLURM_JOB_PARTITION</b>
@@ -634,9 +638,8 @@ The MPI rank (or relative process ID) of the current process. Available in
 SrunProlog, TaskProlog, SrunEpilog and TaskEpilog.</li>
 
 <li><b>SLURM_RESTART_COUNT</b>
-Number of times the job has been restarted. This is only set if the job
-has been restarted at least once. Available in SrunProlog, TaskProlog,
-SrunEpilog and TaskEpilog.</li>
+Number of times the job has been restarted. Available in SrunProlog,
+TaskProlog, SrunEpilog and TaskEpilog.</li>
 
 <li><b>SLURM_RLIMIT_AS</b>
 Resource limit on the job's address space. Available in SrunProlog,

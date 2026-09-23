@@ -42,10 +42,12 @@
 #include <signal.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <termios.h>
 
 #include "slurm/slurm_errno.h"
 
+#include "src/common/events.h"
 #include "src/common/log.h"
 #include "src/common/macros.h"
 #include "src/common/net.h"
@@ -53,8 +55,9 @@
 #include "src/common/slurm_protocol_defs.h"
 #include "src/common/threadpool.h"
 #include "src/common/xmalloc.h"
-#include "src/common/xsignal.h"
 #include "src/common/xstring.h"
+
+#include "src/conmgr/conmgr.h"
 
 #include "src/interfaces/conn.h"
 
@@ -63,14 +66,17 @@
 
 #include "opt.h"
 
-/*  Processed by pty_thr() */
-static int pty_sigarray[] = { SIGWINCH, 0 };
-static int winch;
+static pthread_mutex_t winch_lock = PTHREAD_MUTEX_INITIALIZER;
+static event_signal_t winch_event = EVENT_INITIALIZER("SIGWINCH");
+static bool handle_sigwinch = false;
+/* Set by pty_thread_fini() to wake _pty_thread() so it can shut down cleanly. */
+static bool pty_shutdown = false;
+static pthread_t pty_tid = 0;
+static int pty_listen_fd = -1;
 
 /*
  * Static prototypes
  */
-static void   _handle_sigwinch(int sig);
 static void * _pty_thread(void *arg);
 
 /* Set pty window size in job structure
@@ -88,12 +94,6 @@ int set_winsize(int fd, srun_job_t *job)
 	job->ws_col = ws.ws_col;
 	debug2("winsize %u:%u", job->ws_row, job->ws_col);
 	return 0;
-}
-
-/* SIGWINCH should already be blocked by srun/srun_job.c */
-void block_sigwinch(void)
-{
-	xsignal_block(pty_sigarray);
 }
 
 void pty_thread_create(srun_job_t *job)
@@ -117,13 +117,24 @@ void pty_thread_create(srun_job_t *job)
 	job->pty_port = slurm_get_port(&pty_addr);
 	debug2("initialized job control port %hu", job->pty_port);
 
-	slurm_thread_create_detached(NULL, _pty_thread, job);
+	pty_listen_fd = job->pty_fd;
+	slurm_thread_create(NULL, &pty_tid, _pty_thread, job);
 }
 
-static void  _handle_sigwinch(int sig)
+static void _on_sigwinch(conmgr_callback_args_t conmgr_args, void *arg)
 {
-	winch = 1;
-	xsignal(SIGWINCH, _handle_sigwinch);
+	if (conmgr_args.status == CONMGR_WORK_STATUS_CANCELLED) {
+		log_flag(CONMGR, "Caught SIGWINCH, but conmgr work cancelled, ignoring.");
+		return;
+	}
+	debug2("Caught SIGWINCH");
+
+	slurm_mutex_lock(&winch_lock);
+	handle_sigwinch = true;
+	EVENT_SIGNAL(&winch_event);
+	slurm_mutex_unlock(&winch_lock);
+
+	return;
 }
 
 static void _notify_winsize_change(conn_t *conn, srun_job_t *job)
@@ -149,8 +160,7 @@ static void *_pty_thread(void *arg)
 	slurm_addr_t client_addr;
 	struct termios term;
 
-	xsignal_unblock(pty_sigarray);
-	xsignal(SIGWINCH, _handle_sigwinch);
+	conmgr_add_work_signal(SIGWINCH, _on_sigwinch, NULL);
 
 	if (!(conn = slurm_accept_msg_conn(job->pty_fd, &client_addr))) {
 		error("pty: accept failure: %m");
@@ -165,20 +175,54 @@ static void *_pty_thread(void *arg)
 	fd = conn_g_get_fd(conn);
 
 	net_set_keep_alive(fd);
-	while (job->state <= SRUN_JOB_RUNNING) {
+	while ((srun_job_state(job) <= SRUN_JOB_RUNNING) && !pty_shutdown) {
 		debug2("waiting for SIGWINCH");
-		if ((poll(NULL, 0, -1) < 1) && (errno != EINTR)) {
-			debug("%s: poll error %m", __func__);
-			continue;
+
+		slurm_mutex_lock(&winch_lock);
+		while (!handle_sigwinch && !pty_shutdown)
+			EVENT_WAIT(&winch_event, &winch_lock);
+		handle_sigwinch = false;
+		if (pty_shutdown) {
+			slurm_mutex_unlock(&winch_lock);
+			break;
 		}
-		if (winch) {
-			set_winsize(STDOUT_FILENO, job);
-			_notify_winsize_change(conn, job);
-		}
-		winch = 0;
+		slurm_mutex_unlock(&winch_lock);
+
+		set_winsize(STDOUT_FILENO, job);
+		_notify_winsize_change(conn, job);
 	}
 
+	/*
+	 * Gracefully shut down the TLS connection (sends close_notify) so
+	 * slurmstepd's window manager sees a clean EOF rather than an abrupt
+	 * close. Reaching here requires pty_thread_fini() to wake the loop
+	 * above; otherwise the thread would block in EVENT_WAIT and be killed
+	 * on exit before it could clean up.
+	 */
 	(void) conn_blocking_g_shutdown(conn);
 	conn_g_destroy(conn, true);
 	return NULL;
+}
+
+extern void pty_thread_fini(void)
+{
+	if (!pty_tid)
+		return;
+
+	/* Wake _pty_thread() out of its SIGWINCH wait so it can shut down. */
+	slurm_mutex_lock(&winch_lock);
+	pty_shutdown = true;
+	EVENT_SIGNAL(&winch_event);
+	slurm_mutex_unlock(&winch_lock);
+
+	/*
+	 * If slurmstepd never connected, _pty_thread() is still blocked in
+	 * accept(); shut down the listen socket to unblock it so the join
+	 * below does not hang.
+	 */
+	if (pty_listen_fd >= 0)
+		shutdown(pty_listen_fd, SHUT_RDWR);
+
+	slurm_thread_join(pty_tid);
+	pty_tid = 0;
 }

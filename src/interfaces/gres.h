@@ -147,16 +147,13 @@ typedef struct {
 					      directly requested */
 #define GRES_CONF_FROM_STATE SLURM_BIT(13) /* Flags from state, blow away once
 					      node checks in. */
-#define GRES_CONF_GLOBAL_INDEX SLURM_BIT(14) /* devices use global index */
+#define GRES_CONF_UUID SLURM_BIT(14) /* Use GPU UUID in env vars */
 #define GRES_CONF_AUTODETECT SLURM_BIT(15) /* Conf was made with Autodetect */
 #define GRES_CONF_UPDATE_CONFIG SLURM_BIT(16) /* Flag to update gres config */
 #define GRES_CONF_MIG SLURM_BIT(17) /* GRES configuration is for NVIDIA MIG */
 
 #define GRES_CONF_ENV_SET    0x000008E0   /* Easy check if any of
 					   * GRES_CONF_ENV_* are set. */
-
-/* GRES_DEV_* flags for gres_device_t */
-#define GRES_DEV_MIG SLURM_BIT(0) /* GRES device is an NVIDIA MIG */
 
 /* GRES AutoDetect options */
 #define GRES_AUTODETECT_UNSET     0x00000000 /* Not set */
@@ -166,6 +163,7 @@ typedef struct {
 #define GRES_AUTODETECT_GPU_ONEAPI 0x00000008
 #define GRES_AUTODETECT_GPU_NRT 0x00000010
 #define GRES_AUTODETECT_GPU_NVIDIA 0x00000020
+#define GRES_AUTODETECT_GPU_FULL 0x00000040 /* try all gpu plugins in order */
 
 #define GRES_AUTODETECT_GPU_FLAGS 0x000000ff /* reserve first 8 bits for gpu
 					      * flags */
@@ -209,7 +207,11 @@ typedef struct gres_slurmd_conf {
 	/* Type of this GRES (e.g. model name) */
 	char *type_name;
 
-	/* Used for GPU binding with MIGs */
+	/*
+	 * Device UUID. Used for GPU binding with MIGs, for the vendor env vars
+	 * when GRES_CONF_UUID is set, and to anchor GRES drains to a device.
+	 * Set by AutoDetect or by UUID in gres.conf.
+	 */
 	char *unique_id;
 
 	/* GRES ID number */
@@ -297,6 +299,10 @@ typedef struct gres_job_state {
 	/* Count of required GRES resources plus associated CPUs and memory */
 	uint16_t cpus_per_gres;
 	uint64_t gres_per_job;
+	uint64_t gres_per_job_segment; /* Per-segment portion of gres_per_job,
+					* used as the scheduling target while
+					* selecting nodes for one segment.
+					* 0 when not segmenting. */
 	uint64_t gres_per_node;
 	uint64_t gres_per_socket;
 	uint64_t gres_per_task;
@@ -347,7 +353,15 @@ typedef struct gres_job_state {
 	 *              GRES allocated to the job.
 	 */
 	uint64_t total_gres;
-	uint32_t node_cnt;		/* 0 if no_consume */
+	/*
+	 * node_cnt - Size of the arrays below.
+	 *            For jobs: length of the job allocation (number of nodes
+	 *            allocated to the job).
+	 *            For reservations: node_record_count (full cluster node
+	 *            table size).
+	 *            0 if no_consume.
+	 */
+	uint32_t node_cnt;
 	bitstr_t **gres_bit_alloc;	/* Per node GRES allocated,
 					 * Used with GRES files */
 	uint64_t *gres_cnt_node_alloc;	/* Per node GRES allocated,
@@ -609,6 +623,21 @@ extern int gres_node_config_load(list_t *gres_conf_list,
 				 node_config_load_t *config,
 				 list_t **gres_devices);
 
+/*
+ * Find the first record in gres_conf_list whose UUID duplicates that of an
+ * earlier record of the same GRES. Records without a UUID are skipped.
+ *
+ * Two devices sharing a UUID cannot be told apart, either for the vendor
+ * environment variables or for anchoring a GRES drain to a device. gres.conf
+ * and the merged AutoDetect list are both checked, so the scan lives here and
+ * each caller decides how to report what it finds.
+ *
+ * IN gres_conf_list - list of gres_slurmd_conf_t to check
+ * RET the offending record, owned by gres_conf_list and not to be freed by the
+ *     caller, or NULL if every UUID is unique
+ */
+extern gres_slurmd_conf_t *gres_find_duplicate_unique_id(list_t *gres_conf_list);
+
 
 /*
  * Unpack this node's configuration from a buffer (built/packed by slurmd)
@@ -772,9 +801,6 @@ extern int gres_node_count(list_t *gres_list, int arr_len,
  */
 extern void gres_prep_pack(void *in, uint16_t protocol_version, buf_t *buffer);
 
-extern int gres_prep_pack_legacy(list_t *gres_list, buf_t *buffer,
-				 uint16_t protocol_version);
-
 /*
  * Unpack a job's allocated gres information for use by prolog/epilog
  * OUT gres_list - restored state stored by gres_prep_pack()
@@ -782,9 +808,6 @@ extern int gres_prep_pack_legacy(list_t *gres_list, buf_t *buffer,
  */
 extern int gres_prep_unpack_list(list_t **gres_list, buf_t *buffer,
 				 uint16_t protocol_version);
-
-extern int gres_prep_unpack_legacy(list_t **gres_list, buf_t *buffer,
-				   uint16_t protocol_version);
 
 /*
  * Build List of information needed to set job's Prolog or Epilog environment
@@ -1013,6 +1036,27 @@ extern void gres_g_step_set_env(stepd_step_rec_t *step);
 extern void gres_g_task_set_env(stepd_step_rec_t *step, int local_proc_id);
 
 /*
+ * Clear GRES allocation info for all job GRES at start of scheduling cycle
+ * Return TRUE if any gres_per_job constraints to satisfy
+ */
+extern bool gres_sched_init(list_t *job_gres_list);
+
+/*
+ * Clear the accumulated GRES counter before selecting nodes for a new segment
+ * IN job_gres_list - job's GRES requirements
+ */
+extern void gres_sched_reset(list_t *job_gres_list);
+
+/*
+ * Set the per-segment GRES scheduling target (gres_per_job / segment_cnt) for
+ * all job-scoped GRES so node selection can be satisfied one segment at a time.
+ * IN job_gres_list - job's GRES requirements
+ * IN segment_cnt - number of segments the job is split into
+ * RET false if any gres_per_job is not evenly divisible by segment_cnt
+ */
+extern bool gres_sched_segment_set(list_t *job_gres_list, int segment_cnt);
+
+/*
  * Log a step's current gres state
  * IN gres_list - generated by gres_stepmgr_step_alloc()
  * IN job_id - job's ID
@@ -1054,7 +1098,39 @@ extern void gres_get_autodetected_gpus(node_config_load_t node_conf,
 				       char **first_gres_str,
 				       char **autodetect_str);
 
+/*
+ * Parse gres.conf early, before the local node record exists, populating
+ * gres_conf_list and autodetect_flags. The next gres_g_node_config_load()
+ * call with the same node_name will reuse this result and skip re-parsing.
+ *
+ * IN node_name - name of the node to load the gres.conf records for
+ * IN cpu_cnt - number of CPUs configured for node node_name; must be > 0
+ * RET SLURM_SUCCESS, ESLURM_INVALID_CPU_COUNT if cpu_cnt is 0, or another
+ *     error code from the gres.conf parse
+ */
+extern int gres_parse_conf(char *node_name, uint32_t cpu_cnt);
+
+/*
+ * Build a "Gres=" value ("gpu:<type>:<count>[,...]") for splicing into a
+ * synthesized NodeName= line for a dynamic-normal slurmd ("slurmd -Z").
+ *
+ * Caller should run gres_parse_conf() first so this honors gres.conf:
+ *   - returns NULL if Autodetect=off
+ *   - returns NULL if gres.conf already declares Name=gpu entries
+ *   - probes only the plugin pinned by Autodetect=<X> if set
+ *   - otherwise defaults to Autodetect=full (try NVML, NVIDIA, RSMI,
+ *     oneAPI, NRT in order until one finds devices)
+ *
+ * IN node_conf - node_config_load_t describing this slurmd.
+ * RET malloc'd "gpu:<type>:<count>[,...]" string, or NULL if autofill is
+ *     suppressed or no GPUs are detected. Caller must xfree().
+ */
+extern char *gres_get_dynamic_gpu_str(node_config_load_t node_conf);
+
 extern uint32_t gres_get_autodetect_flags(void);
+
+/* Replace GPU-related autodetect bits in autodetect_flags */
+extern void gres_autodetect_flags_set_gpu(uint32_t gpu_flags_part);
 
 /* Convert the major/minor info to a string */
 extern char *gres_device_id2str(gres_device_id_t *gres_dev);
@@ -1128,6 +1204,30 @@ extern gres_state_t *gres_create_state(void *src_ptr,
 extern void gres_job_state_delete(gres_job_state_t *gres_js);
 
 extern void gres_job_clear_alloc(gres_job_state_t *gres_js);
+
+/*
+ * Remap reservation GRES per-node arrays (indexed by global node table
+ * position) after the node table has been re-sorted (e.g. nodes added, removed,
+ * or reordered between slurmctld restarts).
+ *
+ * Reservation gres_list_alloc arrays are cluster-length (node_record_count),
+ * unlike job arrays which are sized to the job allocation.
+ *
+ * Elements are moved from their old node index to the new one using the global
+ * node_old_to_new_map; entries that map to -1 (removed nodes) have their data
+ * freed.
+ *
+ * Callers must only invoke this when is_node_table_changed is true and the
+ * global node_old_to_new_map is populated.
+ *
+ * Uses globals:
+ *   node_old_to_new_map   - map[old_index] = new_index (-1 if node removed)
+ *   old_node_record_count - length of node_old_to_new_map (previous node count)
+ *   node_record_count     - current node table size (new array length)
+ *
+ * IN gres_list  - reservation gres_list_alloc whose arrays need remapping
+ */
+extern void gres_resv_list_remap_global_indices(list_t *gres_list);
 
 extern void gres_job_list_delete(void *list_element);
 

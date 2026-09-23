@@ -384,30 +384,6 @@ Read a specified Slurm hostfile. The file must contain a list of Slurm NodeNames
 
 =back
 
-=head3 $msg_thr = $slurm->allocation_msg_thr_create($port, $callbacks);
-
-Startup a message handler talking with the controller dealing with messages from the controller during an allocation.
-
-=over 2
-
-=item * OUT $port: port we are listening for messages on from the controller.
-
-=item * IN $callbacks: callbacks for different types of messages, with structure of C<slurm_allocation_callbacks_t>.
-
-=item * RET: opaque object of C<allocation_msg_thread_t *>,  or NULL on failure.
-
-=back
-
-=head3 $slurm->allocation_msg_thr_destroy($msg_thr);
-
-Shutdown the message handler talking with the controller dealing with messages from the controller during an allocation.
-
-=over 2
-
-=item * IN $msg_thr: opaque object of C<allocation_msg_thread_t> pointer.
-
-=back
-
 =head3 $resp = $slurm->submit_batch_job($job_desc_msg);
 
 Issue RPC to submit a job for later execution.
@@ -562,39 +538,6 @@ Output the contents of key_pairs which is a list of opaque data type C<config_ke
 =item * IN $key_pairs: List containing key pairs to be printed.
 
 =item * IN $title: title of key pair list.
-
-=back
-
-
-
-
-=head2 SLURM JOB RESOURCES READ/PRINT FUNCTIONS
-
-=head3 $num = $slurm->job_cpus_allocated_on_node_id($job_res, $node_id);
-
-Get the number of cpus allocated to a job on a node by node id.
-
-=over 2
-
-=item * IN $job_res: job resources data, with structure of C<job_resources_t>.
-
-=item * IN $node_id: zero-origin node id in allocation.
-
-=item * RET: number of CPUs allocated to job on this node or -1 on error.
-
-=back
-
-=head3 $num = $slurm->job_cpus_allocated_on_node($job_res, $node_name);
-
-Get the number of cpus allocated to a job on a node by node name.
-
-=over 2
-
-=item * IN $job_res: job resources data, with structure of C<job_resources_t>.
-
-=item * IN $node_name: name of node.
-
-=item * RET: number of CPUs allocated to job on this node or -1 on error.
 
 =back
 
@@ -898,7 +841,7 @@ Create a new partition, only usable by user root.
 
 =over 2
 
-=item * IN $part_info: description of partition configuration with structure of C<update_part_msg_t>.
+=item * IN $part_info: description of partition configuration with structure of C<partition_info_t>.
 
 =item * RET: 0 on success, -1 on failure with errno set.
 
@@ -910,7 +853,7 @@ Issue RPC to update a partition's configuration per request, only usable by user
 
 =over 2
 
-=item * IN $part_info: description of partition updates with structure of C<update_part_msg_t>.
+=item * IN $part_info: description of partition updates with structure of C<partition_info_t>.
 
 =item * RET: 0 on success, -1 on failure with errno set.
 
